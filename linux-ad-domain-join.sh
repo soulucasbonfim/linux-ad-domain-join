@@ -1,6 +1,6 @@
 #!/bin/bash
 # =================================================================================================
-# Script Name:        ad-domain-join.sh
+# Script Name:        linux-ad-domain-join.sh
 # -------------------------------------------------------------------------------------------------
 # Description:
 #   Automates the process of joining a Linux host to an Active Directory (AD) domain.
@@ -26,7 +26,7 @@
 #
 # -------------------------------------------------------------------------------------------------
 # Usage:
-#   ./ad-domain-join.sh [--dry-run] [--yes|-y] [--verbose|-v]
+#   ./linux-ad-domain-join.sh [--dry-run] [--yes|-y] [--verbose|-v]
 #
 # Options:
 #   --dry-run         Simulate all actions without applying changes
@@ -51,7 +51,7 @@
 # -------------------------------------------------------------------------------------------------
 # Logging:
 #   All actions and outputs are logged to:
-#       /var/log/ad-domain-join.log
+#       /var/log/linux-ad-domain-join.log
 #   Log symbols are normalized to ASCII (no Unicode dependencies).
 #
 # -------------------------------------------------------------------------------------------------
@@ -169,7 +169,7 @@ fi
 # -------------------------------------------------------------------------
 # Setup logging
 # -------------------------------------------------------------------------
-LOG_FILE="/var/log/ad-domain-join.log"
+LOG_FILE="/var/log/linux-ad-domain-join.log"
 mkdir -p "$(dirname "$LOG_FILE")"
 : > "$LOG_FILE"
 exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
@@ -1438,7 +1438,7 @@ SERVICES_LINE=$(IFS=,; echo "${AVAILABLE_RESPONDERS[*]}")
 cat >"$SSSD_CONF" <<EOF
 # ============================================================================
 # File:        /etc/sssd/sssd.conf
-# Description: SSSD configuration generated automatically by ad-domain-join.sh
+# Description: SSSD configuration generated automatically by linux-ad-domain-join.sh
 # Author:      Lucas Bonfim de Oliveira Lima (soulucasbonfim)
 # Domain:      $REALM
 # Hostname:    $HOST_FQDN
