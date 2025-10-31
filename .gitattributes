@@ -1,0 +1,26 @@
+# ======================================================================
+# Git Attributes — line endings and normalization policy
+# ----------------------------------------------------------------------
+# Ensures shell scripts use LF endings even when edited on Windows
+# and that text files are normalized for cross-platform consistency.
+# ======================================================================
+
+# Force Unix (LF) line endings for shell scripts
+*.sh text eol=lf
+
+# Normalize text-based files automatically
+*.md text
+*.txt text
+*.ini text
+*.yml text
+*.yaml text
+*.conf text
+*.service text
+
+# Prevent Git from treating binary assets as text
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.ico binary
+*.pdf binary
