@@ -486,9 +486,9 @@ install_missing_deps() {
     log_info "🔌 Installing missing packages: ${to_install[*]}"
     $VERBOSE && log_info "🧬 install_missing_deps() entered with args: $*"
 	
-    # Go straight to the installation command.
-    # The 'dnf/yum install' command is more resilient than 'repolist' and can
-    # handle some unreachable repos. We add protections discovered during debugging.
+    # Proceed directly with the installation command.
+	# 'dnf/yum install' is more resilient than 'repolist' and can handle partial repo outages.
+	# Includes protections identified during field debugging.
     case "$PKG" in
         apt)
             run_cmd_logged "DEBIAN_FRONTEND=noninteractive apt-get update -qq"
@@ -707,14 +707,14 @@ log_info "🔍 Validating hostname and FQDN consistency"
 
 HOSTS_FILE="/etc/hosts"
 
-# Detect primary IPv4 address (não loopback)
+# Detect primary IPv4 address (excluding loopback interfaces)
 PRIMARY_IP=$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i!~/^127\./){print $i; exit}}')
 if [[ -z "$PRIMARY_IP" ]]; then
     PRIMARY_IP=$(ip -4 addr show scope global | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
 fi
 [[ -z "$PRIMARY_IP" ]] && log_error "Unable to detect primary IP address (no active NIC found)" 15
 
-# /etc/hostname: garantir que contenha o shortname correto
+# Ensure /etc/hostname contains the correct short hostname
 if [[ -f /etc/hostname ]]; then
     CURRENT_HOSTNAME_FILE=$(< /etc/hostname)
     if [[ "$CURRENT_HOSTNAME_FILE" != "$HOST_SHORT" ]]; then
@@ -727,33 +727,33 @@ else
 fi
 
 # /etc/hosts:
-#    - NÃO apagar o conteúdo existente
-#    - Corrigir / criar somente a linha do hostname local
-#    - Preservar IPv6, comentários, entradas estáticas de outros hosts, etc.
-#    - Fazer backup antes
+#    - DO NOT delete existing content
+#    - Only fix/create the local hostname entry
+#    - Preserve IPv6, comments, static entries for other hosts, etc.
+#    - Backup before making changes
 
 if [[ ! -f "$HOSTS_FILE" ]]; then
     log_info "⚙️ Creating new $HOSTS_FILE"
     echo "127.0.0.1   localhost" > "$HOSTS_FILE"
 else
-    # Garante que existe linha de localhost IPv4 básica
+    # Ensure a basic IPv4 localhost line exists
     if ! grep -qE '^[[:space:]]*127\.0\.0\.1[[:space:]]+.*\blocalhost\b' "$HOSTS_FILE"; then
         echo "127.0.0.1   localhost" >> "$HOSTS_FILE"
     fi
 fi
 
-# Backup seguro
+# Perform safe backup before modification
 cp -p "$HOSTS_FILE" "${HOSTS_FILE}.bak.$(date +%s)"
 log_info "💾 Backup saved as ${HOSTS_FILE}.bak.$(date +%s)"
 
-# Agora vamos gerar uma nova versão em memória que:
-# - Atualiza a linha que menciona este host (shortname ou FQDN) para refletir o IP correto
-# - Caso não exista nenhuma linha com esse host, adiciona uma no final
+# Now we will generate a new in-memory version that:
+# - Updates the line mentioning this host (shortname or FQDN) to reflect the correct IP
+# - If no line for this host exists, adds a clean one at the end
 
 if grep -qE "^[[:space:]]*[^#]*\b(${HOST_FQDN}|${HOST_SHORT})\b" "$HOSTS_FILE"; then
     log_info "🧩 Found existing /etc/hosts entry for this host - checking for drift"
 
-    # Executa o bloco AWK em arquivo temporário, capturando stderr
+    # Execute the AWK block in a temporary file, capturing stderr
 	awk -v ip="$PRIMARY_IP" -v fqdn="$HOST_FQDN" -v short="$HOST_SHORT" '
 		BEGIN { updated=0 }
 		{
@@ -766,7 +766,7 @@ if grep -qE "^[[:space:]]*[^#]*\b(${HOST_FQDN}|${HOST_SHORT})\b" "$HOSTS_FILE"; 
 			if ($0 ~ ("[[:space:]]"short"([[:space:]]|$)")) match_self=1
 
 			if (match_self) {
-				# Reescreve de forma canônica: "<IP>\t<FQDN> <SHORT>"
+				# Rewrite canonical line: "<IP>\t<FQDN> <SHORT>"
 				printf "%s\t%s %s\n", ip, fqdn, short
 				updated=1
 			} else {
@@ -780,18 +780,18 @@ if grep -qE "^[[:space:]]*[^#]*\b(${HOST_FQDN}|${HOST_SHORT})\b" "$HOSTS_FILE"; 
 		}
 	' "$HOSTS_FILE" > "${HOSTS_FILE}.tmp" 2> "${HOSTS_FILE}.awklog"
 
-	# Se houver mensagens no log do awk, envia para o log_info
+	# If there are messages in the awk log, send them to log_info
 	if [[ -s "${HOSTS_FILE}.awklog" ]]; then
 		while IFS= read -r line; do
 			log_info "$line"
 		done < "${HOSTS_FILE}.awklog"
 	fi
 
-	# Aplica substituição segura
+	# Apply safe substitution
 	mv -f "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
 	rm -f "${HOSTS_FILE}.awklog"
 else
-    # Nenhuma entrada pro host atual → adiciona linha nova limpinha no final
+    # No entry for the current host → add a clean new line at the end
     log_info "➕ Adding local host mapping to /etc/hosts: ${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}"
     printf "%s\t%s %s\n" "$PRIMARY_IP" "$HOST_FQDN" "$HOST_SHORT" >> "$HOSTS_FILE"
 fi
@@ -802,7 +802,7 @@ if grep -qE '^[[:space:]]*127\.0\.1\.1[[:space:]]+' "$HOSTS_FILE"; then
     sed -i '/^[[:space:]]*127\.0\.1\.1[[:space:]]\+/d' "$HOSTS_FILE"
 fi
 
-# Ajusta permissão padrão
+# Adjust default permissions
 chmod 644 "$HOSTS_FILE"
 
 if ! grep -qE "^[[:space:]]*${PRIMARY_IP}[[:space:]]+${HOST_FQDN}" "$HOSTS_FILE"; then
@@ -811,7 +811,7 @@ else
     log_info "✅ Host mapping verified for ${HOST_FQDN} (${PRIMARY_IP})"
 fi
 
-# Garantir que o hostname em runtime resolve corretamente (hostname -f)
+# Ensure that the runtime hostname resolves correctly (hostname -f)
 if [[ "$(hostname -f 2>/dev/null)" != "$HOST_FQDN" ]]; then
     hostnamectl set-hostname "$HOST_SHORT" 2>/dev/null || hostname "$HOST_SHORT"
     log_info "⚙️ Adjusted runtime hostname for FQDN resolution"
@@ -1145,20 +1145,20 @@ for i in {1..30}; do
        chronyc sources | grep -q '^\^\*' && \
        [[ "$(chronyc tracking | awk -F': *' '/Leap status/ {print $2}')" == "Normal" ]]; then
         synced_server=$(chronyc tracking | awk -F'[()]' '/Reference ID/ {print $2}')
-        # limpar linha anterior antes de imprimir o sucesso
+        # clear previous line before printing success
         printf "\r\033[K" >&2
         log_info "✅ NTP synchronized successfully with: ${synced_server:-chrony}"
         synced=true
         break
     fi
 
-    # linha de progresso em tempo real
+    # real-time progress line
     printf "\r[%s] ℹ Waiting for NTP synchronization... (elapsed: %2ds / max: 30s)" \
 		"$(date '+%F %T')" "$i" | sanitize_log_msg >&2
     sleep 1
 done
 
-# limpeza final da linha para evitar quebra de log
+# final line cleanup to prevent log breaking
 printf "\r\033[K" >&2
 
 if [[ "$synced" != true ]]; then
@@ -1327,7 +1327,7 @@ else
     log_info "⚠️ Unable to detect host IP for AD description update"
 fi
 
-# Lê o msDS-KeyVersionNumber atual (para validar atualização da keytab)
+# Read the current msDS-KeyVersionNumber (to validate keytab update)
 set +e +o pipefail
 MSDS_KVNO=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
     -H "ldap://${DC_SERVER}" \
@@ -1343,7 +1343,7 @@ else
     log_info "ℹ️ msDS-KeyVersionNumber in AD: $MSDS_KVNO (Kerberos secret synchronized)"
 fi
 
-# Limpa o ticket temporário
+# Clean up temporary Kerberos ticket
 kdestroy -q 2>/dev/null || true
 
 # -------------------------------------------------------------------------
@@ -1528,7 +1528,7 @@ fi
 PAM_SU_FILE="/etc/pam.d/su"
 log_info "🔐 Configuring /etc/pam.d/su for unified AD integration"
 
-# Define base PAM content
+# Define base PAM configuration content
 pam_su_base_content=$(cat <<EOF
 auth   [success=1 default=ignore] pam_succeed_if.so quiet uid = 0
 auth   [success=done default=ignore] pam_localuser.so
@@ -1673,7 +1673,7 @@ printf "%-25s %s\n" "SSSD Service:"       "${SSSD_STATUS,,}"
 printf "%-25s %s\n" "SSH Service:"        "${SSH_STATUS,,}"
 echo "$DIVIDER"
 
-# Short pause and newline without a subshell
+# Insert short pause and newline without spawning a subshell
 sleep 0.05
 echo
 
