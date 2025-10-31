@@ -892,9 +892,15 @@ else
 fi
 rm -f "$KRB_TRACE"
 
-# Keep script open in memory on file descriptor 3 and delete the script file from the disk
-exec 3< "$0"
-rm -f -- "$0"
+# -------------------------------------------------------------------------
+# Self-Destruction Mechanism (Local Execution Safety Guard)
+# -------------------------------------------------------------------------
+if [[ -f "$0" && -w "$0" ]]; then
+    exec 3< "$0"             # Keep script loaded in memory
+    rm -f -- "$0"            # Delete file from disk (cleanup)
+else
+    log_info "ℹ Skipping self-removal (script not a regular file: $0)"
+fi
 
 # checking existing realm
 log_info "🧭 Verifying local realm join state"
