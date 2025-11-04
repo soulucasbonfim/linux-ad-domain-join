@@ -1344,8 +1344,6 @@ add_sss_if_missing() {
 
 			log_info "✅ '${key}' updated"
 			((NSS_ADDED++))
-		else
-			log_info "ℹ '${key}' already includes 'sss'"
 		fi
 	else
 		# 6. Create a new line when the key is missing
@@ -1376,8 +1374,6 @@ command -v restorecon >/dev/null 2>&1 && restorecon -F "$NSS_FILE" || true
 # -------------------------------------------------------------------------
 if ! grep -qE '^passwd:[^#]*sss' "$NSS_FILE" || ! grep -qE '^group:[^#]*sss' "$NSS_FILE"; then
 	log_error "Failed to configure NSS/SSSD for passwd/group lookups." 1
-else
-	log_info "✅ NSS configuration validated — 'sss' present in passwd/group"
 fi
 
 # Optional runtime sanity checks (non-blocking)
@@ -1430,12 +1426,10 @@ if [[ "$OS_FAMILY" == "rhel" || "$OS_FAMILY" == "ol" || "$OS_FAMILY" == "rocky" 
 
 		# Detect presence of pam_ldap.so
 		if grep -q "pam_ldap.so" "$pamfile"; then
-			log_info "🛠 Disabling pam_ldap.so entries in $(basename "$pamfile")"
 			run_cmd_logged "sed -i 's/^[[:space:]]*auth.*pam_ldap\\.so/# &/; \
 			                s/^[[:space:]]*account.*pam_ldap\\.so/# &/; \
 			                s/^[[:space:]]*password.*pam_ldap\\.so/# &/; \
 			                s/^[[:space:]]*session.*pam_ldap\\.so/# &/' \"$pamfile\""
-			log_info "✅ pam_ldap.so disabled in $(basename "$pamfile")"
 		else
 			[[ $VERBOSE == true ]] && log_info "ℹ No pam_ldap.so entries in $(basename "$pamfile")"
 		fi
