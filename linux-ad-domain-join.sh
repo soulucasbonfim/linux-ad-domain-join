@@ -96,13 +96,21 @@ set -euo pipefail
 # -------------------------------------------------------------------------
 sanitize_log_msg() {
     LC_ALL=C sed -E '
-        s/⚠|⚠️|❗|❕|🚨|📛|🧯/[!]/g;
-        s/ℹ|ℹ️|🧵|🕒|📡|🌐|💡|🧬|🧭|⏰|🧾|🪪/[i]/g;
-        s/🔁|🔧|🛠|🛠️|🧩|🏷|💾|♻|🚚|⚙️|⚙|🏷️|🧹|🔗|🔌|🔄|↪|🛡️|🧱|🗂|🗂️|🧰|🛡/[>]/g;
-        s/🛑|🚫|❌/[x]/g;
-        s/🔑|🔐|✅|🌟|🔒|➕|🚀/[+]/g;
+        # Warnings / Alerts
+        s/⚠|⚠️|❗|❕|🚨|📛|🧯|🔥|💣|🧨/[!]/g;
+        # Informational / Neutral
+        s/ℹ|ℹ️|🧵|🕒|📡|🌐|💡|🧬|🧭|⏰|🧾|🪪|🧠|🪶|🔢|💬|📘|🔋|🧮/[i]/g;
+        # Operational / Progress / Configuration
+        s/🔁|🔧|🛠|🛠️|🧩|🏷|💾|♻|🚚|⚙️|⚙|🏷️|🧹|🔗|🔌|🔄|↪|🛡️|🧱|🗂|🗂️|🧰|🛡|📦|📎|🪄/[>]/g;
+        # Errors / Failures
+        s/🛑|🚫|❌|🪫/[x]/g;
+        # Success / Completion
+        s/🔑|🔐|✅|🌟|🔒|➕|🚀|🔓/[+]/g;
+        # Lookup / Tests
         s/🔍|🧪|🔎|⏳/[*]/g;
+        # Neutral separators
         s/🚪/[-]/g;
+        # Remove invisible variation selectors
         s/\ufe0f//g
     '
 }
@@ -1044,27 +1052,395 @@ fi
 chmod 644 "$KRB_CONF"
 log_info "✅ /etc/krb5.conf regenerated for realm $REALM_UPPER"
 
-# enable mkhomedir
+# -------------------------------------------------------------------------
+# Enable SSSD and PAM mkhomedir (per-distro native)
+# -------------------------------------------------------------------------
 log_info "🔑 Configuring PAM for SSSD login and mkhomedir"
+
 case $OS_FAMILY in
-    debian)
-		run_cmd "pam-auth-update --enable sss mkhomedir --force"
-        ;;
-    rhel)
-        RHEL_MAJOR=$(rpm -q --qf '%{VERSION}' $(rpm -qf /etc/redhat-release) | cut -d. -f1)
-        if (( RHEL_MAJOR < 8 )); then
-            # Use authconfig (RHEL/CentOS 6/7) with locale clean to avoid warnings
-            run_cmd "LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --update"
-        else
-            # Use authselect (RHEL 8+)
-            run_cmd_logged "authselect select sssd with-mkhomedir --force"
-            run_cmd_logged "systemctl enable --now oddjobd"
-        fi
-        ;;
-    suse)
-		run_cmd "pam-config -a --sss --mkhomedir"
-        ;;
+	debian)
+		run_cmd_logged "pam-auth-update --enable sss mkhomedir --force"
+	;;
+	rhel|ol|rocky|almalinux|centos)
+		RHEL_MAJOR=$(rpm -q --qf '%{VERSION}' $(rpm -qf /etc/redhat-release) | cut -d. -f1)
+		if (( RHEL_MAJOR < 8 )); then
+			# RHEL/CentOS/OL 6–7 → authconfig
+			run_cmd_logged "LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --update"
+		else
+			# RHEL/OL 8+ → authselect
+			run_cmd_logged "authselect select sssd with-mkhomedir --force"
+			run_cmd_logged "systemctl enable --now oddjobd"
+		fi
+	;;
+	suse)
+		run_cmd_logged "pam-config -a --sss --mkhomedir"
+	;;
+	*)
+		log_info "⚠ Unsupported OS_FAMILY for PAM automation: $OS_FAMILY"
+	;;
 esac
+
+# -------------------------------------------------------------------------
+# Ensure oddjob mkhomedir D-Bus registration (RHEL/OL fix, NO installs here)
+# Place this block right AFTER enabling mkhomedir (authconfig/authselect)
+# -------------------------------------------------------------------------
+
+# Only for RHEL-like families
+if [[ "$OS_FAMILY" =~ ^(rhel|ol|centos|rocky|almalinux)$ ]]; then
+    log_info "🧩 Verifying oddjob mkhomedir D-Bus registration (no package installs)"
+
+    DBUS_SVC="/usr/share/dbus-1/system-services/com.redhat.oddjob.service"
+    ODDJOB_XML="/etc/oddjobd.conf.d/mkhomedir.conf"
+    ODDJOB_SERVICE="oddjobd.service"
+    ODDJOB_CHANGED=0
+
+    mkdir -p "$(dirname "$DBUS_SVC")" "$(dirname "$ODDJOB_XML")"
+
+    # Create/repair the D-Bus service auto-activation file (idempotent)
+    if [[ ! -f "$DBUS_SVC" ]]; then
+        log_info "[>] Restoring D-Bus service file: $DBUS_SVC"
+        install -m 0644 -D /dev/stdin "$DBUS_SVC" <<'EOF'
+[D-BUS Service]
+Name=com.redhat.oddjob
+Exec=/usr/sbin/oddjobd -n
+User=root
+SystemdService=oddjobd.service
+EOF
+        ODDJOB_CHANGED=1
+    fi
+
+    # Create/repair the oddjob XML interface for mkhomedir (idempotent)
+    if [[ ! -f "$ODDJOB_XML" ]]; then
+        log_info "[>] Restoring oddjob mkhomedir XML: $ODDJOB_XML"
+        install -m 0644 -D /dev/stdin "$ODDJOB_XML" <<'EOF'
+<oddjobconfig version="1.0">
+  <service name="com.redhat.oddjob_mkhomedir">
+    <object name="/">
+      <interface name="com.redhat.oddjob_mkhomedir">
+        <method name="CreateHome">
+          <arg type="string" name="username"/>
+          <arg type="string" name="homedir"/>
+          <arg type="boolean" name="create_dir"/>
+          <execute helper="/usr/sbin/oddjob-mkhomedir" user="root"/>
+        </method>
+      </interface>
+    </object>
+  </service>
+</oddjobconfig>
+EOF
+        ODDJOB_CHANGED=1
+    fi
+
+    # Apply SELinux contexts (if available) and reload managers when files change
+    if (( ODDJOB_CHANGED == 1 )); then
+        command -v restorecon >/dev/null 2>&1 && restorecon -F "$DBUS_SVC" "$ODDJOB_XML" 2>/dev/null || true
+        run_cmd_logged "systemctl daemon-reload"
+        if command -v busctl >/dev/null 2>&1; then
+            busctl call org.freedesktop.DBus / org.freedesktop.DBus ReloadConfig 2>/dev/null || true
+        else
+            dbus-send --system --type=method_call --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 || true
+        fi
+    fi
+
+    # Ensure service is enabled/active
+    if ! systemctl is-enabled "$ODDJOB_SERVICE" &>/dev/null; then
+        log_info "[>] Enabling $ODDJOB_SERVICE"
+        run_cmd_logged "systemctl enable $ODDJOB_SERVICE"
+    fi
+    if ! systemctl is-active --quiet "$ODDJOB_SERVICE"; then
+        log_info "[>] Starting $ODDJOB_SERVICE"
+        run_cmd_logged "systemctl start $ODDJOB_SERVICE"
+    fi
+
+    # Tolerant D-Bus probe (AccessDenied is common on OL7 and not fatal)
+    if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
+        log_info "✅ oddjob mkhomedir D-Bus service operational"
+    else
+        log_info "ℹ️ D-Bus Hello denied or unavailable — common on OL7; PAM auto-activation may still work"
+    fi
+
+    # Final health validation (files + service)
+    svc_state="inactive"
+    systemctl is-active "$ODDJOB_SERVICE" &>/dev/null && svc_state="active"
+    if [[ -f "$DBUS_SVC" && -f "$ODDJOB_XML" && "$svc_state" == "active" ]]; then
+        log_info "✅ oddjob mkhomedir registration healthy (files present; service active)"
+    else
+        log_info "⚠️ oddjob mkhomedir registration may be incomplete (svc=$svc_state, dbus_svc: $( [[ -f $DBUS_SVC ]] && echo ok || echo missing ), xml: $( [[ -f $ODDJOB_XML ]] && echo ok || echo missing ))"
+    fi
+fi
+
+# -------------------------------------------------------------------------
+# Defensive PAM verification (cross-distro, non-intrusive)
+# -------------------------------------------------------------------------
+log_info "🧩 Verifying PAM stack consistency (non-intrusive check)"
+
+# Detect primary PAM layout
+case "$OS_FAMILY" in
+	rhel|rocky|almalinux|centos|ol)
+		PAM_FILES=("/etc/pam.d/system-auth" "/etc/pam.d/password-auth")
+		;;
+	debian|ubuntu|suse)
+		PAM_FILES=("/etc/pam.d/common-auth" "/etc/pam.d/common-account" "/etc/pam.d/common-session" "/etc/pam.d/common-password")
+		;;
+	*)
+		log_info "ℹ Unknown PAM layout for $OS_FAMILY — skipping PAM consistency check"
+		PAM_FILES=()
+		;;
+esac
+
+for file in "${PAM_FILES[@]}"; do
+	if [[ ! -f "$file" ]]; then
+		log_info "ℹ Skipping non-existent PAM file: $file"
+		continue
+	fi
+
+	PAM_BACKUP="${file}.bak.$(date +%Y%m%d%H%M%S)"
+	run_cmd "cp -p \"$file\" \"$PAM_BACKUP\"" && log_info "💾 Backup saved: $PAM_BACKUP"
+
+	# Disable legacy PAM modules (safe-comment)
+	if grep -Eq 'pam_(ldap|winbind|nis)\.so' "$file"; then
+		run_cmd_logged "sed -i '/pam_ldap\\.so/s/^/# disabled legacy -> /' \"$file\""
+		run_cmd_logged "sed -i '/pam_winbind\\.so/s/^/# disabled legacy -> /' \"$file\""
+		run_cmd_logged "sed -i '/pam_nis\\.so/s/^/# disabled legacy -> /' \"$file\""
+	fi
+
+	# Guarantee pam_sss.so presence per section
+	for context in auth account password session; do
+		if ! grep -Eq "^[[:space:]]*${context}[[:space:]].*pam_sss\\.so" "$file"; then
+			case "$context" in
+				auth)
+					echo "auth        sufficient    pam_sss.so forward_pass" >>"$file"
+					;;
+				account)
+					echo "account     [default=bad success=ok user_unknown=ignore] pam_sss.so" >>"$file"
+					;;
+				password)
+					echo "password    sufficient    pam_sss.so use_authtok" >>"$file"
+					;;
+				session)
+					echo "session     optional      pam_sss.so" >>"$file"
+					;;
+			esac
+			log_info "🧩 Added missing pam_sss.so for $context → $(basename "$file")"
+		fi
+	done
+done
+
+# Re-run consistency for RHEL-like systems
+if [[ "$OS_FAMILY" =~ ^(rhel|ol|rocky|almalinux|centos)$ ]]; then
+	if command -v authconfig >/dev/null 2>&1; then
+		run_cmd_logged "LANG=C LC_ALL=C authconfig --update"
+	fi
+fi
+
+# -------------------------------------------------------------------------
+# Final PAM validation (cross-distro, symlink-aware, fallback-safe)
+# -------------------------------------------------------------------------
+log_info "🔍 Performing PAM validation with symbolic link awareness"
+
+PAM_VALIDATE_FILES=()
+case "$OS_FAMILY" in
+	rhel|ol|centos|rocky|almalinux)
+		for f in /etc/pam.d/system-auth /etc/pam.d/system-auth-ac /etc/pam.d/password-auth /etc/pam.d/password-auth-ac; do
+			[[ -e "$f" ]] && PAM_VALIDATE_FILES+=("$f")
+		done
+		;;
+	debian|ubuntu)
+		for f in /etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-password /etc/pam.d/common-session; do
+			[[ -e "$f" ]] && PAM_VALIDATE_FILES+=("$f")
+		done
+		;;
+	suse)
+		for f in /etc/pam.d/common-auth-pc /etc/pam.d/common-account-pc /etc/pam.d/common-password-pc /etc/pam.d/common-session-pc; do
+			[[ -e "$f" ]] && PAM_VALIDATE_FILES+=("$f")
+		done
+		;;
+esac
+
+if grep -E "pam_sss\.so" "${PAM_VALIDATE_FILES[@]}" 2>/dev/null | grep -qv '^[[:space:]]*#'; then
+	log_info "✅ PAM integration validated — pam_sss.so is active and correctly configured"
+else
+	log_info "⚠️ PAM validation ambiguous — no active pam_sss.so lines detected"
+	log_info "ℹ This may occur on OL7/RHEL7 due to symlinked .ac templates"
+	log_info "ℹ If authentication via SSSD works, this warning can be ignored"
+fi
+
+# -------------------------------------------------------------------------
+# Ensure NSS configuration uses SSSD (cross-distro, legacy-friendly)
+# -------------------------------------------------------------------------
+log_info "🔧 Validating /etc/nsswitch.conf for SSSD integration"
+
+# Resolve the canonical nsswitch path (SUSE may ship defaults under /usr/etc)
+NSS_FILE="/etc/nsswitch.conf"
+[[ ! -f "$NSS_FILE" && -f /usr/etc/nsswitch.conf ]] && NSS_FILE="/usr/etc/nsswitch.conf"
+
+# If the file does not exist, create a minimal, sane default first (0644)
+if [[ ! -f "$NSS_FILE" ]]; then
+	log_info "⚙ Creating minimal $NSS_FILE"
+	umask 022
+	cat >"$NSS_FILE" <<'EOF'
+passwd:		files
+shadow:		files
+group:		files
+hosts:		files dns
+services:	files
+netgroup:	files
+EOF
+	chmod 0644 "$NSS_FILE"
+fi
+
+# Basic access checks (after creation above to avoid false negatives)
+[[ -r "$NSS_FILE" ]] || log_error "Cannot read $NSS_FILE — verify overlay/permissions." 1
+[[ -w "$(dirname "$NSS_FILE")" ]] || log_error "NSS path $(dirname "$NSS_FILE") is not writable (read-only filesystem)." 1
+
+# Detect immutable attribute early (common in hardened images)
+if command -v lsattr >/dev/null 2>&1; then
+	LSATTR_FLAGS=$(lsattr "$NSS_FILE" 2>/dev/null | awk '{print $1}')
+	if echo "$LSATTR_FLAGS" | grep -q 'i'; then
+		log_error "$NSS_FILE is immutable (chattr +i). Remove the immutable bit to proceed." 1
+	fi
+fi
+
+# Normalize line endings (CRLF-safe) before backup
+sed -i 's/\r$//' "$NSS_FILE"
+
+# Choose a portable sed extended-regex flag (-E preferred, fallback to -r)
+if echo | sed -E 's/(.*)//' >/dev/null 2>&1; then
+	SED_EXT='-E'
+elif echo | sed -r 's/(.*)//' >/dev/null 2>&1; then
+	SED_EXT='-r'
+else
+	log_error "sed without extended regex support (-E/-r) — install a compatible sed." 1
+fi
+
+# Backup prior to modifications
+NSS_BACKUP="${NSS_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+run_cmd "cp -p \"$NSS_FILE\" \"$NSS_BACKUP\""
+log_info "💾 Backup saved as $NSS_BACKUP"
+
+# -------------------------------------------------------------------------
+# Helper: safely ensure `key:` line contains `sss` (cross-distro safe)
+# -------------------------------------------------------------------------
+add_sss_if_missing() {
+	local key="$1"
+	local pattern="^[[:space:]]*${key}:"
+
+	# 1. Does a non-commented line exist for this key?
+	if grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
+		# 2. If it exists but lacks 'sss', patch it
+		if ! grep -qE "${pattern}[^#]*sss" "$NSS_FILE"; then
+			log_info "🛠 Adding 'sss' to '${key}' entry"
+
+			# 3. Remove conflicting legacy sources, normalize whitespace
+			run_cmd_logged "sed -i ${SED_EXT} \"s/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g\" \"$NSS_FILE\""
+
+			# 4. UNIVERSAL INSERTION:
+			#    Append 'sss' right before an inline comment (if any) or at EOL.
+			#    This avoids non-greedy regex (?) which is not universally supported.
+			run_cmd_logged "sed -i ${SED_EXT} \"s/\\(${pattern}[^#]*\\)\\(#.*\\)\$/\\1 sss \\2/; t; s/\\(${pattern}[^#]*\\)\$/\\1 sss/\" \"$NSS_FILE\""
+
+			# 5. Final dedupe/normalize (avoid 'sss sss')
+			run_cmd_logged "sed -i ${SED_EXT} \"s/sss[[:space:]]\\+sss/sss/g; s/[[:space:]]\\{2,\\}/ /g\" \"$NSS_FILE\""
+
+			log_info "✅ '${key}' updated"
+			((NSS_ADDED++))
+		else
+			log_info "ℹ '${key}' already includes 'sss'"
+		fi
+	else
+		# 6. Create a new line when the key is missing
+		echo "${key}: files sss" >>"$NSS_FILE"
+		log_info "➕ Created missing '${key}' entry"
+		((NSS_CREATED++))
+	fi
+}
+
+# Apply to the core maps
+for section in passwd shadow group services netgroup; do
+	add_sss_if_missing "$section"
+done
+
+# Add sudoers on RHEL/SUSE (Debian/Ubuntu usually manage sudoers via PAM/files, not NSS)
+if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
+	add_sss_if_missing "sudoers"
+fi
+
+# Final whitespace normalization (collapse multiple spaces, trim ends)
+awk '{$1=$1}1' "$NSS_FILE" > "${NSS_FILE}.tmp" && mv "${NSS_FILE}.tmp" "$NSS_FILE"
+
+# Restore SELinux context if applicable
+command -v restorecon >/dev/null 2>&1 && restorecon -F "$NSS_FILE" || true
+
+# -------------------------------------------------------------------------
+# Validation and cache refresh
+# -------------------------------------------------------------------------
+if ! grep -qE '^passwd:[^#]*sss' "$NSS_FILE" || ! grep -qE '^group:[^#]*sss' "$NSS_FILE"; then
+	log_error "Failed to configure NSS/SSSD for passwd/group lookups." 1
+else
+	log_info "✅ NSS configuration validated — 'sss' present in passwd/group"
+fi
+
+# Optional runtime sanity checks (non-blocking)
+getent passwd root >/dev/null || log_info "⚠ NSS runtime check (passwd) inconclusive — verify SSSD/NSCD"
+getent group root >/dev/null || log_info "⚠ NSS runtime check (group) inconclusive — verify SSSD/NSCD"
+
+# If legacy nslcd is present, stop it to avoid conflicts with SSSD
+if command -v systemctl &>/dev/null; then
+	systemctl list-units --type=service 2>/dev/null | grep -q '^nslcd\.service' && run_cmd_logged "systemctl stop nslcd || true"
+fi
+
+# Restart order: SSSD first (reads nsswitch/sssd.conf), then NSCD to clear caches
+if command -v systemctl &>/dev/null; then
+	# 1. SSSD
+	if systemctl list-unit-files 2>/dev/null | grep -q '^sssd' || systemctl is-active sssd &>/dev/null; then
+		log_info "🔄 Restarting SSSD"
+		run_cmd_logged "systemctl restart sssd || true"
+	fi
+	# 2. NSCD
+	if systemctl list-unit-files 2>/dev/null | grep -q '^nscd' || systemctl is-active nscd &>/dev/null; then
+		log_info "🔄 Restarting NSCD"
+		run_cmd_logged "systemctl restart nscd || true"
+	fi
+else
+	# Non-systemd fallback
+	pgrep sssd &>/dev/null && { pkill -HUP sssd; log_info "🔄 Reloaded sssd"; }
+	pgrep nscd &>/dev/null && { pkill -HUP nscd; log_info "🔄 Reloaded nscd"; }
+fi
+
+# Explicit SSSD cache flush when available
+if command -v sss_cache >/dev/null 2>&1; then
+	# This only fails if SSSD is not running, which is fine.
+	sss_cache -E || true
+fi
+
+log_info "🌟 NSS/SSSD integration completed successfully"
+
+# -------------------------------------------------------------------------
+# Disable legacy pam_ldap if SSSD is active (RHEL-like systems)
+# -------------------------------------------------------------------------
+if [[ "$OS_FAMILY" == "rhel" || "$OS_FAMILY" == "ol" || "$OS_FAMILY" == "rocky" || "$OS_FAMILY" == "almalinux" ]]; then
+	log_info "🧩 Checking for legacy pam_ldap entries (system-auth, password-auth)"
+
+	for pamfile in /etc/pam.d/system-auth /etc/pam.d/password-auth; do
+		[[ -f "$pamfile" ]] || continue
+
+		# Backup
+		cp -p "$pamfile" "${pamfile}.bak.$(date +%Y%m%d%H%M%S)"
+		[[ $VERBOSE == true ]] && log_info "💾 Backup saved: ${pamfile}.bak.$(date +%Y%m%d%H%M%S)"
+
+		# Detect presence of pam_ldap.so
+		if grep -q "pam_ldap.so" "$pamfile"; then
+			log_info "🛠 Disabling pam_ldap.so entries in $(basename "$pamfile")"
+			run_cmd_logged "sed -i 's/^[[:space:]]*auth.*pam_ldap\\.so/# &/; \
+			                s/^[[:space:]]*account.*pam_ldap\\.so/# &/; \
+			                s/^[[:space:]]*password.*pam_ldap\\.so/# &/; \
+			                s/^[[:space:]]*session.*pam_ldap\\.so/# &/' \"$pamfile\""
+			log_info "✅ pam_ldap.so disabled in $(basename "$pamfile")"
+		else
+			[[ $VERBOSE == true ]] && log_info "ℹ No pam_ldap.so entries in $(basename "$pamfile")"
+		fi
+	done
+fi
 
 # configure NTP with domain
 log_info "⏰ Configuring NTP to use domain ($DOMAIN)"
@@ -1604,15 +1980,45 @@ else
     log_info "⚠️ SSH is active, but no known systemd unit found. Skipping restart."
 fi
 
-# configure sudoers
-SUDO_F=/etc/sudoers.d/ad-admin-groups
+# -------------------------------------------------------------------------
+# Ensure explicit inclusion of AD admin sudoers file (safe and idempotent)
+# -------------------------------------------------------------------------
+SUDO_F="/etc/sudoers.d/ad-admin-groups"
+SUDO_MAIN="/etc/sudoers"
+
 log_info "🛡️ Configuring sudoers file: $SUDO_F"
 
+# 1. Ensure target directory exists
+mkdir -p "$(dirname "$SUDO_F")"
+
+# 2. Create or refresh AD admin sudoers definition
 cat >"$SUDO_F" <<EOF
 %$ADM ALL=(ALL) NOPASSWD: ALL
 %$ADM_ALL ALL=(ALL) NOPASSWD: ALL
 EOF
-run_cmd "chmod 440 $SUDO_F"
+chmod 440 "$SUDO_F"
+
+# 3. Check if /etc/sudoers already includes this specific file
+if ! grep -Eq "^[[:space:]]*#include[[:space:]]+$SUDO_F" "$SUDO_MAIN"; then
+	log_info "⚙️ Adding explicit include for $SUDO_F in $SUDO_MAIN"
+
+	# Backup before modification
+	SUDO_BAK="${SUDO_MAIN}.bak.$(date +%Y%m%d%H%M%S)"
+	cp -p "$SUDO_MAIN" "$SUDO_BAK"
+
+	# Append safely at the end of file
+	echo -e "\n# Include AD-specific sudo policy\n#include $SUDO_F" >> "$SUDO_MAIN"
+
+	# Syntax validation (rollback on error)
+	if visudo -c >/dev/null 2>&1; then
+		log_info "✅ Sudoers include added successfully"
+	else
+		log_info "🛑 visudo syntax check failed — restoring previous configuration"
+		mv -f "$SUDO_BAK" "$SUDO_MAIN"
+	fi
+else
+	log_info "✅ Explicit include for $SUDO_F already present in $SUDO_MAIN"
+fi
 
 log_info "🚀 Completed domain join for $DOMAIN"
 
