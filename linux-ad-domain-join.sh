@@ -1343,54 +1343,56 @@ run_cmd "cp -p \"$NSS_FILE\" \"$NSS_BACKUP\""
 log_info "💾 Backup saved as $NSS_BACKUP"
 
 # -------------------------------------------------------------------------
-# Helper: safely ensure `key:` line contains `sss` (cross-distro & legacy-safe)
+# NSS/SSSD line normalization (no functions, no subshells)
 # -------------------------------------------------------------------------
-add_sss_if_missing() {
-	local key="$1"
-	local pattern="^[[:space:]]*${key}:"
-	# Ensure counters exist (even if running under set -u or subshell)
-	: "${NSS_ADDED:=0}"
-	: "${NSS_CREATED:=0}"
+for key in passwd shadow group services netgroup; do
+    pattern="^[[:space:]]*${key}:"
 
-	# 1. Does a non-commented line exist for this key?
-	if grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
-		# 2. If it exists but lacks 'sss', patch it
-		if ! grep -qE "${pattern}[^#]*sss" "$NSS_FILE"; then
+    # 1. Garantir arquivo existente
+    [ -f "$NSS_FILE" ] || touch "$NSS_FILE"
 
-			# 3. Remove conflicting legacy sources (ldap, nis, yp) and normalize whitespace
-			run_cmd_logged "sed -i 's/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g' \"$NSS_FILE\""
+    # 2. Se a chave existe e contém 'sss', ignora
+    if grep -qE "${pattern}[^#]*sss" "$NSS_FILE"; then
+        log_info "ℹ️ '${key}' already includes sss"
+        continue
+    fi
 
-			# 4. UNIVERSAL INSERTION — works from sed 4.1.5 (2006) → 4.9 (2025)
-			#    Using basic regex grouping (\(...\)) avoids unsupported -E/-r flags.
-			run_cmd_logged "sed -i \
-				-e 's/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/' \
-				-e 's/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/' \"$NSS_FILE\""
+    # 3. Se a linha existe mas sem 'sss', normaliza e adiciona
+    if grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
+        log_info "🧩 Updating existing '${key}' entry to include sss"
+        sed -i "s/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g" "$NSS_FILE"
+        sed -i \
+            -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
+            -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_FILE"
+        sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_FILE"
+        log_info "✅ '${key}' updated"
+    else
+        # 4. Se não existe, cria a linha nova
+        echo "${key}: files sss" >>"$NSS_FILE"
+        log_info "➕ Created missing '${key}' entry"
+    fi
+done
 
-			# 5. Final dedupe/normalize (avoid 'sss sss' and extra spaces)
-			run_cmd_logged "sed -i 's/sss[[:space:]]\\+sss/sss/g; s/[[:space:]]\\{2,\\}/ /g' \"$NSS_FILE\""
-
-			log_info "✅ '${key}' updated"
-			((NSS_ADDED++))
-		fi
-	else
-		# 6. Create a new line when the key is missing entirely
-		echo "${key}: files sss" >>"$NSS_FILE"
-		log_info "➕ Created missing '${key}' entry"
-		((NSS_CREATED++))
-	fi
-}
-
-# -------------------------------------------------------------------------
-# Apply to the core maps
-# -------------------------------------------------------------------------
-#for section in passwd shadow group services netgroup; do
-#	add_sss_if_missing "$section"
-#done
-
-# Add sudoers on RHEL/SUSE (Debian/Ubuntu usually manage sudoers via PAM/files, not NSS)
-#if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
-#	add_sss_if_missing "sudoers"
-#fi
+# Add sudoers para RHEL/SUSE
+if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
+    key="sudoers"
+    pattern="^[[:space:]]*${key}:"
+    if ! grep -qE "${pattern}[^#]*sss" "$NSS_FILE"; then
+        if grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
+            sed -i "s/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g" "$NSS_FILE"
+            sed -i \
+                -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
+                -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_FILE"
+            sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_FILE"
+            log_info "✅ '${key}' updated"
+        else
+            echo "${key}: files sss" >>"$NSS_FILE"
+            log_info "➕ Created missing '${key}' entry"
+        fi
+    else
+        log_info "ℹ️ '${key}' already includes sss"
+    fi
+fi
 
 # Final whitespace normalization (collapse multiple spaces, trim ends)
 awk '{$1=$1}1' "$NSS_FILE" > "${NSS_FILE}.tmp" && mv "${NSS_FILE}.tmp" "$NSS_FILE"
