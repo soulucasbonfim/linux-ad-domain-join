@@ -1383,9 +1383,9 @@ add_sss_if_missing() {
 # -------------------------------------------------------------------------
 # Apply to the core maps
 # -------------------------------------------------------------------------
-for section in passwd shadow group services netgroup; do
-	add_sss_if_missing "$section"
-done
+#for section in passwd shadow group services netgroup; do
+#	add_sss_if_missing "$section"
+#done
 
 # Add sudoers on RHEL/SUSE (Debian/Ubuntu usually manage sudoers via PAM/files, not NSS)
 if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
