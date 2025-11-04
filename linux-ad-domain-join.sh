@@ -1388,9 +1388,9 @@ add_sss_if_missing() {
 #done
 
 # Add sudoers on RHEL/SUSE (Debian/Ubuntu usually manage sudoers via PAM/files, not NSS)
-if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
-	add_sss_if_missing "sudoers"
-fi
+#if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
+#	add_sss_if_missing "sudoers"
+#fi
 
 # Final whitespace normalization (collapse multiple spaces, trim ends)
 awk '{$1=$1}1' "$NSS_FILE" > "${NSS_FILE}.tmp" && mv "${NSS_FILE}.tmp" "$NSS_FILE"
