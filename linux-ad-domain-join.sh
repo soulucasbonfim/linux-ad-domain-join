@@ -1319,7 +1319,7 @@ run_cmd "cp -p \"$NSS_FILE\" \"$NSS_BACKUP\""
 log_info "💾 Backup saved as $NSS_BACKUP"
 
 # -------------------------------------------------------------------------
-# Helper: safely ensure `key:` line contains `sss` (cross-distro safe)
+# Helper: safely ensure `key:` line contains `sss` (cross-distro & legacy-safe)
 # -------------------------------------------------------------------------
 add_sss_if_missing() {
 	local key="$1"
@@ -1330,24 +1330,23 @@ add_sss_if_missing() {
 		# 2. If it exists but lacks 'sss', patch it
 		if ! grep -qE "${pattern}[^#]*sss" "$NSS_FILE"; then
 
-			# 3. Remove conflicting legacy sources, normalize whitespace
-			run_cmd_logged "sed -i ${SED_EXT} \"s/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g\" \"$NSS_FILE\""
+			# 3. Remove conflicting legacy sources (ldap, nis, yp) and normalize whitespace
+			run_cmd_logged "sed -i 's/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g' \"$NSS_FILE\""
 
-			# 4. UNIVERSAL INSERTION:
-			#    Append 'sss' right before an inline comment (if any) or at EOL.
-			#    This avoids non-greedy regex (?) which is not universally supported.
-			run_cmd_logged "sed -i ${SED_EXT} \
-				-e \"s/\\(${pattern}[^#]*\\)\\(#.*\\)\$/\\1 sss \\2/\" \
-				-e \"s/\\(${pattern}[^#]*\\)\$/\\1 sss/\" \"$NSS_FILE\""
+			# 4. UNIVERSAL INSERTION — works from sed 4.1.5 (2006) → 4.9 (2025)
+			#    Using basic regex grouping (\(...\)) avoids unsupported -E/-r flags.
+			run_cmd_logged "sed -i \
+				-e 's/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/' \
+				-e 's/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/' \"$NSS_FILE\""
 
-			# 5. Final dedupe/normalize (avoid 'sss sss')
-			run_cmd_logged "sed -i ${SED_EXT} \"s/sss[[:space:]]\\+sss/sss/g; s/[[:space:]]\\{2,\\}/ /g\" \"$NSS_FILE\""
+			# 5. Final dedupe/normalize (avoid 'sss sss' and extra spaces)
+			run_cmd_logged "sed -i 's/sss[[:space:]]\\+sss/sss/g; s/[[:space:]]\\{2,\\}/ /g' \"$NSS_FILE\""
 
 			log_info "✅ '${key}' updated"
 			((NSS_ADDED++))
 		fi
 	else
-		# 6. Create a new line when the key is missing
+		# 6. Create a new line when the key is missing entirely
 		echo "${key}: files sss" >>"$NSS_FILE"
 		log_info "➕ Created missing '${key}' entry"
 		((NSS_CREATED++))
