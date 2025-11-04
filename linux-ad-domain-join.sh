@@ -1293,16 +1293,36 @@ fi
 [[ -r "$NSS_FILE" ]] || log_error "Cannot read $NSS_FILE — verify overlay/permissions." 1
 [[ -w "$(dirname "$NSS_FILE")" ]] || log_error "NSS path $(dirname "$NSS_FILE") is not writable (read-only filesystem)." 1
 
-# Detect immutable attribute early (common in hardened images)
+# -------------------------------------------------------------------------
+# ROBUST IMMUTABILITY DETECTION (lsattr/chattr)
+# -------------------------------------------------------------------------
 if command -v lsattr >/dev/null 2>&1; then
-    # Use -d to query the file itself; tolerate FS without attributes support
-    LSATTR_FLAGS="$(
-        ( lsattr -d -- "$NSS_FILE" 2>/dev/null || true ) | awk '{print $1}'
-    )"
-    # Only act if we actually got flags back; empty means unsupported or not applicable
-    if [[ -n "$LSATTR_FLAGS" ]] && echo "$LSATTR_FLAGS" | grep -q 'i'; then
-        log_error "$NSS_FILE is immutable (chattr +i). Remove the immutable bit to proceed." 1
+    # Temporarily disable -e to tolerate unsupported filesystems (e.g., XFS, Btrfs)
+    set +e
+    LSATTR_SUPPORTED=false
+
+    # Test whether lsattr can actually operate on the target file
+    if lsattr -d -- "$NSS_FILE" >/dev/null 2>&1; then
+        LSATTR_SUPPORTED=true
     fi
+
+    # Re-enable strict error mode
+    set -e
+
+    if $LSATTR_SUPPORTED; then
+        log_info "🧩 Filesystem supports lsattr — checking for immutable attribute"
+
+        # Extract flags safely; tolerate legacy lsattr output or missing fields
+        LSATTR_FLAGS="$(lsattr -d -- "$NSS_FILE" 2>/dev/null | awk '{print $1}' || true)"
+
+        if [[ -n "$LSATTR_FLAGS" ]] && echo "$LSATTR_FLAGS" | grep -q 'i'; then
+            log_error "$NSS_FILE is immutable (chattr +i). Remove the immutable bit to proceed." 1
+        fi
+    else
+        log_info "ℹ lsattr operation not supported by the underlying filesystem — skipping immutability check"
+    fi
+else
+    log_info "ℹ lsattr not available on this system — skipping immutability check"
 fi
 
 # Normalize line endings (CRLF-safe) before backup
