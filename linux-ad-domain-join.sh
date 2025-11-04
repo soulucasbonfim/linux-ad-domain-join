@@ -1353,7 +1353,12 @@ add_sss_if_missing() {
 	fi
 }
 
+# -------------------------------------------------------------------------
 # Apply to the core maps
+# -------------------------------------------------------------------------
+NSS_ADDED=0
+NSS_CREATED=0
+
 for section in passwd shadow group services netgroup; do
 	add_sss_if_missing "$section"
 done
