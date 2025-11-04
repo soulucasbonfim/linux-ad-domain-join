@@ -1324,6 +1324,9 @@ log_info "💾 Backup saved as $NSS_BACKUP"
 add_sss_if_missing() {
 	local key="$1"
 	local pattern="^[[:space:]]*${key}:"
+	# Ensure counters exist (even if running under set -u or subshell)
+	: "${NSS_ADDED:=0}"
+	: "${NSS_CREATED:=0}"
 
 	# 1. Does a non-commented line exist for this key?
 	if grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
@@ -1356,9 +1359,6 @@ add_sss_if_missing() {
 # -------------------------------------------------------------------------
 # Apply to the core maps
 # -------------------------------------------------------------------------
-NSS_ADDED=0
-NSS_CREATED=0
-
 for section in passwd shadow group services netgroup; do
 	add_sss_if_missing "$section"
 done
