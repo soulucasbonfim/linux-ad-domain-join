@@ -1329,7 +1329,6 @@ add_sss_if_missing() {
 	if grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
 		# 2. If it exists but lacks 'sss', patch it
 		if ! grep -qE "${pattern}[^#]*sss" "$NSS_FILE"; then
-			log_info "🛠 Adding 'sss' to '${key}' entry"
 
 			# 3. Remove conflicting legacy sources, normalize whitespace
 			run_cmd_logged "sed -i ${SED_EXT} \"s/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g\" \"$NSS_FILE\""
@@ -1337,7 +1336,9 @@ add_sss_if_missing() {
 			# 4. UNIVERSAL INSERTION:
 			#    Append 'sss' right before an inline comment (if any) or at EOL.
 			#    This avoids non-greedy regex (?) which is not universally supported.
-			run_cmd_logged "sed -i ${SED_EXT} \"s/\\(${pattern}[^#]*\\)\\(#.*\\)\$/\\1 sss \\2/; t; s/\\(${pattern}[^#]*\\)\$/\\1 sss/\" \"$NSS_FILE\""
+			run_cmd_logged "sed -i ${SED_EXT} \
+				-e \"s/\\(${pattern}[^#]*\\)\\(#.*\\)\$/\\1 sss \\2/\" \
+				-e \"s/\\(${pattern}[^#]*\\)\$/\\1 sss/\" \"$NSS_FILE\""
 
 			# 5. Final dedupe/normalize (avoid 'sss sss')
 			run_cmd_logged "sed -i ${SED_EXT} \"s/sss[[:space:]]\\+sss/sss/g; s/[[:space:]]\\{2,\\}/ /g\" \"$NSS_FILE\""
