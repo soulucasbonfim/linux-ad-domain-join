@@ -1343,42 +1343,62 @@ run_cmd "cp -p \"$NSS_FILE\" \"$NSS_BACKUP\""
 log_info "💾 Backup saved as $NSS_BACKUP"
 
 # -------------------------------------------------------------------------
-# NSS/SSSD line normalization (no functions, no subshells)
+# NSS/SSSD line normalization (fully linear, legacy-safe, idempotent)
 # -------------------------------------------------------------------------
 for key in passwd shadow group services netgroup; do
     pattern="^[[:space:]]*${key}:"
 
-    # 1. Garantir arquivo existente
+    # 1. Ensure file exists (covers empty overlayfs scenarios)
     [ -f "$NSS_FILE" ] || touch "$NSS_FILE"
 
-    # 2. Se a chave existe e contém 'sss', ignora
-    if grep -qE "${pattern}[^#]*sss" "$NSS_FILE"; then
+    # 2. Normalize whitespace early to avoid false-positive differences
+    sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_FILE"
+
+    # 3. Skip if entry already includes 'sss' (tolerant to spacing)
+    if grep -Eq "${pattern}[^#]*[[:space:]]sss([[:space:]]|\$)" "$NSS_FILE"; then
         log_info "ℹ️ '${key}' already includes sss"
         continue
     fi
 
-    # 3. Se a linha existe mas sem 'sss', normaliza e adiciona
+    # 4. If entry exists but lacks 'sss', clean and patch it
     if grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
         log_info "🧩 Updating existing '${key}' entry to include sss"
+
+        # Remove conflicting legacy sources and normalize spacing
         sed -i "s/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g" "$NSS_FILE"
+
+        # Insert 'sss' before inline comment or at end of line
         sed -i \
             -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
             -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_FILE"
+
+        # Final normalization (dedupe and collapse spaces)
         sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_FILE"
+
         log_info "✅ '${key}' updated"
     else
-        # 4. Se não existe, cria a linha nova
+        # 5. If missing, create a new valid entry
         echo "${key}: files sss" >>"$NSS_FILE"
         log_info "➕ Created missing '${key}' entry"
     fi
 done
 
-# Add sudoers para RHEL/SUSE
+# -------------------------------------------------------------------------
+# Add sudoers map for RHEL/SUSE (Debian/Ubuntu handle via PAM)
+# -------------------------------------------------------------------------
 if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
     key="sudoers"
     pattern="^[[:space:]]*${key}:"
-    if ! grep -qE "${pattern}[^#]*sss" "$NSS_FILE"; then
+
+    # Normalize once before checks
+    sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_FILE"
+
+    # Skip if 'sss' already present
+    if grep -Eq "${pattern}[^#]*[[:space:]]sss([[:space:]]|\$)" "$NSS_FILE"; then
+        log_info "ℹ️ '${key}' already includes sss"
+    else
         if grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
+            log_info "🧩 Updating existing '${key}' entry to include sss"
             sed -i "s/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g" "$NSS_FILE"
             sed -i \
                 -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
@@ -1389,8 +1409,6 @@ if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
             echo "${key}: files sss" >>"$NSS_FILE"
             log_info "➕ Created missing '${key}' entry"
         fi
-    else
-        log_info "ℹ️ '${key}' already includes sss"
     fi
 fi
 
