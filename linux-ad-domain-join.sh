@@ -1295,10 +1295,14 @@ fi
 
 # Detect immutable attribute early (common in hardened images)
 if command -v lsattr >/dev/null 2>&1; then
-	LSATTR_FLAGS=$(lsattr "$NSS_FILE" 2>/dev/null | awk '{print $1}')
-	if echo "$LSATTR_FLAGS" | grep -q 'i'; then
-		log_error "$NSS_FILE is immutable (chattr +i). Remove the immutable bit to proceed." 1
-	fi
+    # Use -d to query the file itself; tolerate FS without attributes support
+    LSATTR_FLAGS="$(
+        ( lsattr -d -- "$NSS_FILE" 2>/dev/null || true ) | awk '{print $1}'
+    )"
+    # Only act if we actually got flags back; empty means unsupported or not applicable
+    if [[ -n "$LSATTR_FLAGS" ]] && echo "$LSATTR_FLAGS" | grep -q 'i'; then
+        log_error "$NSS_FILE is immutable (chattr +i). Remove the immutable bit to proceed." 1
+    fi
 fi
 
 # Normalize line endings (CRLF-safe) before backup
