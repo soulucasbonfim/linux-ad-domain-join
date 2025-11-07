@@ -1183,12 +1183,9 @@ EOF
         DBUS_SERVICE="dbus.service"
         systemctl status "$DBUS_SERVICE" &>/dev/null || DBUS_SERVICE="messagebus.service"
 
-        log_info "🔄 Restarting $DBUS_SERVICE safely (detached from current D-Bus session)"
-		(
-			# Run restart fully detached to avoid PolicyKit disconnection messages
-			setsid bash -c "systemctl restart '$DBUS_SERVICE' &>/dev/null" &
-			disown
-		) >/dev/null 2>&1
+        log_info "🔄 Restarting $DBUS_SERVICE silently (detached from current D-Bus session)"
+		nohup setsid bash -c "systemctl restart '$DBUS_SERVICE' >/dev/null 2>&1 < /dev/null" >/dev/null 2>&1 &
+		disown || true
 		sleep 3
 
         # After D-Bus restart, re-test
