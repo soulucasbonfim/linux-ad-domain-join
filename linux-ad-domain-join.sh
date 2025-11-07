@@ -1081,11 +1081,8 @@ case $OS_FAMILY in
 esac
 
 # -------------------------------------------------------------------------
-# Ensure oddjob mkhomedir D-Bus registration (RHEL/OL fix, NO installs here)
-# Place this block right AFTER enabling mkhomedir (authconfig/authselect)
+# Ensure oddjob mkhomedir D-Bus registration (RHEL/OL compatibility block)
 # -------------------------------------------------------------------------
-
-# Only for RHEL-like families
 if [[ "$OS_FAMILY" =~ ^(rhel|ol|centos|rocky|almalinux)$ ]]; then
     log_info "🧩 Verifying oddjob mkhomedir D-Bus registration (no package installs)"
 
@@ -1096,9 +1093,9 @@ if [[ "$OS_FAMILY" =~ ^(rhel|ol|centos|rocky|almalinux)$ ]]; then
 
     mkdir -p "$(dirname "$DBUS_SVC")" "$(dirname "$ODDJOB_XML")"
 
-    # Create/repair the D-Bus service auto-activation file (idempotent)
+    # Create or repair the D-Bus service activation file
     if [[ ! -f "$DBUS_SVC" ]]; then
-        log_info "[>] Restoring D-Bus service file: $DBUS_SVC"
+        log_info "🔧 Restoring D-Bus service file: $DBUS_SVC"
         install -m 0644 -D /dev/stdin "$DBUS_SVC" <<'EOF'
 [D-BUS Service]
 Name=com.redhat.oddjob
@@ -1109,9 +1106,9 @@ EOF
         ODDJOB_CHANGED=1
     fi
 
-    # Create/repair the oddjob XML interface for mkhomedir (idempotent)
+    # Create or repair the oddjob mkhomedir XML interface
     if [[ ! -f "$ODDJOB_XML" ]]; then
-        log_info "[>] Restoring oddjob mkhomedir XML: $ODDJOB_XML"
+        log_info "🔧 Restoring oddjob mkhomedir XML: $ODDJOB_XML"
         install -m 0644 -D /dev/stdin "$ODDJOB_XML" <<'EOF'
 <oddjobconfig version="1.0">
   <service name="com.redhat.oddjob_mkhomedir">
@@ -1131,37 +1128,70 @@ EOF
         ODDJOB_CHANGED=1
     fi
 
-    # Apply SELinux contexts (if available) and reload managers when files change
+    # Apply SELinux contexts and reload systemd/dbus managers as needed
     if (( ODDJOB_CHANGED == 1 )); then
-        command -v restorecon >/dev/null 2>&1 && restorecon -F "$DBUS_SVC" "$ODDJOB_XML" 2>/dev/null || true
-        run_cmd_logged "systemctl daemon-reload"
-        if command -v busctl >/dev/null 2>&1; then
-            busctl call org.freedesktop.DBus / org.freedesktop.DBus ReloadConfig 2>/dev/null || true
+        if command -v restorecon >/dev/null 2>&1; then
+            restorecon -F "$DBUS_SVC" "$ODDJOB_XML" 2>/dev/null || true
+        fi
+
+        log_info "🔄 Updating system management daemons (systemd and D-Bus)"
+
+        # On RHEL/OL 7.x, systemd requires daemon-reexec to reload new units
+        run_cmd_logged "systemctl daemon-reexec || true"
+        run_cmd_logged "systemctl daemon-reload || true"
+
+        # Attempt to notify the D-Bus daemon about configuration changes
+        if systemctl is-active --quiet dbus.service 2>/dev/null || systemctl is-active --quiet messagebus.service 2>/dev/null; then
+            if command -v busctl >/dev/null 2>&1; then
+                busctl call org.freedesktop.DBus / org.freedesktop.DBus ReloadConfig 2>/dev/null || true
+            else
+                dbus-send --system --type=method_call --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 || true
+            fi
+            log_info "✅ D-Bus configuration reloaded successfully"
         else
-            dbus-send --system --type=method_call --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 || true
+            log_info "ℹ️ D-Bus is not active — skipping configuration reload"
+        fi
+
+        # Optional full D-Bus restart (disabled by default)
+        if [[ "$FORCE_DBUS_RESTART" == "true" ]]; then
+            log_info "⚠️ Restarting D-Bus as explicitly requested (may disconnect PolicyKit agents)"
+            DBUS_SERVICE="dbus.service"
+            systemctl status "$DBUS_SERVICE" &>/dev/null || DBUS_SERVICE="messagebus.service"
+            run_cmd_logged "systemctl restart $DBUS_SERVICE || true"
         fi
     fi
 
-    # Ensure service is enabled/active
-    if ! systemctl is-enabled "$ODDJOB_SERVICE" &>/dev/null; then
-        log_info "[>] Enabling $ODDJOB_SERVICE"
-        run_cmd_logged "systemctl enable $ODDJOB_SERVICE"
-    fi
-    if ! systemctl is-active --quiet "$ODDJOB_SERVICE"; then
-        log_info "[>] Starting $ODDJOB_SERVICE"
-        run_cmd_logged "systemctl start $ODDJOB_SERVICE"
+    # Ensure oddjobd service is enabled and active (RHEL/OL 6–9)
+    if ! systemctl is-enabled --quiet "$ODDJOB_SERVICE" 2>/dev/null; then
+        log_info "🔧 Enabling $ODDJOB_SERVICE"
+        run_cmd_logged "systemctl enable $ODDJOB_SERVICE || true"
     fi
 
-    # Tolerant D-Bus probe (AccessDenied is common on OL7 and not fatal)
+    # Retry start sequence for legacy systemd versions (slow registration)
+    retry_count=0
+    max_retries=5
+    while (( retry_count < max_retries )); do
+        if systemctl is-active --quiet "$ODDJOB_SERVICE"; then
+            log_info "✅ $ODDJOB_SERVICE is active"
+            break
+        fi
+        log_info "🔁 Starting $ODDJOB_SERVICE (attempt $((retry_count + 1))/$max_retries)"
+        run_cmd_logged "systemctl start $ODDJOB_SERVICE || true"
+        sleep 2
+        ((retry_count++))
+    done
+
+    # Verify operational status through D-Bus
     if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
         log_info "✅ oddjob mkhomedir D-Bus service operational"
     else
-        log_info "ℹ️ D-Bus Hello denied or unavailable — common on OL7; PAM auto-activation may still work"
+        log_info "ℹ️ D-Bus Hello denied or unavailable — common on RHEL/OL 7; PAM auto-activation may still function"
     fi
 
-    # Final health validation (files + service)
+    # Final health validation summary
     svc_state="inactive"
     systemctl is-active "$ODDJOB_SERVICE" &>/dev/null && svc_state="active"
+
     if [[ -f "$DBUS_SVC" && -f "$ODDJOB_XML" && "$svc_state" == "active" ]]; then
         log_info "✅ oddjob mkhomedir registration healthy (files present; service active)"
     else
