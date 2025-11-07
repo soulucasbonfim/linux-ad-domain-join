@@ -1158,18 +1158,18 @@ EOF
     fi
 
     # Retry start sequence for legacy systemd versions (slow registration)
-    retry_count=0
-    max_retries=5
-    while (( retry_count < max_retries )); do
-        if systemctl is-active --quiet "$ODDJOB_SERVICE"; then
-            log_info "✅ $ODDJOB_SERVICE is active"
-            break
-        fi
-        log_info "🔁 Starting $ODDJOB_SERVICE (attempt $((retry_count + 1))/$max_retries)"
-        run_cmd_logged "systemctl start $ODDJOB_SERVICE || true"
-        sleep 2
-        ((retry_count++))
-    done
+	retry_count=0
+	max_retries=5
+	while (( retry_count < max_retries )); do
+		if systemctl is-active --quiet "$ODDJOB_SERVICE"; then
+			log_info "✅ $ODDJOB_SERVICE is active"
+			break
+		fi
+		log_info "🔁 Starting $ODDJOB_SERVICE (attempt $((retry_count + 1))/$max_retries)"
+		run_cmd_logged "systemctl start $ODDJOB_SERVICE || true"
+		sleep 2
+		retry_count=$((retry_count + 1))
+	done
 
     # Verify operational status through D-Bus (auto-healing if broken)
     if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
