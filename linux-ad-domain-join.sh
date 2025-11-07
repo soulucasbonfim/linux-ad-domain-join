@@ -1157,17 +1157,20 @@ EOF
         run_cmd_logged "systemctl enable $ODDJOB_SERVICE || true"
     fi
 
-    # Retry start sequence for legacy systemd versions (slow registration)
+	# Retry start sequence for legacy systemd versions (slow registration)
 	retry_count=0
 	max_retries=5
-	while (( retry_count < max_retries )); do
+	while [ "$retry_count" -lt "$max_retries" ]; do
 		if systemctl is-active --quiet "$ODDJOB_SERVICE"; then
 			log_info "✅ $ODDJOB_SERVICE is active"
 			break
 		fi
-		log_info "🔁 Starting $ODDJOB_SERVICE (attempt $((retry_count + 1))/$max_retries)"
+
+		current_try=$((retry_count + 1))
+		log_info "🔁 Starting $ODDJOB_SERVICE (attempt ${current_try}/${max_retries})"
 		run_cmd_logged "systemctl start $ODDJOB_SERVICE || true"
 		sleep 2
+
 		retry_count=$((retry_count + 1))
 	done
 
