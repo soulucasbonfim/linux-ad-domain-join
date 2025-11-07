@@ -1183,9 +1183,13 @@ EOF
         DBUS_SERVICE="dbus.service"
         systemctl status "$DBUS_SERVICE" &>/dev/null || DBUS_SERVICE="messagebus.service"
 
-        log_info "🔄 Restarting $DBUS_SERVICE safely (suppressing transient PolicyKit noise)"
-        systemctl restart "$DBUS_SERVICE" &>/dev/null || true
-        sleep 3
+        log_info "🔄 Restarting $DBUS_SERVICE safely (detached from current D-Bus session)"
+		(
+			# Run restart fully detached to avoid PolicyKit disconnection messages
+			setsid bash -c "systemctl restart '$DBUS_SERVICE' &>/dev/null" &
+			disown
+		) >/dev/null 2>&1
+		sleep 3
 
         # After D-Bus restart, re-test
         if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
