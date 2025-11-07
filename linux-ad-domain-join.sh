@@ -1135,12 +1135,10 @@ EOF
         fi
 
         log_info "🔄 Updating system management daemons (systemd and D-Bus)"
-
-        # On RHEL/OL 7.x, systemd requires daemon-reexec to reload new units
         run_cmd_logged "systemctl daemon-reexec || true"
         run_cmd_logged "systemctl daemon-reload || true"
 
-        # Attempt to notify the D-Bus daemon about configuration changes
+        # Attempt to notify D-Bus to reload configuration
         if systemctl is-active --quiet dbus.service 2>/dev/null || systemctl is-active --quiet messagebus.service 2>/dev/null; then
             if command -v busctl >/dev/null 2>&1; then
                 busctl call org.freedesktop.DBus / org.freedesktop.DBus ReloadConfig 2>/dev/null || true
@@ -1150,14 +1148,6 @@ EOF
             log_info "✅ D-Bus configuration reloaded successfully"
         else
             log_info "ℹ️ D-Bus is not active — skipping configuration reload"
-        fi
-
-        # Optional full D-Bus restart (disabled by default)
-        if [[ "$FORCE_DBUS_RESTART" == "true" ]]; then
-            log_info "⚠️ Restarting D-Bus as explicitly requested (may disconnect PolicyKit agents)"
-            DBUS_SERVICE="dbus.service"
-            systemctl status "$DBUS_SERVICE" &>/dev/null || DBUS_SERVICE="messagebus.service"
-            run_cmd_logged "systemctl restart $DBUS_SERVICE || true"
         fi
     fi
 
@@ -1181,11 +1171,22 @@ EOF
         ((retry_count++))
     done
 
-    # Verify operational status through D-Bus
+    # Verify operational status through D-Bus (auto-healing if broken)
     if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
         log_info "✅ oddjob mkhomedir D-Bus service operational"
     else
-        log_info "ℹ️ D-Bus Hello denied or unavailable — common on RHEL/OL 7; PAM auto-activation may still function"
+        log_info "⚠️ D-Bus Hello denied or unavailable — attempting full D-Bus restart"
+        DBUS_SERVICE="dbus.service"
+        systemctl status "$DBUS_SERVICE" &>/dev/null || DBUS_SERVICE="messagebus.service"
+        run_cmd_logged "systemctl restart $DBUS_SERVICE || true"
+        sleep 3
+
+        # Re-test after D-Bus restart
+        if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
+            log_info "✅ oddjob mkhomedir D-Bus service operational after D-Bus restart"
+        else
+            log_info "❌ oddjob mkhomedir D-Bus probe still failing; manual inspection required"
+        fi
     fi
 
     # Final health validation summary
