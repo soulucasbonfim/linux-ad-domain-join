@@ -787,8 +787,8 @@ EXISTING_LINE=$(grep -E "^[[:space:]]*${PRIMARY_IP}[[:space:]]+" "$HOSTS_FILE" |
 if [[ -n "$EXISTING_LINE" ]] && ! grep -q "$HOST_FQDN" <<< "$EXISTING_LINE"; then
     OLD_FQDN=$(awk '{print $2}' <<< "$EXISTING_LINE" | head -n1)
     log_info "⚠ Detected FQDN mismatch in /etc/hosts:"
-    log_info "   Current entry -> $EXISTING_LINE"
-    log_info "   Expected FQDN -> $HOST_FQDN"
+    log_info "ℹ Current entry -> $EXISTING_LINE"
+    log_info "ℹ Expected FQDN -> $HOST_FQDN"
 
     if $WEB_ACTIVE; then
         log_info "🌐 Web service detected - possible virtual host binding ($OLD_FQDN)"
