@@ -718,9 +718,24 @@ HOSTS_FILE="/etc/hosts"
 # Detect primary IPv4 address (excluding loopback interfaces)
 PRIMARY_IP=$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i!~/^127\./){print $i; exit}}')
 if [[ -z "$PRIMARY_IP" ]]; then
-    PRIMARY_IP=$(ip -4 addr show scope global | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+    PRIMARY_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
 fi
 [[ -z "$PRIMARY_IP" ]] && log_error "Unable to detect primary IP address (no active NIC found)" 15
+
+# Check for active web services (port 80 or 443)
+if command -v ss >/dev/null 2>&1; then
+    NETSTAT_CMD="ss -tulpen"
+elif command -v netstat >/dev/null 2>&1; then
+    NETSTAT_CMD="netstat -tulpen"
+else
+    NETSTAT_CMD=""
+fi
+
+WEB_ACTIVE=false
+if [[ -n "$NETSTAT_CMD" ]] && $NETSTAT_CMD 2>/dev/null | grep -qE ':(80|443)\b'; then
+    WEB_ACTIVE=true
+    log_info "🌐 Detected active web service (port 80/443 in use)"
+fi
 
 # Ensure /etc/hostname contains the correct short hostname
 if [[ -f /etc/hostname ]]; then
@@ -734,12 +749,9 @@ else
     log_info "🧩 Created /etc/hostname with '$HOST_SHORT'"
 fi
 
-# /etc/hosts:
-#    - DO NOT delete existing content
-#    - Only fix/create the local hostname entry
-#    - Preserve IPv6, comments, static entries for other hosts, etc.
-#    - Backup before making changes
-
+# -------------------------------------------------------------------------
+# Prepare /etc/hosts safely
+# -------------------------------------------------------------------------
 if [[ ! -f "$HOSTS_FILE" ]]; then
     log_info "⚙️ Creating new $HOSTS_FILE"
     echo "127.0.0.1   localhost" > "$HOSTS_FILE"
@@ -750,61 +762,80 @@ else
     fi
 fi
 
+# Ensure IPv6 localhost line exists
+if ! grep -qE '^::1[[:space:]]+localhost' "$HOSTS_FILE"; then
+    echo "::1   localhost" >> "$HOSTS_FILE"
+fi
+
 # Perform safe backup before modification
 cp -p "$HOSTS_FILE" "${HOSTS_FILE}.bak.$(date +%s)"
 log_info "💾 Backup saved as ${HOSTS_FILE}.bak.$(date +%s)"
 
-# Now we will generate a new in-memory version that:
-# - Updates the line mentioning this host (shortname or FQDN) to reflect the correct IP
-# - If no line for this host exists, adds a clean one at the end
+# -------------------------------------------------------------------------
+# Check for domain drift before AWK rewrite (interactive or forced correction)
+# -------------------------------------------------------------------------
+EXISTING_LINE=$(grep -E "^[[:space:]]*${PRIMARY_IP}[[:space:]]+" "$HOSTS_FILE" || true)
+if [[ -n "$EXISTING_LINE" ]] && ! grep -q "$HOST_FQDN" <<< "$EXISTING_LINE"; then
+    OLD_FQDN=$(awk '{print $2}' <<< "$EXISTING_LINE" | head -n1)
+    log_info "⚠ Detected FQDN mismatch in /etc/hosts:"
+    log_info "   Current entry → $EXISTING_LINE"
+    log_info "   Expected FQDN → $HOST_FQDN"
 
+    if $WEB_ACTIVE; then
+        log_info "🌐 Web service detected — possible virtual host binding ($OLD_FQDN)"
+    fi
+
+    SAFE_OLD_FQDN=$(printf '%s\n' "$OLD_FQDN" | sed 's/[.[\*^$()+?{}|]/\\&/g')
+    SAFE_NEW_FQDN=$(printf '%s\n' "$HOST_FQDN" | sed 's/[&/\]/\\&/g')
+
+    if [[ "$YES" == "true" ]]; then
+        log_info "💡 --yes specified → automatically correcting entry to ${HOST_FQDN}"
+        sed -i "s/${SAFE_OLD_FQDN}/${SAFE_NEW_FQDN}/g" "$HOSTS_FILE"
+    else
+        read -p "Replace '${OLD_FQDN}' with '${HOST_FQDN}' in /etc/hosts? [y/N]: " reply
+        if [[ "$reply" =~ ^[Yy]$ ]]; then
+            sed -i "s/${SAFE_OLD_FQDN}/${SAFE_NEW_FQDN}/g" "$HOSTS_FILE"
+            log_info "✅ Updated FQDN to ${HOST_FQDN}"
+        else
+            log_info "🟡 Keeping existing mapping → ${OLD_FQDN}"
+        fi
+    fi
+fi
+
+# -------------------------------------------------------------------------
+# Continue with canonical in-memory rewrite (AWK block preserved)
+# -------------------------------------------------------------------------
 if grep -qE "^[[:space:]]*[^#]*\b(${HOST_FQDN}|${HOST_SHORT})\b" "$HOSTS_FILE"; then
     log_info "🧩 Found existing /etc/hosts entry for this host - checking for drift"
 
-    # Execute the AWK block in a temporary file, capturing stderr
-	awk -v ip="$PRIMARY_IP" -v fqdn="$HOST_FQDN" -v short="$HOST_SHORT" '
-		BEGIN { updated=0 }
-		{
-			# Preserve comments as-is
-			if ($0 ~ /^[[:space:]]*#/) { print; next }
+    awk -v ip="$PRIMARY_IP" -v fqdn="$HOST_FQDN" -v short="$HOST_SHORT" '
+        BEGIN { updated=0 }
+        {
+            if ($0 ~ /^[[:space:]]*#/) { print; next }
+            match_self = 0
+            if ($0 ~ ("[[:space:]]"fqdn"([[:space:]]|$)")) match_self=1
+            if ($0 ~ ("[[:space:]]"short"([[:space:]]|$)")) match_self=1
+            if (match_self) {
+                printf "%s\t%s %s\n", ip, fqdn, short
+                updated=1
+            } else { print }
+        }
+        END {
+            if (updated==1) printf "[i] Host mapping updated to %s -> %s %s\n", ip, fqdn, short > "/dev/stderr"
+        }
+    ' "$HOSTS_FILE" > "${HOSTS_FILE}.tmp" 2> "${HOSTS_FILE}.awklog"
 
-			# Line references this machine? (either FQDN or shortname as hostname token)
-			match_self = 0
-			if ($0 ~ ("[[:space:]]"fqdn"([[:space:]]|$)")) match_self=1
-			if ($0 ~ ("[[:space:]]"short"([[:space:]]|$)")) match_self=1
-
-			if (match_self) {
-				# Rewrite canonical line: "<IP>\t<FQDN> <SHORT>"
-				printf "%s\t%s %s\n", ip, fqdn, short
-				updated=1
-			} else {
-				print
-			}
-		}
-		END {
-			if (updated==1) {
-				printf "[i] Host mapping updated to %s -> %s %s\n", ip, fqdn, short > "/dev/stderr"
-			}
-		}
-	' "$HOSTS_FILE" > "${HOSTS_FILE}.tmp" 2> "${HOSTS_FILE}.awklog"
-
-	# If there are messages in the awk log, send them to log_info
-	if [[ -s "${HOSTS_FILE}.awklog" ]]; then
-		while IFS= read -r line; do
-			log_info "$line"
-		done < "${HOSTS_FILE}.awklog"
-	fi
-
-	# Apply safe substitution
-	mv -f "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
-	rm -f "${HOSTS_FILE}.awklog"
+    if [[ -s "${HOSTS_FILE}.awklog" ]]; then
+        while IFS= read -r line; do log_info "$line"; done < "${HOSTS_FILE}.awklog"
+    fi
+    mv -f "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
+    rm -f "${HOSTS_FILE}.awklog"
 else
-    # No entry for the current host → add a clean new line at the end
     log_info "➕ Adding local host mapping to /etc/hosts: ${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}"
     printf "%s\t%s %s\n" "$PRIMARY_IP" "$HOST_FQDN" "$HOST_SHORT" >> "$HOSTS_FILE"
 fi
 
-# Remove Ubuntu-style 127.0.1.1 entries (can break Kerberos reverse lookups)
+# Cleanup and validation
 if grep -qE '^[[:space:]]*127\.0\.1\.1[[:space:]]+' "$HOSTS_FILE"; then
     log_info "⚙️ Removing obsolete 127.0.1.1 hostname entries (Ubuntu/Debian compatibility fix)"
     sed -i '/^[[:space:]]*127\.0\.1\.1[[:space:]]\+/d' "$HOSTS_FILE"
@@ -820,7 +851,8 @@ else
 fi
 
 # Ensure that the runtime hostname resolves correctly (hostname -f)
-if [[ "$(hostname -f 2>/dev/null)" != "$HOST_FQDN" ]]; then
+CURRENT_FQDN=$(hostname -f 2>/dev/null || echo "")
+if [[ "$CURRENT_FQDN" != "$HOST_FQDN" ]]; then
     hostnamectl set-hostname "$HOST_SHORT" 2>/dev/null || hostname "$HOST_SHORT"
     log_info "⚙️ Adjusted runtime hostname for FQDN resolution"
 fi
