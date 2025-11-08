@@ -99,7 +99,7 @@ sanitize_log_msg() {
         # Warnings / Alerts
         s/⚠|⚠️|❗|❕|🚨|📛|🧯|🔥|💣|🧨/[!]/g;
         # Informational / Neutral
-        s/ℹ|ℹ️|🧵|🕒|📡|🌐|💡|🧬|🧭|⏰|🧾|🪪|🧠|🪶|🔢|💬|📘|🔋|🧮/[i]/g;
+        s/ℹ|ℹ️|🧵|🕒|📡|🌐|💡|🧬|🧭|⏰|🧾|🪪|🧠|🪶|🔢|💬|📘|🔋|🧮|🟡/[i]/g;
         # Operational / Progress / Configuration
         s/🔁|🔧|🛠|🛠️|🧩|🏷|💾|♻|🚚|⚙️|⚙|🏷️|🧹|🔗|🔌|🔄|↪|🛡️|🧱|🗂|🗂️|🧰|🛡|📦|📎|🪄/[>]/g;
         # Errors / Failures
@@ -801,8 +801,8 @@ if [[ -n "$EXISTING_LINE" ]] && ! grep -q "$HOST_FQDN" <<< "$EXISTING_LINE"; the
         log_info "💡 --yes specified -> automatically correcting entry to ${HOST_FQDN}"
         sed -i "s/${SAFE_OLD_FQDN}/${SAFE_NEW_FQDN}/g" "$HOSTS_FILE"
     else
-        read -p "Replace '${OLD_FQDN}' with '${HOST_FQDN}' in /etc/hosts? [y/N]: " reply
-        if [[ "$reply" =~ ^[Yy]$ ]]; then
+		read_sanitized "⚠️ Replace '${OLD_FQDN}' with '${HOST_FQDN}' in /etc/hosts? [y/N]: " REPLY
+        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
             sed -i "s/${SAFE_OLD_FQDN}/${SAFE_NEW_FQDN}/g" "$HOSTS_FILE"
             log_info "✅ Updated FQDN to ${HOST_FQDN}"
         else
