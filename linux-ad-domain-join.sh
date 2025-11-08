@@ -199,6 +199,15 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+# -------------------------------------------------------------------------
+# Default values for optional flags (safe for set -u environments)
+# -------------------------------------------------------------------------
+YES="${YES:-false}"
+FORCE="${FORCE:-false}"
+DRY_RUN="${DRY_RUN:-false}"
+NONINTERACTIVE="${NONINTERACTIVE:-false}"
+VERBOSE="${VERBOSE:-false}"
+
 to_lower(){ echo "$1" | tr '[:upper:]' '[:lower:]'; }
 
 trim_line(){ sed -e 's/^[[:space:]]\+//' -e 's/^[[:space:]]*[-*•][[:space:]]\+//' -e 's/[[:space:]]\+$//' -e '/[Cc]url error/ s/[[:space:]]\[[^]]*\][[:space:]]*$//'; }
@@ -778,18 +787,18 @@ EXISTING_LINE=$(grep -E "^[[:space:]]*${PRIMARY_IP}[[:space:]]+" "$HOSTS_FILE" |
 if [[ -n "$EXISTING_LINE" ]] && ! grep -q "$HOST_FQDN" <<< "$EXISTING_LINE"; then
     OLD_FQDN=$(awk '{print $2}' <<< "$EXISTING_LINE" | head -n1)
     log_info "⚠ Detected FQDN mismatch in /etc/hosts:"
-    log_info "   Current entry → $EXISTING_LINE"
-    log_info "   Expected FQDN → $HOST_FQDN"
+    log_info "   Current entry -> $EXISTING_LINE"
+    log_info "   Expected FQDN -> $HOST_FQDN"
 
     if $WEB_ACTIVE; then
-        log_info "🌐 Web service detected — possible virtual host binding ($OLD_FQDN)"
+        log_info "🌐 Web service detected - possible virtual host binding ($OLD_FQDN)"
     fi
 
     SAFE_OLD_FQDN=$(printf '%s\n' "$OLD_FQDN" | sed 's/[.[\*^$()+?{}|]/\\&/g')
     SAFE_NEW_FQDN=$(printf '%s\n' "$HOST_FQDN" | sed 's/[&/\]/\\&/g')
 
-    if [[ "$YES" == "true" ]]; then
-        log_info "💡 --yes specified → automatically correcting entry to ${HOST_FQDN}"
+    if [[ "$NONINTERACTIVE" == "true" ]]; then
+        log_info "💡 --yes specified -> automatically correcting entry to ${HOST_FQDN}"
         sed -i "s/${SAFE_OLD_FQDN}/${SAFE_NEW_FQDN}/g" "$HOSTS_FILE"
     else
         read -p "Replace '${OLD_FQDN}' with '${HOST_FQDN}' in /etc/hosts? [y/N]: " reply
@@ -797,7 +806,7 @@ if [[ -n "$EXISTING_LINE" ]] && ! grep -q "$HOST_FQDN" <<< "$EXISTING_LINE"; the
             sed -i "s/${SAFE_OLD_FQDN}/${SAFE_NEW_FQDN}/g" "$HOSTS_FILE"
             log_info "✅ Updated FQDN to ${HOST_FQDN}"
         else
-            log_info "🟡 Keeping existing mapping → ${OLD_FQDN}"
+            log_info "🟡 Keeping existing mapping -> ${OLD_FQDN}"
         fi
     fi
 fi
@@ -1096,10 +1105,10 @@ case $OS_FAMILY in
 	rhel|ol|rocky|almalinux|centos)
 		RHEL_MAJOR=$(rpm -q --qf '%{VERSION}' $(rpm -qf /etc/redhat-release) | cut -d. -f1)
 		if (( RHEL_MAJOR < 8 )); then
-			# RHEL/CentOS/OL 6–7 → authconfig
+			# RHEL/CentOS/OL 6–7 -> authconfig
 			run_cmd_logged "LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --update"
 		else
-			# RHEL/OL 8+ → authselect
+			# RHEL/OL 8+ -> authselect
 			run_cmd_logged "authselect select sssd with-mkhomedir --force"
 			run_cmd_logged "systemctl enable --now oddjobd"
 		fi
@@ -1182,7 +1191,7 @@ EOF
             fi
             log_info "✅ D-Bus configuration reloaded successfully"
         else
-            log_info "ℹ️ D-Bus is not active — skipping configuration reload"
+            log_info "ℹ️ D-Bus is not active - skipping configuration reload"
         fi
     fi
 
@@ -1211,7 +1220,7 @@ EOF
     if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
         log_info "✅ oddjob mkhomedir D-Bus service operational"
     else
-        log_info "⚠️ D-Bus Hello denied or unavailable — attempting full D-Bus restart"
+        log_info "⚠️ D-Bus Hello denied or unavailable - attempting full D-Bus restart"
         DBUS_SERVICE="dbus.service"
         systemctl status "$DBUS_SERVICE" &>/dev/null || DBUS_SERVICE="messagebus.service"
 
@@ -1224,7 +1233,7 @@ EOF
         if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
             log_info "✅ oddjob mkhomedir D-Bus service operational after D-Bus restart"
         else
-            log_info "⚠️ D-Bus Hello still denied — common on RHEL/OL 7 (AccessDenied not fatal)"
+            log_info "⚠️ D-Bus Hello still denied - common on RHEL/OL 7 (AccessDenied not fatal)"
         fi
     fi
 
@@ -1253,7 +1262,7 @@ case "$OS_FAMILY" in
 		PAM_FILES=("/etc/pam.d/common-auth" "/etc/pam.d/common-account" "/etc/pam.d/common-session" "/etc/pam.d/common-password")
 		;;
 	*)
-		log_info "ℹ Unknown PAM layout for $OS_FAMILY — skipping PAM consistency check"
+		log_info "ℹ Unknown PAM layout for $OS_FAMILY - skipping PAM consistency check"
 		PAM_FILES=()
 		;;
 esac
@@ -1291,7 +1300,7 @@ for file in "${PAM_FILES[@]}"; do
 					echo "session     optional      pam_sss.so" >>"$file"
 					;;
 			esac
-			log_info "🧩 Added missing pam_sss.so for $context → $(basename "$file")"
+			log_info "🧩 Added missing pam_sss.so for $context -> $(basename "$file")"
 		fi
 	done
 done
@@ -1328,9 +1337,9 @@ case "$OS_FAMILY" in
 esac
 
 if grep -E "pam_sss\.so" "${PAM_VALIDATE_FILES[@]}" 2>/dev/null | grep -qv '^[[:space:]]*#'; then
-	log_info "✅ PAM integration validated — pam_sss.so is active and correctly configured"
+	log_info "✅ PAM integration validated - pam_sss.so is active and correctly configured"
 else
-	log_info "⚠️ PAM validation ambiguous — no active pam_sss.so lines detected"
+	log_info "⚠️ PAM validation ambiguous - no active pam_sss.so lines detected"
 	log_info "ℹ This may occur on OL7/RHEL7 due to symlinked .ac templates"
 	log_info "ℹ If authentication via SSSD works, this warning can be ignored"
 fi
@@ -1360,7 +1369,7 @@ EOF
 fi
 
 # Basic access checks (after creation above to avoid false negatives)
-[[ -r "$NSS_FILE" ]] || log_error "Cannot read $NSS_FILE — verify overlay/permissions." 1
+[[ -r "$NSS_FILE" ]] || log_error "Cannot read $NSS_FILE - verify overlay/permissions." 1
 [[ -w "$(dirname "$NSS_FILE")" ]] || log_error "NSS path $(dirname "$NSS_FILE") is not writable (read-only filesystem)." 1
 
 # -------------------------------------------------------------------------
@@ -1380,7 +1389,7 @@ if command -v lsattr >/dev/null 2>&1; then
     set -e
 
     if $LSATTR_SUPPORTED; then
-        log_info "🧩 Filesystem supports lsattr — checking for immutable attribute"
+        log_info "🧩 Filesystem supports lsattr - checking for immutable attribute"
 
         # Extract flags safely; tolerate legacy lsattr output or missing fields
         LSATTR_FLAGS="$(lsattr -d -- "$NSS_FILE" 2>/dev/null | awk '{print $1}' || true)"
@@ -1389,10 +1398,10 @@ if command -v lsattr >/dev/null 2>&1; then
             log_error "$NSS_FILE is immutable (chattr +i). Remove the immutable bit to proceed." 1
         fi
     else
-        log_info "ℹ lsattr operation not supported by the underlying filesystem — skipping immutability check"
+        log_info "ℹ lsattr operation not supported by the underlying filesystem - skipping immutability check"
     fi
 else
-    log_info "ℹ lsattr not available on this system — skipping immutability check"
+    log_info "ℹ lsattr not available on this system - skipping immutability check"
 fi
 
 # Normalize line endings (CRLF-safe) before backup
@@ -1404,7 +1413,7 @@ if echo | sed -E 's/(.*)//' >/dev/null 2>&1; then
 elif echo | sed -r 's/(.*)//' >/dev/null 2>&1; then
 	SED_EXT='-r'
 else
-	log_error "sed without extended regex support (-E/-r) — install a compatible sed." 1
+	log_error "sed without extended regex support (-E/-r) - install a compatible sed." 1
 fi
 
 # Backup prior to modifications
@@ -1510,8 +1519,8 @@ if ! grep -qE '^passwd:[^#]*sss' "$NSS_FILE" || ! grep -qE '^group:[^#]*sss' "$N
 fi
 
 # Optional runtime sanity checks (non-blocking)
-getent passwd root >/dev/null || log_info "⚠ NSS runtime check (passwd) inconclusive — verify SSSD/NSCD"
-getent group root >/dev/null || log_info "⚠ NSS runtime check (group) inconclusive — verify SSSD/NSCD"
+getent passwd root >/dev/null || log_info "⚠ NSS runtime check (passwd) inconclusive - verify SSSD/NSCD"
+getent group root >/dev/null || log_info "⚠ NSS runtime check (group) inconclusive - verify SSSD/NSCD"
 
 # If legacy nslcd is present, stop it to avoid conflicts with SSSD
 if command -v systemctl &>/dev/null; then
@@ -1629,7 +1638,7 @@ fi
 
 # If detected unit is an alias, normalize to chrony.service
 if [[ "$chrony_service" == "chronyd" && "$(readlink -f /etc/systemd/system/chronyd.service 2>/dev/null)" == *"chrony.service" ]]; then
-    log_info "  Detected alias 'chronyd.service' → using real unit 'chrony.service'"
+    log_info "  Detected alias 'chronyd.service' -> using real unit 'chrony.service'"
     chrony_service="chrony"
 fi
 
@@ -2011,7 +2020,7 @@ run_cmd "chown root:root $SSSD_CONF"
 # -------------------------------------------------------------------------
 if command -v sss_cache >/dev/null 2>&1; then
     if [[ "$NONINTERACTIVE" == "true" ]]; then
-        log_info "ℹ️ NONINTERACTIVE mode detected — skipping SSSD cache flush to preserve UID mapping"
+        log_info "ℹ️ NONINTERACTIVE mode detected - skipping SSSD cache flush to preserve UID mapping"
     else
         log_info "🔁 Flushing old SSSD caches"
         sss_cache -E >/dev/null 2>&1 || log_info "⚠️ Failed to flush SSSD cache (non-critical)"
@@ -2146,7 +2155,7 @@ if ! grep -Eq "^[[:space:]]*#include[[:space:]]+$SUDO_F" "$SUDO_MAIN"; then
 	if visudo -c >/dev/null 2>&1; then
 		log_info "✅ Sudoers include added successfully"
 	else
-		log_info "🛑 visudo syntax check failed — restoring previous configuration"
+		log_info "🛑 visudo syntax check failed - restoring previous configuration"
 		mv -f "$SUDO_BAK" "$SUDO_MAIN"
 	fi
 else
