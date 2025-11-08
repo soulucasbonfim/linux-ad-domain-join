@@ -1974,10 +1974,16 @@ EOF
 run_cmd "chmod 600 $SSSD_CONF"
 run_cmd "chown root:root $SSSD_CONF"
 
+# -------------------------------------------------------------------------
 # Optional: flush old caches before restart
+# -------------------------------------------------------------------------
 if command -v sss_cache >/dev/null 2>&1; then
-    log_info "🔁 Flushing old SSSD caches"
-    sss_cache -E >/dev/null 2>&1 || log_info "⚠️ Failed to flush SSSD cache (non-critical)"
+    if [[ "$NONINTERACTIVE" == "true" ]]; then
+        log_info "ℹ️ NONINTERACTIVE mode detected — skipping SSSD cache flush to preserve UID mapping"
+    else
+        log_info "🔁 Flushing old SSSD caches"
+        sss_cache -E >/dev/null 2>&1 || log_info "⚠️ Failed to flush SSSD cache (non-critical)"
+    fi
 else
     log_info "ℹ️ sss_cache not found - skipping cache flush"
 fi
