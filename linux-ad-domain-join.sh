@@ -1605,8 +1605,8 @@ else
     touch "$chrony_conf"
 fi
 
-# Write new configuration (universal minimal config)
-cat <<EOF > "$chrony_conf"
+# Write new Chrony configuration (universal minimal config)
+cat > "$chrony_conf" <<EOF
 server $DOMAIN iburst
 driftfile /var/lib/chrony/drift
 makestep 1.0 3
@@ -1737,7 +1737,7 @@ EOF
             LDAP_MOVE_CODE=$?
         else
             TMP_LDIF=$(mktemp)
-            cat <<EOF > "$TMP_LDIF"
+			cat > "$TMP_LDIF" <<EOF
 dn: $CURRENT_DN
 changetype: modrdn
 newrdn: CN=${HOST_SHORT_U}
@@ -1823,7 +1823,7 @@ if [[ -n "$HOST_IP" ]]; then
 
     TMP_LDIF=$(mktemp)
 	timestamp=$(date '+%Y-%m-%dT%H:%M:%S%z')
-    cat <<EOF > "$TMP_LDIF"
+    cat > "$TMP_LDIF" <<EOF
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: description
@@ -1859,9 +1859,9 @@ fi
 kdestroy -q 2>/dev/null || true
 
 # -------------------------------------------------------------------------
-# Validate Active Directory trust (Kerberos/SSSD mode)
+# Authenticate administrative user (Kerberos TGT acquisition)
 # -------------------------------------------------------------------------
-log_info "🔍 Validating Active Directory trust integrity (Kerberos/SSSD mode)"
+log_info "🔐 Authenticating domain user for administrative operations"
 
 # Obtain a valid user TGT for administrative operations.
 # NOTE: The password is provided securely via stdin and never exposed in process arguments or shell history.
@@ -1869,26 +1869,76 @@ log_info "ℹ Obtaining Kerberos ticket for synchronization"
 echo "$DOMAIN_PASS" | kinit "${DOMAIN_USER}@${REALM}" >/dev/null 2>&1 || \
     log_error "Failed to obtain Kerberos ticket for ${DOMAIN_USER}@${REALM}" 2
 
+# -------------------------------------------------------------------------
+# Prepare safe context for subsequent validation steps
+# -------------------------------------------------------------------------
 # Temporarily relax '-e' and 'pipefail' and neutralize the global ERR trap to make this validation tolerant.
 # Failures here must not abort the script.
+# -------------------------------------------------------------------------
 __old_opts="$(set +o)"    # Save current 'set' options
 __old_trap="$(trap -p ERR | sed -E 's/^trap -- //')"
 set +e +o pipefail
 trap - ERR
 
 # -------------------------------------------------------------------------
-# Kerberos keytab validation
+# Validate machine Kerberos keytab (domain trust check)
 # -------------------------------------------------------------------------
 TRUST_STATUS="⚠️ Trust check failed"
 
-# Attempt authentication using the local machine account keytab
-if kinit -kt /etc/krb5.keytab "$(hostname -s | tr '[:lower:]' '[:upper:]')\$@${REALM}" >/dev/null 2>&1; then
-    kdestroy -q
-    TRUST_STATUS="✅ Kerberos trust OK"
-    log_info "✅ Kerberos machine keytab authentication succeeded"
+REALM_UPPER="${REALM^^}"
+PRINCIPAL="$(hostname -s | tr '[:lower:]' '[:upper:]')\$@${REALM_UPPER}"
+KRB_LOG=$(mktemp)
+START_MS=$(date +%s%3N)
+
+KRB5_TRACE=$KRB_LOG kinit -kt /etc/krb5.keytab "$PRINCIPAL" >/dev/null 2>&1
+EXIT_CODE=$?
+END_MS=$(date +%s%3N)
+ELAPSED=$((END_MS - START_MS))
+
+# Resolve DC name dynamically
+DC_USED=$(grep -Eo 'to (dgram|stream) ([0-9.]+|[A-Za-z0-9._-]+)' "$KRB_LOG" | awk '{print $3}' | tail -n1)
+[[ -z "$DC_USED" ]] && DC_USED=$(grep -Eo '([A-Za-z0-9._-]+\.[A-Za-z]{2,})' "$KRB_LOG" | grep -vi "$REALM" | tail -n1)
+[[ -z "$DC_USED" ]] && DC_USED="(unknown DC)"
+
+# Optional reverse DNS
+if [[ "$DC_USED" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    if command -v host >/dev/null 2>&1; then
+        DC_NAME=$(host "$DC_USED" 2>/dev/null | awk '/pointer/ {print $5}' | sed 's/\.$//')
+    elif command -v dig >/dev/null 2>&1; then
+        DC_NAME=$(dig +short -x "$DC_USED" 2>/dev/null | sed 's/\.$//')
+    fi
 else
-    log_info "⚠️ Kerberos keytab authentication failed - domain trust may be broken"
+    DC_NAME="$DC_USED"
 fi
+[[ -z "$DC_NAME" ]] && DC_NAME="$DC_USED"
+
+# Ping RTT
+PING_RTT="$(ping -c 1 -W 1 "$DC_NAME" 2>/dev/null | awk -F'=' '/time=/{print $NF}' | tr -d ' ' || echo 'n/a')"
+
+# Determine trust status
+if [[ $EXIT_CODE -eq 0 ]]; then
+    TRUST_STATUS="✅ Kerberos trust OK"
+else
+    TRUST_STATUS="⚠️ Kerberos trust failed"
+    log_info "⚠️ Kerberos trust check failed — review trace: $KRB_LOG"
+fi
+
+# Save for summary
+DC_SERVER="$DC_NAME"
+TRUST_ELAPSED="$ELAPSED"
+TRUST_RTT="$PING_RTT"
+
+# Verbose trace (optional)
+if [[ "${VERBOSE:-false}" == "true" ]]; then
+    echo "--------------------------------------------------------------------------"
+    echo "[*] Kerberos trace summary:"
+    grep -E "Sending initial|Response was from|error from KDC" "$KRB_LOG" | sed 's/^/   /'
+    echo "--------------------------------------------------------------------------"
+fi
+
+# Cleanup
+kdestroy -q 2>/dev/null || true
+rm -f "$KRB_LOG" 2>/dev/null || true
 
 # -------------------------------------------------------------------------
 # Validate and re-enable computer object if disabled in AD
@@ -2217,6 +2267,8 @@ printf "%-25s %s\n" "Computer Name:"      "$HOST_SHORT_U"
 printf "%-25s %s\n" "Kerberos Principal:" "${KLIST_PRINCIPAL:-⚠️ None active}"
 printf "%-25s %s\n" "Key Version (KVNO):" "$MSDS_KVNO"
 printf "%-25s %s\n" "Domain Trust:"       "$TRUST_STATUS"
+printf "%-25s %s\n" "Handshake (ms):"     "${TRUST_ELAPSED:-n/a}"
+printf "%-25s %s\n" "Network RTT:"        "${TRUST_RTT:-n/a}"
 printf "%-25s %s\n" "SSSD Service:"       "${SSSD_STATUS,,}"
 printf "%-25s %s\n" "SSH Service:"        "${SSH_STATUS,,}"
 echo "$DIVIDER"
