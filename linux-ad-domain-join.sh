@@ -1656,7 +1656,7 @@ for i in {1..30}; do
     if systemctl is-active "$chrony_service" &>/dev/null && \
        chronyc sources | grep -q '^\^\*' && \
        [[ "$(chronyc tracking | awk -F': *' '/Leap status/ {print $2}')" == "Normal" ]]; then
-        synced_server=$(chronyc tracking | awk -F'[()]' '/Reference ID/ {print $2}')
+		synced_server=$( chronyc tracking | awk -F '[()]' '/Reference ID/ { print $2 }' )
         # clear previous line before printing success
         printf "\r\033[K" >&2
         log_info "✅ NTP synchronized successfully with: ${synced_server:-chrony}"
