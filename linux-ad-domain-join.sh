@@ -144,6 +144,14 @@ read_sanitized() {
     read -rp "[$(date '+%F %T')] $sanitized" "$var_name"
 }
 
+# Safe divider generator (resilient to SSH, tmux, or resizing)
+get_divider() {
+    local cols
+    cols=$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)
+    [[ -z "$cols" || "$cols" -lt 20 ]] && cols=80
+    printf '%*s\n' "$cols" '' | tr ' ' '-'
+}
+
 # -------------------------------------------------------------------------
 # Global error trap - catches any unexpected command failure
 # -------------------------------------------------------------------------
@@ -658,7 +666,9 @@ case "$OS_FAMILY" in
 		;;
 esac
 
-# gather inputs
+# -------------------------------------------------------------------------
+# Collect domain join inputs
+# -------------------------------------------------------------------------
 if $NONINTERACTIVE; then
     : "${DOMAIN:?DOMAIN required}"
     : "${OU:?OU required}"
@@ -667,25 +677,47 @@ if $NONINTERACTIVE; then
     : "${DOMAIN_PASS:?DOMAIN_PASS required}"
 else
     log_info "🧪 Collecting inputs"
-    DIVIDER=$(printf '%*s\n' "$(tput cols)" '' | tr ' ' '-')
+    DIVIDER=$(get_divider)
     echo "$DIVIDER"
-	
-    read -rp "Domain (e.g., acme.net): " DOMAIN
-	DOMAIN_UPPER=$(echo "$DOMAIN" | tr '[:lower:]' '[:upper:]')
-	DOMAIN_SHORT=$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')
-	
-	default_OU="OU=Servers,OU=DC_ORACLE,OU=SITES,OU=OPERATIONS,OU=${DOMAIN_SHORT},OU=COMPANIES,DC=${DOMAIN_SHORT},DC=$(echo "$DOMAIN" | cut -d'.' -f2 | tr '[:lower:]' '[:upper:]')"
-	read -rp "OU [default: ${default_OU}]: " OU
-	OU=${OU:-$default_OU}
-	
-	default_DC_SERVER="${DOMAIN_SHORT,,}-sp-ad01.${DOMAIN,,}"
-	read -rp "DC server [default: ${default_DC_SERVER}]: " DC_SERVER
-	DC_SERVER=${DC_SERVER:-$default_DC_SERVER}
-	
-    read -rp "Join user (e.g., adm-l.lima): " DOMAIN_USER
-    read -rsp "Password for $DOMAIN_USER: " DOMAIN_PASS; printf '%*s\n' 16 '' | tr ' ' '*'
+
+    # Require DOMAIN
+    while true; do
+        read -rp "[?] Domain (e.g., acme.net): " DOMAIN
+        DOMAIN=$(echo "$DOMAIN" | xargs)
+        [[ -n "$DOMAIN" ]] && break
+        echo "[!] Domain is required."
+    done
+    DOMAIN_UPPER=$(echo "$DOMAIN" | tr '[:lower:]' '[:upper:]')
+    DOMAIN_SHORT=$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')
+
+    # OU (optional, default filled)
+    default_OU="OU=Servers,OU=DC_ORACLE,OU=SITES,OU=OPERATIONS,OU=${DOMAIN_SHORT},OU=COMPANIES,DC=${DOMAIN_SHORT},DC=$(echo "$DOMAIN" | cut -d'.' -f2 | tr '[:lower:]' '[:upper:]')"
+    read -rp "[?] OU [default: ${default_OU}]: " OU
+    OU=${OU:-$default_OU}
+
+    # DC Server (optional, default filled)
+    default_DC_SERVER="${DOMAIN_SHORT,,}-sp-ad01.${DOMAIN,,}"
+    read -rp "[?] DC server [default: ${default_DC_SERVER}]: " DC_SERVER
+    DC_SERVER=${DC_SERVER:-$default_DC_SERVER}
+
+    # Require Join User
+    while true; do
+        read -rp "[?] Join user (e.g., adm-l.lima): " DOMAIN_USER
+        DOMAIN_USER=$(echo "$DOMAIN_USER" | xargs)
+        [[ -n "$DOMAIN_USER" ]] && break
+        echo "[!] Join user is required."
+    done
+
+    # Require Password
+    while true; do
+        read -rsp "[?] Password for $DOMAIN_USER: " DOMAIN_PASS
+        echo
+        [[ -n "$DOMAIN_PASS" ]] && break
+        echo "[!] Password cannot be empty."
+    done
 fi
 
+# Validate non-interactive env vars
 for var in DOMAIN OU DC_SERVER DOMAIN_USER DOMAIN_PASS; do
     [[ -n "${!var}" ]] || log_error "$var is required" 1
 done
@@ -696,15 +728,22 @@ done
 if $NONINTERACTIVE; then
     : "${GLOBAL_ADMIN_GROUPS:?GLOBAL_ADMIN_GROUPS required in non-interactive mode}"
 else
-    echo "Define the global admin group(s) allowed SSH access (space-separated):"
-    read -rp "Global admin group(s): " GLOBAL_ADMIN_GROUPS
-    while [[ -z "$GLOBAL_ADMIN_GROUPS" ]]; do
-        echo "⚠️ You must specify at least one group."
-        read -rp "Global admin group(s): " GLOBAL_ADMIN_GROUPS
-    done
-fi
+    printf "[?] Define the global admin group(s) allowed SSH access (space-separated):\n" >&2
 
-log_info "🔐 Using global admin group(s) for SSH access: $GLOBAL_ADMIN_GROUPS"
+    # prompt shown via stderr (unbuffered, ordered)
+    printf "[?] Global admin group(s): " >&2
+    read -r GLOBAL_ADMIN_GROUPS
+    GLOBAL_ADMIN_GROUPS="$(echo "$GLOBAL_ADMIN_GROUPS" | xargs)"  # trim spaces
+
+    # handle optional input gracefully
+    [[ -z "$GLOBAL_ADMIN_GROUPS" ]] && GLOBAL_ADMIN_GROUPS="(none)"
+fi
+echo "$DIVIDER"
+
+# Only log if GLOBAL_ADMIN_GROUPS is defined and not "(none)"
+if [ -n "$GLOBAL_ADMIN_GROUPS" ] && [ "$GLOBAL_ADMIN_GROUPS" != "(none)" ]; then
+    log_info "🔐 Using global admin group(s) for SSH access: $GLOBAL_ADMIN_GROUPS"
+fi
 
 # prepare environment
 REALM=${DOMAIN^^}
@@ -1605,8 +1644,8 @@ else
     touch "$chrony_conf"
 fi
 
-# Write new Chrony configuration (universal minimal config)
-cat > "$chrony_conf" <<EOF
+# Write new configuration (universal minimal config)
+cat >"$chrony_conf" <<EOF
 server $DOMAIN iburst
 driftfile /var/lib/chrony/drift
 makestep 1.0 3
@@ -1656,7 +1695,7 @@ for i in {1..30}; do
     if systemctl is-active "$chrony_service" &>/dev/null && \
        chronyc sources | grep -q '^\^\*' && \
        [[ "$(chronyc tracking | awk -F': *' '/Leap status/ {print $2}')" == "Normal" ]]; then
-		synced_server=$( chronyc tracking | awk -F '[()]' '/Reference ID/ { print $2 }' )
+        synced_server=$( chronyc tracking | awk -F '[()]' '/Reference ID/ { print $2 }' )
         # clear previous line before printing success
         printf "\r\033[K" >&2
         log_info "✅ NTP synchronized successfully with: ${synced_server:-chrony}"
@@ -1737,7 +1776,7 @@ EOF
             LDAP_MOVE_CODE=$?
         else
             TMP_LDIF=$(mktemp)
-			cat > "$TMP_LDIF" <<EOF
+			cat >"$TMP_LDIF" <<EOF
 dn: $CURRENT_DN
 changetype: modrdn
 newrdn: CN=${HOST_SHORT_U}
@@ -1823,7 +1862,7 @@ if [[ -n "$HOST_IP" ]]; then
 
     TMP_LDIF=$(mktemp)
 	timestamp=$(date '+%Y-%m-%dT%H:%M:%S%z')
-    cat > "$TMP_LDIF" <<EOF
+    cat >"$TMP_LDIF" <<EOF
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: description
@@ -2139,7 +2178,9 @@ run_cmd_logged "systemctl restart sssd"
 
 unset DOMAIN_PASS
 
-# configure SSH
+# -------------------------------------------------------------------------
+# Configure SSH AllowGroups
+# -------------------------------------------------------------------------
 log_info "🔒 Configuring SSH"
 cfg=/etc/ssh/sshd_config
 HOST_L=$(to_lower "$(hostname -s)")
@@ -2148,8 +2189,16 @@ ADM_ALL="grp-adm-all-linux-servers"
 RDP="grp-ssh-$HOST_L"
 RDP_ALL="grp-ssh-all-linux-servers"
 
-ALLOW_GROUPS="$RDP $RDP_ALL $SSH_G root $GLOBAL_ADMIN_GROUPS"
+# Build AllowGroups safely (skip empty or '(none)')
+ALLOW_GROUPS="$RDP $RDP_ALL $SSH_G root"
+if [[ -n "$GLOBAL_ADMIN_GROUPS" && "$GLOBAL_ADMIN_GROUPS" != "(none)" ]]; then
+    ALLOW_GROUPS="$ALLOW_GROUPS $GLOBAL_ADMIN_GROUPS"
+fi
 
+# Normalize multiple spaces and trim ends
+ALLOW_GROUPS="$(echo "$ALLOW_GROUPS" | xargs)"
+
+# Apply AllowGroups config
 if grep -q '^AllowGroups' "$cfg"; then
     run_cmd "sed -i \"/^AllowGroups/c\\AllowGroups $ALLOW_GROUPS\" $cfg"
 else
@@ -2257,7 +2306,7 @@ fi
 [[ -z "$REALM_JOINED" ]] && REALM_JOINED="⚠️ Not detected"
 
 # Summary output
-DIVIDER=$(printf '%*s\n' "$(tput cols)" '' | tr ' ' '-')
+DIVIDER=$(get_divider)
 echo "$DIVIDER"
 log_info "🌟 DOMAIN JOIN VALIDATION SUMMARY"
 echo "$DIVIDER"
