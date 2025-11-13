@@ -816,74 +816,62 @@ if ! grep -qE '^::1[[:space:]]+localhost' "$HOSTS_FILE"; then
 fi
 
 # Perform safe backup before modification
-cp -p "$HOSTS_FILE" "${HOSTS_FILE}.bak.$(date +%s)"
-log_info "💾 Backup saved as ${HOSTS_FILE}.bak.$(date +%s)"
+BACKUP_FILE="${HOSTS_FILE}.bak.$(date +%s)"
+cp -p "$HOSTS_FILE" "$BACKUP_FILE"
+log_info "💾 Backup saved as $BACKUP_FILE"
 
 # -------------------------------------------------------------------------
-# Check for domain drift before AWK rewrite (interactive or forced correction)
+# Cloud-aware canonical mapping with preservation of provider aliases
 # -------------------------------------------------------------------------
 EXISTING_LINE=$(grep -E "^[[:space:]]*${PRIMARY_IP}[[:space:]]+" "$HOSTS_FILE" || true)
-if [[ -n "$EXISTING_LINE" ]] && ! grep -q "$HOST_FQDN" <<< "$EXISTING_LINE"; then
-    OLD_FQDN=$(awk '{print $2}' <<< "$EXISTING_LINE" | head -n1)
-    log_info "⚠ Detected FQDN mismatch in /etc/hosts:"
-    log_info "ℹ Current entry -> $EXISTING_LINE"
-    log_info "ℹ Expected FQDN -> $HOST_FQDN"
 
-    if $WEB_ACTIVE; then
-        log_info "🌐 Web service detected - possible virtual host binding ($OLD_FQDN)"
-    fi
+if [[ -n "$EXISTING_LINE" ]]; then
+    log_info "🧩 Found existing /etc/hosts entry for ${PRIMARY_IP}, analyzing for drift and aliases"
 
-    SAFE_OLD_FQDN=$(printf '%s\n' "$OLD_FQDN" | sed 's/[.[\*^$()+?{}|]/\\&/g')
-    SAFE_NEW_FQDN=$(printf '%s\n' "$HOST_FQDN" | sed 's/[&/\]/\\&/g')
+    # Tokenize existing line (IP + names)
+    read -ra TOKENS <<< "$EXISTING_LINE"
 
-    if [[ "$NONINTERACTIVE" == "true" ]]; then
-        log_info "💡 --yes specified -> automatically correcting entry to ${HOST_FQDN}"
-        sed -i "s/${SAFE_OLD_FQDN}/${SAFE_NEW_FQDN}/g" "$HOSTS_FILE"
-    else
-		read_sanitized "⚠️ Replace '${OLD_FQDN}' with '${HOST_FQDN}' in /etc/hosts? [y/N]: " REPLY
-        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-            sed -i "s/${SAFE_OLD_FQDN}/${SAFE_NEW_FQDN}/g" "$HOSTS_FILE"
-            log_info "✅ Updated FQDN to ${HOST_FQDN}"
-        else
-            log_info "🟡 Keeping existing mapping -> ${OLD_FQDN}"
+    # First token is the IP; the rest are names (FQDN, short, cloud aliases)
+    declare -a NAMES=("${TOKENS[@]:1}")
+
+    CLOUD_ALIASES=()
+
+    for name in "${NAMES[@]}"; do
+        # Preserve any provider/DHCP aliases that are not the expected FQDN or short hostname
+        if [[ "$name" != "$HOST_FQDN" && "$name" != "$HOST_SHORT" ]]; then
+            CLOUD_ALIASES+=("$name")
         fi
+    done
+
+    if [[ "${#CLOUD_ALIASES[@]}" -gt 0 ]]; then
+        log_info "🌐 Preserving cloud/DHCP aliases: ${CLOUD_ALIASES[*]}"
     fi
-fi
 
-# -------------------------------------------------------------------------
-# Continue with canonical in-memory rewrite (AWK block preserved)
-# -------------------------------------------------------------------------
-if grep -qE "^[[:space:]]*[^#]*\b(${HOST_FQDN}|${HOST_SHORT})\b" "$HOSTS_FILE"; then
-    log_info "🧩 Found existing /etc/hosts entry for this host - checking for drift"
+    # Rebuild canonical entry: PRIMARY_IP HOST_FQDN HOST_SHORT <aliases>
+    {
+        printf "%s\t%s %s" "$PRIMARY_IP" "$HOST_FQDN" "$HOST_SHORT"
+        for alias in "${CLOUD_ALIASES[@]}"; do
+            printf " %s" "$alias"
+        done
+        printf "\n"
+    } > "${HOSTS_FILE}.canonical"
 
-    awk -v ip="$PRIMARY_IP" -v fqdn="$HOST_FQDN" -v short="$HOST_SHORT" '
-        BEGIN { updated=0 }
-        {
-            if ($0 ~ /^[[:space:]]*#/) { print; next }
-            match_self = 0
-            if ($0 ~ ("[[:space:]]"fqdn"([[:space:]]|$)")) match_self=1
-            if ($0 ~ ("[[:space:]]"short"([[:space:]]|$)")) match_self=1
-            if (match_self) {
-                printf "%s\t%s %s\n", ip, fqdn, short
-                updated=1
-            } else { print }
-        }
-        END {
-            if (updated==1) printf "[i] Host mapping updated to %s -> %s %s\n", ip, fqdn, short > "/dev/stderr"
-        }
-    ' "$HOSTS_FILE" > "${HOSTS_FILE}.tmp" 2> "${HOSTS_FILE}.awklog"
+    # Remove any old lines referencing this IP
+    sed -i "\|^[[:space:]]*${PRIMARY_IP}[[:space:]]\+|d" "$HOSTS_FILE"
 
-    if [[ -s "${HOSTS_FILE}.awklog" ]]; then
-        while IFS= read -r line; do log_info "$line"; done < "${HOSTS_FILE}.awklog"
-    fi
-    mv -f "${HOSTS_FILE}.tmp" "$HOSTS_FILE"
-    rm -f "${HOSTS_FILE}.awklog"
+    # Append canonical entry
+    cat "${HOSTS_FILE}.canonical" >> "$HOSTS_FILE"
+    rm -f "${HOSTS_FILE}.canonical"
+
+    log_info "✅ Applied canonical mapping: ${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT} ${CLOUD_ALIASES[*]}"
 else
-    log_info "➕ Adding local host mapping to /etc/hosts: ${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}"
+    log_info "➕ No entry found for ${PRIMARY_IP}; adding canonical host mapping"
     printf "%s\t%s %s\n" "$PRIMARY_IP" "$HOST_FQDN" "$HOST_SHORT" >> "$HOSTS_FILE"
 fi
 
-# Cleanup and validation
+# -------------------------------------------------------------------------
+# Cleanup: remove obsolete Ubuntu/Debian 127.0.1.1 entries
+# -------------------------------------------------------------------------
 if grep -qE '^[[:space:]]*127\.0\.1\.1[[:space:]]+' "$HOSTS_FILE"; then
     log_info "⚙️ Removing obsolete 127.0.1.1 hostname entries (Ubuntu/Debian compatibility fix)"
     sed -i '/^[[:space:]]*127\.0\.1\.1[[:space:]]\+/d' "$HOSTS_FILE"
@@ -892,6 +880,7 @@ fi
 # Adjust default permissions
 chmod 644 "$HOSTS_FILE"
 
+# Final validation
 if ! grep -qE "^[[:space:]]*${PRIMARY_IP}[[:space:]]+${HOST_FQDN}" "$HOSTS_FILE"; then
     log_error "Host mapping not applied correctly in /etc/hosts"
 else
