@@ -872,7 +872,11 @@ if [[ -n "$EXISTING_LINE" ]]; then
     cat "${HOSTS_FILE}.canonical" >> "$HOSTS_FILE"
     rm -f "${HOSTS_FILE}.canonical"
 
-    log_info "✅ Applied canonical mapping: ${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT} ${CLOUD_ALIASES[*]}"
+    if [[ ${#CLOUD_ALIASES[@]} -gt 0 ]]; then
+		log_info "✅ Applied canonical mapping: ${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT} ${CLOUD_ALIASES[*]}"
+	else
+		log_info "✅ Applied canonical mapping: ${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}"
+	fi
 
 else
     # No line found → we create the canonical entry from scratch
