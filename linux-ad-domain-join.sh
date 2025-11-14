@@ -870,7 +870,7 @@ if [[ -n "$EXISTING_LINE" ]]; then
     fi
 
     # Build the canonical line that must exist in /etc/hosts
-    CANONICAL_LINE="${PRIMARY_IP}\t${HOST_FQDN} ${HOST_SHORT}"
+    CANONICAL_LINE="${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}"
     if [[ -n "$CLOUD_ALIASES" ]]; then
         CANONICAL_LINE+=" ${CLOUD_ALIASES}"
     fi
