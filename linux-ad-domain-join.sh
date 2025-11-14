@@ -829,12 +829,13 @@ if [[ -n "$EXISTING_LINE" ]]; then
     log_info "🧩 Found existing /etc/hosts entry for ${PRIMARY_IP}, analyzing for drift and aliases"
 
     # Tokenize existing line (IP + names)
-    read -ra TOKENS <<< "$EXISTING_LINE"
+	read -ra TOKENS <<< "$EXISTING_LINE"
 
     # First token is the IP; the rest are names (FQDN, short, cloud aliases)
     declare -a NAMES=("${TOKENS[@]:1}")
 
-    CLOUD_ALIASES=()
+	# Always declare arrays explicitly under set -u / nounset
+	declare -a CLOUD_ALIASES=()
 
     for name in "${NAMES[@]}"; do
         # Preserve any provider/DHCP aliases that are not the expected FQDN or short hostname
@@ -843,7 +844,7 @@ if [[ -n "$EXISTING_LINE" ]]; then
         fi
     done
 
-    if [[ "${#CLOUD_ALIASES[@]}" -gt 0 ]]; then
+    if [[ "${#CLOUD_ALIASES[@]:-0}" -gt 0 ]]; then
         log_info "🌐 Preserving cloud/DHCP aliases: ${CLOUD_ALIASES[*]}"
     fi
 
