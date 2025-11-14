@@ -820,7 +820,77 @@ BACKUP_FILE="${HOSTS_FILE}.bak.$(date +%s)"
 cp -p "$HOSTS_FILE" "$BACKUP_FILE"
 log_info "💾 Backup saved as $BACKUP_FILE"
 
+# -------------------------------------------------------------------------
+# Cloud-aware canonical mapping with preservation of provider aliases
+# -------------------------------------------------------------------------
+# Goal:
+#   - Ensure a single canonical /etc/hosts entry per PRIMARY_IP:
+#       PRIMARY_IP  HOST_FQDN  HOST_SHORT  [aliases...]
+#   - Preserve any existing provider/DHCP aliases (e.g., cloud hostnames).
+#   - Be 100% safe under "set -u" (no unbound array expansions).
+# Requirements (assumed defined before this block):
+#   - PRIMARY_IP   → primary IPv4 of this host
+#   - HOST_FQDN    → canonical FQDN (e.g., odrl-sp-mx05.odrl.net)
+#   - HOST_SHORT   → short hostname (e.g., odrl-sp-mx05)
+#   - HOSTS_FILE   → usually /etc/hosts
+# -------------------------------------------------------------------------
 
+# Defensive initialization for strict mode (set -u)
+CLOUD_ALIASES=""
+
+# Get the first matching line for this IP (if any)
+EXISTING_LINE=$(grep -E "^[[:space:]]*${PRIMARY_IP}[[:space:]]+" "$HOSTS_FILE" | head -n1 || true)
+
+if [[ -n "$EXISTING_LINE" ]]; then
+    log_info "🧩 Found existing /etc/hosts entry for ${PRIMARY_IP}, analyzing for drift and aliases"
+
+    # Split the existing line into tokens:
+    #   TOKENS[0] = IP
+    #   TOKENS[1..N] = hostnames/aliases
+    read -r -a TOKENS <<< "$EXISTING_LINE"
+
+    if [[ ${#TOKENS[@]} -gt 1 ]]; then
+        # Iterate over all names (skip index 0 which is the IP)
+        for (( i=1; i<${#TOKENS[@]}; i++ )); do
+            name="${TOKENS[i]}"
+
+            # Keep only non-canonical names as "cloud/DHCP aliases"
+            if [[ "$name" != "$HOST_FQDN" && "$name" != "$HOST_SHORT" ]]; then
+                if [[ -z "$CLOUD_ALIASES" ]]; then
+                    CLOUD_ALIASES="$name"
+                else
+                    CLOUD_ALIASES+=" $name"
+                fi
+            fi
+        done
+    fi
+
+    if [[ -n "$CLOUD_ALIASES" ]]; then
+        log_info "🌐 Preserving cloud/DHCP aliases: $CLOUD_ALIASES"
+    fi
+
+    # Build the canonical line that must exist in /etc/hosts
+    CANONICAL_LINE="${PRIMARY_IP}\t${HOST_FQDN} ${HOST_SHORT}"
+    if [[ -n "$CLOUD_ALIASES" ]]; then
+        CANONICAL_LINE+=" ${CLOUD_ALIASES}"
+    fi
+
+    # Remove any previous entries for this IP (avoid duplicates/drift)
+    sed -i "\|^[[:space:]]*${PRIMARY_IP}[[:space:]]\+|d" "$HOSTS_FILE"
+
+    # Append the canonical entry
+    # %b ensures that "\t" is interpreted as a real tab
+    printf "%b\n" "$CANONICAL_LINE" >> "$HOSTS_FILE"
+
+    # Log a human-readable version (tabs replaced by spaces implicitly)
+    log_info "✅ Applied canonical mapping: ${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}${CLOUD_ALIASES:+ $CLOUD_ALIASES}"
+
+else
+    # No existing entry for this IP → create a fresh canonical mapping
+    log_info "➕ No entry found for ${PRIMARY_IP}; adding canonical host mapping"
+
+    printf "%s\t%s %s\n" "$PRIMARY_IP" "$HOST_FQDN" "$HOST_SHORT" >> "$HOSTS_FILE"
+fi
 
 # -------------------------------------------------------------------------
 # Cleanup: remove obsolete Ubuntu/Debian 127.0.1.1 entries
