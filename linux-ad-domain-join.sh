@@ -702,7 +702,7 @@ else
     DC_SERVER=${DC_SERVER:-$default_DC_SERVER}
 
 	# NTP Server (optional, default filled)
-    default_NTP_SERVER="${DOMAIN,,}"
+    default_NTP_SERVER="ntp.${DOMAIN,,}"
     read -rp "[?] NTP server [default: ${default_NTP_SERVER}]: " NTP_SERVER
     NTP_SERVER=${NTP_SERVER:-$default_NTP_SERVER}
 
