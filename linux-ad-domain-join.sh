@@ -2188,6 +2188,98 @@ log_info "🔄 Restarting SSSD"
 run_cmd_logged "systemctl enable sssd"
 run_cmd_logged "systemctl restart sssd"
 
+# -------------------------------------------------------------------------
+# FUNÇÃO: Intelligent Restart for systemd-logind (Systemd Only, High Compatibility)
+# -------------------------------------------------------------------------
+restart_logind_service() {
+    log_info "🔄 Initiating intelligent restart for systemd-logind service"
+    
+    local logind_unit="systemd-logind.service"
+    
+    # 1. Check for systemctl presence (Systemd environments)
+    if command -v systemctl &>/dev/null; then
+        
+        # Check if the logind unit file exists and is active
+        if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${logind_unit}"; then
+            
+            log_info "✅ Systemd detected. Attempting restart of ${logind_unit} to refresh PAM/D-Bus"
+            
+            # Attempt a full restart first (most reliable for resolving login issues)
+            if run_cmd "systemctl restart ${logind_unit}" &>/dev/null; then
+                log_info "🚀 ${logind_unit} restarted successfully."
+                return 0
+            else
+                log_info "⚠️ Failed to restart ${logind_unit}. Attempting safe reload instead."
+                if run_cmd "systemctl reload ${logind_unit}" &>/dev/null; then
+                    log_info "🚀 ${logind_unit} reloaded successfully."
+                    return 0
+                fi
+            fi
+            
+            log_info "🛑 Failed to restart or reload ${logind_unit}. Continuing script execution."
+            return 1
+            
+        else
+            log_info "ℹ️ Systemd found, but ${logind_unit} unit file is missing. Skipping restart."
+        fi
+        
+    elif command -v service &>/dev/null; then
+        # 2. SysVinit/Upstart environments (Using 'service' command)
+        
+        # The service 'systemd-logind' does not exist in these environments.
+        # If the system uses 'service' instead of 'systemctl', the component 
+        # that caused the slowdown (systemd-logind) is not present.
+        
+        log_info "ℹ️ SysVinit/Upstart detected. systemd-logind is not applicable; skipping restart."
+        
+    else
+        # 3. No known service manager
+        log_info "ℹ️ Neither systemctl nor service command found. Skipping systemd-logind action."
+    fi
+}
+
+# -------------------------------------------------------------------------
+# Intelligent Restart for systemd-logind
+# -------------------------------------------------------------------------
+log_info "🔄 Starting direct execution block for systemd-logind restart"
+
+LOGIND_UNIT="systemd-logind.service"
+
+# 1. Check for systemctl presence (Systemd environments)
+if command -v systemctl &>/dev/null; then
+    
+    # Check if the logind unit file exists
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${LOGIND_UNIT}"; then
+        
+        log_info "✅ Systemd detected. Attempting restart of ${LOGIND_UNIT} to refresh PAM/D-Bus"
+        
+        # Attempt a full restart first (most reliable)
+        if run_cmd "systemctl restart ${LOGIND_UNIT}" &>/dev/null; then
+            log_info "🚀 ${LOGIND_UNIT} restarted successfully."
+        else
+            log_info "⚠️ Failed to restart ${LOGIND_UNIT}. Attempting safe reload instead."
+            if run_cmd "systemctl reload ${LOGIND_UNIT}" &>/dev/null; then
+                log_info "🚀 ${LOGIND_UNIT} reloaded successfully."
+            else
+                log_info "🛑 Failed to restart or reload ${LOGIND_UNIT}. Continuing script execution."
+            fi
+        fi
+        
+    else
+        log_info "ℹ️ Systemd found, but ${LOGIND_UNIT} unit file is missing. Skipping restart."
+    fi
+    
+elif command -v service &>/dev/null; then
+    # 2. SysVinit/Upstart environments (Using 'service' command)
+    
+    # systemd-logind is not a SysV service; skip action gracefully.
+    log_info "ℹ️ SysVinit/Upstart detected. systemd-logind is not applicable; skipping restart."
+    
+else
+    # 3. No known service manager
+    log_info "ℹ️ Neither systemctl nor service command found. Skipping systemd-logind action."
+fi
+
 unset DOMAIN_PASS
 
 # -------------------------------------------------------------------------
