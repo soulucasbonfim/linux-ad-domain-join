@@ -99,9 +99,9 @@ sanitize_log_msg() {
         # Warnings / Alerts
         s/⚠|⚠️|❗|❕|🚨|📛|🧯|🔥|💣|🧨/[!]/g;
         # Informational / Neutral
-        s/ℹ|ℹ️|🧵|🕒|📡|🌐|💡|🧬|🧭|⏰|🧾|🪪|🧠|🪶|🔢|💬|📘|🔋|🧮|🟡/[i]/g;
+        s/ℹ|ℹ️|🧵|🕒|📌|📡|🌐|💡|🧬|🧭|⏰|🧾|🪪|🧠|🪶|🔢|💬|📘|🔋|🧮|🟡/[i]/g;
         # Operational / Progress / Configuration
-        s/🖥️|🖥|🔁|🔧|🛠|🛠️|🧩|🏷|💾|♻|🚚|⚙️|⚙|🏷️|🧹|🔗|🔌|🔄|↪|🛡️|🧱|🗂|🗂️|🧰|🛡|📦|📎|🪄/[>]/g;
+        s/🖥️|🖥|🔁|🔧|🛠|📄|🛠️|🧩|🏷|💾|♻|🚚|⚙️|⚙|🏷️|🧹|🔗|🔌|🔄|↪|🛡️|🧱|🗂|🗂️|🧰|🛡|📦|📎|🪄/[>]/g;
         # Errors / Failures
         s/🛑|🚫|❌|🪫/[x]/g;
         # Success / Completion
@@ -2335,44 +2335,181 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Ensure explicit inclusion of AD admin sudoers file (safe and idempotent)
+# Ensure explicit inclusion of AD admin sudoers file
 # -------------------------------------------------------------------------
-SUDO_F="/etc/sudoers.d/ad-admin-groups"
-SUDO_MAIN="/etc/sudoers"
+SUDOERS_MAIN="/etc/sudoers"
+SUDOERS_DIR="/etc/sudoers.d"
+SUDOERS_AD="/etc/sudoers.d/ad-admin-groups"
+BLOCK_FILE="${SUDOERS_DIR}/00-block-root-shell"
 
-log_info "🛡️ Configuring sudoers file: $SUDO_F"
+log_info "🛡️ Configuring sudoers file: $SUDOERS_AD"
 
 # 1. Ensure target directory exists
-mkdir -p "$(dirname "$SUDO_F")"
+mkdir -p "$(dirname "$SUDOERS_AD")"
 
 # 2. Create or refresh AD admin sudoers definition
-cat >"$SUDO_F" <<EOF
+cat >"$SUDOERS_AD" <<EOF
 %$ADM ALL=(ALL) NOPASSWD: ALL
 %$ADM_ALL ALL=(ALL) NOPASSWD: ALL
 EOF
-chmod 440 "$SUDO_F"
+chmod 440 "$SUDOERS_AD"
 
 # 3. Check if /etc/sudoers already includes this specific file
-if ! grep -Eq "^[[:space:]]*#include[[:space:]]+$SUDO_F" "$SUDO_MAIN"; then
-	log_info "⚙️ Adding explicit include for $SUDO_F in $SUDO_MAIN"
+if ! grep -Eq "^[[:space:]]*#include[[:space:]]+$SUDOERS_AD" "$SUDOERS_MAIN"; then
+	log_info "⚙️ Adding explicit include for $SUDOERS_AD in $SUDOERS_MAIN"
 
 	# Backup before modification
-	SUDO_BAK="${SUDO_MAIN}.bak.$(date +%Y%m%d%H%M%S)"
-	cp -p "$SUDO_MAIN" "$SUDO_BAK"
+	SUDO_BAK="${SUDOERS_MAIN}.bak.$(date +%Y%m%d%H%M%S)"
+	cp -p "$SUDOERS_MAIN" "$SUDO_BAK"
 
 	# Append safely at the end of file
-	echo -e "\n# Include AD-specific sudo policy\n#include $SUDO_F" >> "$SUDO_MAIN"
+	echo -e "\n# Include AD-specific sudo policy\n#include $SUDOERS_AD" >> "$SUDOERS_MAIN"
 
 	# Syntax validation (rollback on error)
 	if visudo -c >/dev/null 2>&1; then
 		log_info "✅ Sudoers include added successfully"
 	else
 		log_info "🛑 visudo syntax check failed - restoring previous configuration"
-		mv -f "$SUDO_BAK" "$SUDO_MAIN"
+		mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
 	fi
 else
-	log_info "✅ Explicit include for $SUDO_F already present in $SUDO_MAIN"
+	log_info "✅ Explicit include for $SUDOERS_AD already present in $SUDOERS_MAIN"
 fi
+
+# -------------------------------------------------------------------------
+# Root Shell Hardening (restrict interactive shells for all sudo groups)
+# -------------------------------------------------------------------------
+
+log_info "🔍 Starting root shell hardening"
+
+# -------------------------------------------------------------------------
+# Create ROOT_SHELLS command alias (centralized restriction control)
+# -------------------------------------------------------------------------
+log_info "🛠️ Installing ROOT_SHELLS alias at $BLOCK_FILE"
+
+cat >"$BLOCK_FILE" <<'EOF'
+Cmnd_Alias ROOT_SHELLS = /bin/su, /usr/bin/su, /bin/bash, /usr/bin/bash, /bin/sh, /usr/bin/sh
+EOF
+
+chmod 440 "$BLOCK_FILE"
+
+visudo -cf "$BLOCK_FILE" >/dev/null 2>&1 || \
+    log_error "Invalid syntax in $BLOCK_FILE"
+
+log_info "🔒 ROOT_SHELLS alias applied"
+
+# -------------------------------------------------------------------------
+# Enumerate sudoers files (main file + drop-in directory)
+# -------------------------------------------------------------------------
+log_info "🗂️ Enumerating sudoers configuration files"
+
+FILES=("$SUDOERS_MAIN")
+
+while IFS= read -r f; do
+    [[ "$f" == "$BLOCK_FILE" ]] && continue
+    [[ "$f" =~ README ]] && continue
+    [[ "$f" =~ \.bak ]] && continue
+    FILES+=("$f")
+done < <(find "$SUDOERS_DIR" -maxdepth 1 -type f)
+
+# -------------------------------------------------------------------------
+# Extract administrative groups from all sudoers files
+# -------------------------------------------------------------------------
+log_info "🔎 Enumerating administrative groups"
+
+RAW_GROUPS=()
+
+for f in "${FILES[@]}"; do
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^%([A-Za-z0-9._-]+)[[:space:]] ]]; then
+            RAW_GROUPS+=("${BASH_REMATCH[1]}")
+        fi
+    done <"$f"
+done
+
+TARGET_GROUPS=()
+for g in "${RAW_GROUPS[@]}"; do
+    exists=false
+    for e in "${TARGET_GROUPS[@]}"; do
+        [[ "$g" == "$e" ]] && exists=true
+    done
+    [[ "$exists" == false ]] && TARGET_GROUPS+=("$g")
+done
+
+log_info "📌 Sudo groups detected: ${TARGET_GROUPS[*]}"
+
+# -------------------------------------------------------------------------
+# Patch sudo rules to enforce !ROOT_SHELLS restriction
+# -------------------------------------------------------------------------
+log_info "⚙️ Updating rules"
+
+for f in "${FILES[@]}"; do
+    patched=()
+    compliant=()
+
+    tmp="${f}.tmp"
+    : >"$tmp"
+
+    while IFS= read -r line; do
+        original="$line"
+        handled=false
+
+        for grp in "${TARGET_GROUPS[@]}"; do
+            good_all="%${grp} ALL=(ALL:ALL) ALL, !ROOT_SHELLS"
+            good_npw="%${grp} ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS"
+
+            pat_all="^%${grp}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+ALL$"
+            pat_npw="^%${grp}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]+ALL$"
+
+            # Already compliant
+            if [[ "$line" == "$good_all" || "$line" == "$good_npw" ]]; then
+                compliant+=("$grp")
+                echo "$line" >>"$tmp"
+                handled=true
+                break
+            fi
+
+            # Needs patching: ALL=(ALL:ALL) ALL
+            if [[ "$line" =~ $pat_all ]]; then
+                echo "# ORIGINAL (disabled by hardening $(date +%F))" >>"$tmp"
+                echo "# $original" >>"$tmp"
+                echo "$good_all" >>"$tmp"
+                patched+=("$grp")
+                handled=true
+                break
+            fi
+
+            # Needs patching: ALL with NOPASSWD
+            if [[ "$line" =~ $pat_npw ]]; then
+                echo "# ORIGINAL (disabled by hardening $(date +%F))" >>"$tmp"
+                echo "# $original" >>"$tmp"
+                echo "$good_npw" >>"$tmp"
+                patched+=("$grp")
+                handled=true
+                break
+            fi
+        done
+
+        [[ "$handled" == false ]] && echo "$line" >>"$tmp"
+
+    done <"$f"
+
+    # Validate syntax before committing changes
+    if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+        rm -f "$tmp"
+        log_error "Invalid syntax after modifying $f"
+    fi
+
+    mv -f "$tmp" "$f"
+    chmod 440 "$f"
+
+    # Standardized log output format
+    if [[ ${#patched[@]} -gt 0 ]]; then
+        log_info "📄 $f → patched: ${patched[*]}"
+    elif [[ ${#compliant[@]} -gt 0 ]]; then
+        log_info "📄 $f → unchanged: ${compliant[*]}"
+    fi
+done
 
 log_info "🚀 Completed domain join for $DOMAIN"
 
