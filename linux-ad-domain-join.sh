@@ -101,7 +101,7 @@ sanitize_log_msg() {
         # Informational / Neutral
         s/ℹ|ℹ️|🧵|🕒|📡|🌐|💡|🧬|🧭|⏰|🧾|🪪|🧠|🪶|🔢|💬|📘|🔋|🧮|🟡/[i]/g;
         # Operational / Progress / Configuration
-        s/🔁|🔧|🛠|🛠️|🧩|🏷|💾|♻|🚚|⚙️|⚙|🏷️|🧹|🔗|🔌|🔄|↪|🛡️|🧱|🗂|🗂️|🧰|🛡|📦|📎|🪄/[>]/g;
+        s/🖥️|🖥|🔁|🔧|🛠|🛠️|🧩|🏷|💾|♻|🚚|⚙️|⚙|🏷️|🧹|🔗|🔌|🔄|↪|🛡️|🧱|🗂|🗂️|🧰|🛡|📦|📎|🪄/[>]/g;
         # Errors / Failures
         s/🛑|🚫|❌|🪫/[x]/g;
         # Success / Completion
@@ -673,6 +673,7 @@ if $NONINTERACTIVE; then
     : "${DOMAIN:?DOMAIN required}"
     : "${OU:?OU required}"
     : "${DC_SERVER:?DC_SERVER required}"
+	: "${NTP_SERVER:?NTP_SERVER required}"
     : "${DOMAIN_USER:?DOMAIN_USER required}"
     : "${DOMAIN_PASS:?DOMAIN_PASS required}"
 else
@@ -699,6 +700,11 @@ else
     default_DC_SERVER="${DOMAIN_SHORT,,}-sp-ad01.${DOMAIN,,}"
     read -rp "[?] DC server [default: ${default_DC_SERVER}]: " DC_SERVER
     DC_SERVER=${DC_SERVER:-$default_DC_SERVER}
+
+	# NTP Server (optional, default filled)
+    default_NTP_SERVER="${DOMAIN,,}"
+    read -rp "[?] NTP server [default: ${default_NTP_SERVER}]: " NTP_SERVER
+    NTP_SERVER=${NTP_SERVER:-$default_NTP_SERVER}
 
     # Require Join User
     while true; do
@@ -1629,8 +1635,8 @@ if [[ "$OS_FAMILY" == "rhel" || "$OS_FAMILY" == "ol" || "$OS_FAMILY" == "rocky" 
 	done
 fi
 
-# configure NTP with domain
-log_info "⏰ Configuring NTP to use domain ($DOMAIN)"
+# configure NTP with $NTP_SERVER
+log_info "⏰ Configuring NTP to use domain ($NTP_SERVER)"
 
 # Detect chrony configuration file path
 if [[ -f /etc/chrony.conf ]]; then
@@ -1658,7 +1664,7 @@ fi
 
 # Write new configuration (universal minimal config)
 cat >"$chrony_conf" <<EOF
-server $DOMAIN iburst
+server $NTP_SERVER iburst
 driftfile /var/lib/chrony/drift
 makestep 1.0 3
 rtcsync
@@ -1725,7 +1731,7 @@ done
 printf "\r\033[K" >&2
 
 if [[ "$synced" != true ]]; then
-    log_info "⚠️ NTP is not yet synchronized with $DOMAIN after 30s; please verify chronyd logs"
+    log_info "⚠️ NTP is not yet synchronized with $NTP_SERVER after 30s; please verify chronyd logs"
 else
     end_time=$(date +%s)
     elapsed=$(( end_time - start_time ))
