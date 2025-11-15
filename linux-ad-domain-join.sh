@@ -1636,7 +1636,7 @@ if [[ "$OS_FAMILY" == "rhel" || "$OS_FAMILY" == "ol" || "$OS_FAMILY" == "rocky" 
 fi
 
 # configure NTP with $NTP_SERVER
-log_info "⏰ Configuring NTP to use domain ($NTP_SERVER)"
+log_info "⏰ Configuring NTP to use ($NTP_SERVER)"
 
 # Detect chrony configuration file path
 if [[ -f /etc/chrony.conf ]]; then
