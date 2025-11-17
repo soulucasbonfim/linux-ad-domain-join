@@ -18,5 +18,5 @@ A cross-distro automation script to securely join Linux systems (Ubuntu, RHEL, O
 
 ## Download & Usage
 ```bash
-bash <( (command -v curl >/dev/null && curl -fsSL https://raw.githubusercontent.com/soulucasbonfim/linux-ad-domain-join/main/linux-ad-domain-join.sh) || wget -qO- https://raw.githubusercontent.com/soulucasbonfim/linux-ad-domain-join/main/linux-ad-domain-join.sh )
+sudo bash <( (command -v curl >/dev/null && curl -fsSL https://raw.githubusercontent.com/soulucasbonfim/linux-ad-domain-join/main/linux-ad-domain-join.sh) || wget -qO- https://raw.githubusercontent.com/soulucasbonfim/linux-ad-domain-join/main/linux-ad-domain-join.sh )
 ```
