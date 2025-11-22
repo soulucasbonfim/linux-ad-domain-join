@@ -2710,7 +2710,9 @@ printf "%-25s %s\n" "Handshake (ms):"     "${TRUST_ELAPSED:-n/a}"
 printf "%-25s %s\n" "Network RTT:"        "${TRUST_RTT:-n/a}"
 printf "%-25s %s\n" "SSSD Service:"       "${SSSD_STATUS,,}"
 printf "%-25s %s\n" "SSH Service:"        "${SSH_STATUS,,}"
+echo
 printf "%s\n" "$DIVIDER" >&2
+echo
 
 # Insert short pause and newline without spawning a subshell
 sleep 0.05
