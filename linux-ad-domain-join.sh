@@ -770,56 +770,6 @@ if [ -n "$GLOBAL_ADMIN_GROUPS" ] && [ "$GLOBAL_ADMIN_GROUPS" != "(none)" ]; then
     log_info "🔐 Using global admin group(s) for SSH access: $GLOBAL_ADMIN_GROUPS"
 fi
 
-# -------------------------------------------------------------------------
-# Build BASE_DN and normalize OU format
-# -------------------------------------------------------------------------
-DOMAIN_DN=$(awk -F'.' '{
-    for (i = 1; i <= NF; i++) printf "%sDC=%s", (i>1?",":""), toupper($i)
-}' <<< "$DOMAIN")
-
-BASE_DN="$DOMAIN_DN"
-
-if [[ "$OU" != *"DC="* ]]; then
-    log_info "⚠ OU missing DC= — using default Computers container"
-    OU="CN=Computers,${DOMAIN_DN}"
-fi
-
-# -------------------------------------------------------------------------
-# Validate OU existence (with fallback, simple bind)
-# -------------------------------------------------------------------------
-log_info "🔍 Checking OU: $OU"
-
-set +e
-LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
-    -H "ldap://${DC_SERVER}" \
-    -D "${DOMAIN_USER}@${DOMAIN}" -w "$DOMAIN_PASS" \
-    -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>/dev/null)
-LDAP_CODE=$?
-set -e
-
-if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
-    log_info "⚠ OU not found — applying fallback"
-    OU="CN=Computers,${DOMAIN_DN}"
-    log_info "↪ Using fallback: $OU"
-
-    # Test fallback OU also under safe mode
-    set +e
-    LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
-        -H "ldap://${DC_SERVER}" \
-        -D "${DOMAIN_USER}@${DOMAIN}" -w "$DOMAIN_PASS" \
-        -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>/dev/null)
-    LDAP_CODE=$?
-    set -e
-
-    [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]] && log_error "Invalid OU and fallback missing — aborting" 4
-fi
-
-# -------------------------------------------------------------------------
-# Final OU and BaseDN
-# -------------------------------------------------------------------------
-log_info "✔ OU DN: $OU"
-log_info "✔ BaseDN: $BASE_DN"
-
 # Prepare environment
 REALM=${DOMAIN^^}
 HOST_FQDN="$(hostname -s).$(to_lower "$DOMAIN")"
@@ -1061,6 +1011,56 @@ if [[ -f "$0" && -w "$0" ]]; then
 else
     log_info "ℹ Skipping self-removal (script not a regular file: $0)"
 fi
+
+# -------------------------------------------------------------------------
+# Build BASE_DN and normalize OU format
+# -------------------------------------------------------------------------
+DOMAIN_DN=$(awk -F'.' '{
+    for (i = 1; i <= NF; i++) printf "%sDC=%s", (i>1?",":""), toupper($i)
+}' <<< "$DOMAIN")
+
+BASE_DN="$DOMAIN_DN"
+
+if [[ "$OU" != *"DC="* ]]; then
+    log_info "⚠ OU missing DC= — using default Computers container"
+    OU="CN=Computers,${DOMAIN_DN}"
+fi
+
+# -------------------------------------------------------------------------
+# Validate OU existence (with fallback, simple bind)
+# -------------------------------------------------------------------------
+log_info "🔍 Checking OU: $OU"
+
+set +e
+LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
+    -H "ldap://${DC_SERVER}" \
+    -D "${DOMAIN_USER}@${DOMAIN}" -w "$DOMAIN_PASS" \
+    -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>/dev/null)
+LDAP_CODE=$?
+set -e
+
+if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
+    log_info "⚠ OU not found — applying fallback"
+    OU="CN=Computers,${DOMAIN_DN}"
+    log_info "↪ Using fallback: $OU"
+
+    # Test fallback OU also under safe mode
+    set +e
+    LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
+        -H "ldap://${DC_SERVER}" \
+        -D "${DOMAIN_USER}@${DOMAIN}" -w "$DOMAIN_PASS" \
+        -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>/dev/null)
+    LDAP_CODE=$?
+    set -e
+
+    [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]] && log_error "Invalid OU and fallback missing — aborting" 4
+fi
+
+# -------------------------------------------------------------------------
+# Final OU and BaseDN
+# -------------------------------------------------------------------------
+log_info "✔ OU DN: $OU"
+log_info "✔ BaseDN: $BASE_DN"
 
 # checking existing realm
 log_info "🧭 Verifying local realm join state"
