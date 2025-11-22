@@ -704,7 +704,11 @@ else
     DOMAIN_SHORT=$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')
 
     # OU (optional, default filled)
-    default_OU="OU=Servers,OU=DC_ORACLE,OU=SITES,OU=OPERATIONS,OU=${DOMAIN_SHORT},OU=COMPANIES,DC=${DOMAIN_SHORT},DC=$(echo "$DOMAIN" | cut -d'.' -f2 | tr '[:lower:]' '[:upper:]')"
+    DOMAIN_DN=$(awk -F'.' '{
+		for (i = 1; i <= NF; i++) printf "%sDC=%s", (i>1?",":""), toupper($i)
+	}' <<< "$DOMAIN")
+
+	default_OU="OU=Servers,OU=DC_ORACLE,OU=SITES,OU=OPERATIONS,OU=${DOMAIN_SHORT},OU=COMPANIES,${DOMAIN_DN}"
     read -rp "[?] OU [default: ${default_OU}]: " OU
     OU=${OU:-$default_OU}
 
