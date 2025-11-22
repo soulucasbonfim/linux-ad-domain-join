@@ -691,7 +691,7 @@ if $NONINTERACTIVE; then
     : "${DOMAIN_PASS:?DOMAIN_PASS required}"
 else
     log_info "🧪 Collecting inputs"
-    echo "$DIVIDER"
+    printf "\n%s\n" "$DIVIDER"
 
     # Require DOMAIN
     while true; do
@@ -808,7 +808,7 @@ else
     # handle optional input gracefully
     [[ -z "$GLOBAL_ADMIN_GROUPS" ]] && GLOBAL_ADMIN_GROUPS="(none)"
 fi
-echo "$DIVIDER"
+printf "\n%s\n" "$DIVIDER"
 
 # Only log if GLOBAL_ADMIN_GROUPS is defined and not "(none)"
 if [ -n "$GLOBAL_ADMIN_GROUPS" ] && [ "$GLOBAL_ADMIN_GROUPS" != "(none)" ]; then
@@ -2678,9 +2678,9 @@ fi
 
 # Summary output
 DIVIDER=$(get_divider)
-echo "$DIVIDER"
+printf "\n%s\n" "$DIVIDER"
 log_info "🌟 DOMAIN JOIN VALIDATION SUMMARY"
-echo "$DIVIDER"
+printf "\n%s\n" "$DIVIDER"
 printf "%-25s %s\n" "Realm:"              "$REALM_JOINED"
 printf "%-25s %s\n" "DC Server:"          "$DC_SERVER"
 printf "%-25s %s\n" "Computer Name:"      "$HOST_SHORT_U"
@@ -2691,7 +2691,7 @@ printf "%-25s %s\n" "Handshake (ms):"     "${TRUST_ELAPSED:-n/a}"
 printf "%-25s %s\n" "Network RTT:"        "${TRUST_RTT:-n/a}"
 printf "%-25s %s\n" "SSSD Service:"       "${SSSD_STATUS,,}"
 printf "%-25s %s\n" "SSH Service:"        "${SSH_STATUS,,}"
-echo "$DIVIDER"
+printf "\n%s\n" "$DIVIDER"
 
 # Insert short pause and newline without spawning a subshell
 sleep 0.05
