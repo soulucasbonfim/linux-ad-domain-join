@@ -462,9 +462,15 @@ done
 # -------------------------------------------------------------------------
 if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release || -f /etc/rocky-release || -f /etc/almalinux-release ]]; then
     log_info "🧩 Checking RPM database integrity"
-
-    # Test basic query (lightweight check)
-    if ! rpm -qf /etc/redhat-release &>/dev/null; then
+	
+	release_file=""
+    for f in /etc/redhat-release /etc/centos-release /etc/oracle-release /etc/rocky-release /etc/almalinux-release; do
+        [[ -f "$f" ]] && { release_file="$f"; break; }
+    done
+	
+    if [[ -z "$release_file" ]]; then
+        log_info "ℹ No release file found for rpm check, skipping RPM DB verification"
+    elif ! rpm -qf "$release_file" &>/dev/null; then
         log_info "⚙ RPM database appears corrupted - initiating recovery"
 
         # Backup existing RPM database
@@ -485,7 +491,7 @@ if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release
         fi
 
         # Re-test after rebuild
-        if ! rpm -qf /etc/redhat-release &>/dev/null; then
+        if ! rpm -qf "$release_file" &>/dev/null; then
             log_error "RPM database still corrupted after rebuild. Aborting execution." 9
         fi
     else
@@ -540,7 +546,7 @@ install_missing_deps() {
 # -------------------------------------------------------------------------
 # List required tools
 # -------------------------------------------------------------------------
-tools=( realm adcli kinit kdestroy timedatectl systemctl sed grep tput timeout hostname cp chmod tee ldapsearch ldapmodify chronyc nc )
+tools=( realm adcli kinit kdestroy timedatectl systemctl sed grep tput timeout hostname cp chmod tee ldapsearch ldapmodify chronyc nc host dig )
 
 # Add PAM config tool based on OS family
 case "$OS_FAMILY" in
@@ -568,6 +574,8 @@ for cmd in "${tools[@]}"; do
     ! command -v "$cmd" &>/dev/null && missing_cmds+=( "$cmd" )
 done
 
+[[ ${#missing_cmds[@]} -gt 0 ]] && log_info "⚠ Missing tools (pre-install): ${missing_cmds[*]}"
+
 # -------------------------------------------------------------------------
 # Package list by distro (Samba-free, SSSD-based)
 # -------------------------------------------------------------------------
@@ -576,7 +584,7 @@ case "$OS_FAMILY" in
     debian)
         pkgs=( realmd sssd sssd-tools adcli oddjob oddjob-mkhomedir \
                packagekit krb5-user libnss-sss libpam-sss libpam-runtime \
-               ldap-utils chrony dialog )
+               ldap-utils chrony dialog dnsutils )
         # Prefer netcat-openbsd, fallback to nmap-ncat
 		if apt-cache show netcat-openbsd >/dev/null 2>&1; then
 			pkgs+=( netcat-openbsd )
@@ -589,7 +597,7 @@ case "$OS_FAMILY" in
 	rhel)
 		RHEL_MAJOR=$(rpm -q --qf '%{VERSION}' "$(rpm -qf /etc/redhat-release)" | cut -d. -f1)
 		pkgs=( realmd sssd sssd-tools adcli oddjob oddjob-mkhomedir \
-			   krb5-workstation chrony openldap-clients nmap-ncat )
+			   krb5-workstation chrony openldap-clients nmap-ncat bind-utils )
 		if (( RHEL_MAJOR < 8 )); then
 			pkgs+=( authconfig )
 		else
@@ -600,6 +608,11 @@ case "$OS_FAMILY" in
     suse)
 		pkgs=( realmd sssd adcli oddjob oddjob-mkhomedir \
 			   krb5-client pam-config chrony )
+		# DNS utils (host/dig)
+        if zypper se -x bind-utils >/dev/null 2>&1; then
+            pkgs+=( bind-utils )
+        fi
+		
 		# Prefer openldap2-client (SLES 12) or openldap-clients (Leap 15/SLES 15)
 		if zypper se -x openldap-clients >/dev/null 2>&1; then
 			pkgs+=( openldap-clients )
@@ -668,6 +681,7 @@ esac
 # -------------------------------------------------------------------------
 # Collect domain join inputs
 # -------------------------------------------------------------------------
+DIVIDER=$(get_divider)
 if $NONINTERACTIVE; then
     : "${DOMAIN:?DOMAIN required}"
     : "${OU:?OU required}"
@@ -677,7 +691,6 @@ if $NONINTERACTIVE; then
     : "${DOMAIN_PASS:?DOMAIN_PASS required}"
 else
     log_info "🧪 Collecting inputs"
-    DIVIDER=$(get_divider)
     echo "$DIVIDER"
 
     # Require DOMAIN
@@ -722,10 +735,58 @@ else
     done
 fi
 
+# -------------------------------------------------------------------------
 # Validate non-interactive env vars
-for var in DOMAIN OU DC_SERVER DOMAIN_USER DOMAIN_PASS; do
+# -------------------------------------------------------------------------
+for var in DOMAIN OU DC_SERVER DOMAIN_USER DOMAIN_PASS NTP_SERVER; do
     [[ -n "${!var}" ]] || log_error "$var is required" 1
 done
+
+# -------------------------------------------------------------------------
+# Build BASE_DN and normalize OU format
+# -------------------------------------------------------------------------
+DOMAIN_DN=$(awk -F'.' '{
+    for (i = 1; i <= NF; i++) printf "%sDC=%s", (i>1?",":""), toupper($i)
+}' <<< "$DOMAIN")
+
+BASE_DN="$DOMAIN_DN"
+
+if [[ "$OU" != *"DC="* ]]; then
+    log_info "⚠ OU missing DC= — using default Computers container"
+    OU="CN=Computers,${DOMAIN_DN}"
+fi
+
+# -------------------------------------------------------------------------
+# Validate OU existence (with fallback, simple bind)
+# -------------------------------------------------------------------------
+log_info "🔍 Checking OU: $OU"
+
+ldapsearch -x -LLL \
+    -H "ldap://${DC_SERVER}" \
+    -D "${DOMAIN_USER}@${DOMAIN}" -w "$DOMAIN_PASS" \
+    -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" \
+    >/dev/null 2>&1
+
+if [[ $? -ne 0 ]]; then
+    log_info "⚠ OU not found — applying fallback"
+
+    OU="CN=Computers,${DOMAIN_DN}"
+    log_info "↪ Using fallback: $OU"
+
+    ldapsearch -x -LLL \
+        -H "ldap://${DC_SERVER}" \
+        -D "${DOMAIN_USER}@${DOMAIN}" -w "$DOMAIN_PASS" \
+        -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" \
+        >/dev/null 2>&1
+
+    [[ $? -ne 0 ]] && log_error "Invalid OU and fallback missing — aborting" 4
+fi
+
+# -------------------------------------------------------------------------
+# Final OU and BaseDN
+# -------------------------------------------------------------------------
+log_info "✔ OU DN: $OU"
+log_info "✔ BaseDN: $BASE_DN"
 
 # -------------------------------------------------------------------------
 # Global admin group(s) for SSH AllowGroups
@@ -750,10 +811,8 @@ if [ -n "$GLOBAL_ADMIN_GROUPS" ] && [ "$GLOBAL_ADMIN_GROUPS" != "(none)" ]; then
     log_info "🔐 Using global admin group(s) for SSH access: $GLOBAL_ADMIN_GROUPS"
 fi
 
-# prepare environment
+# Prepare environment
 REALM=${DOMAIN^^}
-OS_NAME=$PRETTY_NAME
-OS_VERSION=$(uname -r)
 HOST_FQDN="$(hostname -s).$(to_lower "$DOMAIN")"
 
 # Hostname format for Kerberos (uppercase short name)
@@ -942,25 +1001,33 @@ else
     log_error "Cannot reach LDAP port 389 on $DC_SERVER (network/firewall issue)" 12
 fi
 
-# Optional: SRV record check
-if ! dig +short _kerberos._tcp."$DOMAIN" &>/dev/null; then
-    log_info "⚠️ No _kerberos._tcp SRV records found for $DOMAIN (realm discovery may fail)"
-fi
-
 log_info "✅ DNS and KDC reachability OK"
 
-# verify credentials
+# -------------------------------------------------------------------------
+# Kerberos credential validation (controlled error handling block)
+# -------------------------------------------------------------------------
 log_info "🔐 Verifying credentials for $DOMAIN_USER@$REALM"
 KRB_TRACE=$(mktemp)
 
-trap - ERR
+# Save current shell options and ERR trap to restore later
+__kinit_old_opts="$(set +o)"
+__kinit_old_trap="$(trap -p ERR | sed -E 's/^trap -- //')"
+
+# Temporarily relax -e and disable ERR trap to classify kinit failures
 set +e
+trap - ERR
+
 echo "$DOMAIN_PASS" | KRB5_TRACE="$KRB_TRACE" kinit "$DOMAIN_USER@$REALM" >/dev/null 2>&1
 KINIT_CODE=$?
-set -e
 
-# Restore global trap after controlled block
-trap 'log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?' ERR
+# Restore previous shell options and ERR trap
+eval "$__kinit_old_opts"
+if [[ -n "$__kinit_old_trap" ]]; then
+    eval "$__kinit_old_trap"
+else
+    trap 'log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?' ERR
+fi
+unset __kinit_old_opts __kinit_old_trap
 
 # analyze both return code AND trace contents
 if (( KINIT_CODE == 0 )) && ! grep -qiE 'CLIENT_LOCKED_OUT|revoked|disabled|locked out|denied|expired' "$KRB_TRACE"; then
@@ -1146,7 +1213,7 @@ case $OS_FAMILY in
 	debian)
 		run_cmd_logged "pam-auth-update --enable sss mkhomedir --force"
 	;;
-	rhel|ol|rocky|almalinux|centos)
+	rhel)
 		RHEL_MAJOR=$(rpm -q --qf '%{VERSION}' $(rpm -qf /etc/redhat-release) | cut -d. -f1)
 		if (( RHEL_MAJOR < 8 )); then
 			# RHEL/CentOS/OL 6–7 -> authconfig
@@ -1171,7 +1238,7 @@ esac
 # Fully autonomous logic: performs D-Bus reload and, if needed, safe restart.
 # Works across RHEL/OL 6–9 and automatically self-heals registration failures.
 # -------------------------------------------------------------------------
-if [[ "$OS_FAMILY" =~ ^(rhel|ol|centos|rocky|almalinux)$ ]]; then
+if [[ "$OS_FAMILY" =~ ^(rhel)$ ]]; then
     log_info "🧩 Verifying oddjob mkhomedir D-Bus registration (no package installs)"
 
     DBUS_SVC="/usr/share/dbus-1/system-services/com.redhat.oddjob.service"
@@ -1299,10 +1366,10 @@ log_info "🧩 Verifying PAM stack consistency (non-intrusive check)"
 
 # Detect primary PAM layout
 case "$OS_FAMILY" in
-	rhel|rocky|almalinux|centos|ol)
+	rhel)
 		PAM_FILES=("/etc/pam.d/system-auth" "/etc/pam.d/password-auth")
 		;;
-	debian|ubuntu|suse)
+	debian|suse)
 		PAM_FILES=("/etc/pam.d/common-auth" "/etc/pam.d/common-account" "/etc/pam.d/common-session" "/etc/pam.d/common-password")
 		;;
 	*)
@@ -1350,7 +1417,7 @@ for file in "${PAM_FILES[@]}"; do
 done
 
 # Re-run consistency for RHEL-like systems
-if [[ "$OS_FAMILY" =~ ^(rhel|ol|rocky|almalinux|centos)$ ]]; then
+if [[ "$OS_FAMILY" =~ ^(rhel)$ ]]; then
 	if command -v authconfig >/dev/null 2>&1; then
 		run_cmd_logged "LANG=C LC_ALL=C authconfig --update"
 	fi
@@ -1363,12 +1430,12 @@ log_info "🔍 Performing PAM validation with symbolic link awareness"
 
 PAM_VALIDATE_FILES=()
 case "$OS_FAMILY" in
-	rhel|ol|centos|rocky|almalinux)
+	rhel)
 		for f in /etc/pam.d/system-auth /etc/pam.d/system-auth-ac /etc/pam.d/password-auth /etc/pam.d/password-auth-ac; do
 			[[ -e "$f" ]] && PAM_VALIDATE_FILES+=("$f")
 		done
 		;;
-	debian|ubuntu)
+	debian)
 		for f in /etc/pam.d/common-auth /etc/pam.d/common-account /etc/pam.d/common-password /etc/pam.d/common-session; do
 			[[ -e "$f" ]] && PAM_VALIDATE_FILES+=("$f")
 		done
@@ -1499,7 +1566,7 @@ for key in passwd shadow group services netgroup; do
     # 5. If entry exists but lacks 'sss', patch it
     if grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
         log_info "🧩 Updating existing '${key}' entry to include sss"
-        sed -i "s/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g" "$NSS_FILE"
+        sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_FILE"
         sed -i \
             -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
             -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_FILE"
@@ -1537,7 +1604,7 @@ if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
         log_info "ℹ️ '${key}' already includes sss"
     elif grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
         log_info "🧩 Updating existing '${key}' entry to include sss"
-        sed -i "s/[[:space:]]\\+(ldap|nis|yp)//g; s/[[:space:]]\\{2,\\}/ /g" "$NSS_FILE"
+        sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_FILE"
         sed -i \
             -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
             -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_FILE"
@@ -1600,7 +1667,7 @@ log_info "🌟 NSS/SSSD integration completed successfully"
 # -------------------------------------------------------------------------
 # Disable legacy pam_ldap if SSSD is active (RHEL-like systems)
 # -------------------------------------------------------------------------
-if [[ "$OS_FAMILY" == "rhel" || "$OS_FAMILY" == "ol" || "$OS_FAMILY" == "rocky" || "$OS_FAMILY" == "almalinux" ]]; then
+if [[ "$OS_FAMILY" == "rhel" ]]; then
 	log_info "🧩 Checking for legacy pam_ldap entries (system-auth, password-auth)"
 
 	for pamfile in /etc/pam.d/system-auth /etc/pam.d/password-auth; do
@@ -1733,8 +1800,6 @@ echo "$DOMAIN_PASS" | kinit "${DOMAIN_USER}@${REALM}" >/dev/null || {
     log_error "Failed to obtain Kerberos ticket for $DOMAIN_USER"
 }
 
-BASE_DN=$(awk -F, '{for (i=1; i<=NF; i++) if ($i ~ /^DC=/) print $i}' <<< "$OU" | paste -sd, -)
-
 if $VERBOSE; then
     log_info "🧪 DEBUG: Testing LDAP search for computer object..."
     echo "🔸 HOST_SHORT_U: $HOST_SHORT_U"
@@ -1767,6 +1832,7 @@ $VERBOSE && echo "$LDAP_OUT"
 
 if [[ -n "$CURRENT_DN" ]]; then
     EXPECTED_DN="CN=${HOST_SHORT_U},${OU}"
+
     if [[ "$CURRENT_DN" == "$EXPECTED_DN" ]]; then
         $VERBOSE && log_info "ℹ️ Computer object is already in the correct OU"
     else
@@ -1988,6 +2054,21 @@ kdestroy -q 2>/dev/null || true
 rm -f "$KRB_LOG" 2>/dev/null || true
 
 # -------------------------------------------------------------------------
+# Restore original shell options and ERR trap after trust validation
+# -------------------------------------------------------------------------
+if [[ -n "${__old_opts:-}" ]]; then
+    eval "$__old_opts"
+    unset __old_opts
+fi
+
+if [[ -n "${__old_trap:-}" ]]; then
+    eval "$__old_trap"
+else
+    trap 'log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?' ERR
+fi
+unset __old_trap
+
+# -------------------------------------------------------------------------
 # Validate and re-enable computer object if disabled in AD
 # -------------------------------------------------------------------------
 log_info "🔧 Checking if computer object is disabled in AD..."
@@ -1998,32 +2079,50 @@ UAC_RAW=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${DC_SERVER}" \
     2>$($VERBOSE && echo /dev/stderr || echo /dev/null) | \
     awk '/^userAccountControl:/ {print $2}' || true)
 
-# Normalize to decimal if hexadecimal
-if [[ "$UAC_RAW" =~ ^0x ]]; then
-    UAC=$((UAC_RAW))
+if [[ -z "$UAC_RAW" ]]; then
+    $VERBOSE && log_info "ℹ userAccountControl attribute not returned for CN=${HOST_SHORT_U},${OU} (skipping auto re-enable step)"
 else
-    UAC=$UAC_RAW
-fi
+    # Normalize userAccountControl to a decimal integer
+    if [[ "$UAC_RAW" =~ ^0x[0-9A-Fa-f]+$ ]]; then
+        UAC=$((UAC_RAW))
+    elif [[ "$UAC_RAW" =~ ^[0-9]+$ ]]; then
+        UAC="$UAC_RAW"
+    else
+        log_info "⚠ Unexpected userAccountControl format '$UAC_RAW' for CN=${HOST_SHORT_U},${OU} (skipping auto re-enable)"
+        UAC=""
+    fi
 
-# Check ACCOUNTDISABLE bit (0x2)
-if (( (UAC & 2) != 0 )); then
-    log_info "♻️ Computer object is disabled (UAC=$UAC). Re-enabling..."
+    if [[ -n "${UAC:-}" ]]; then
+        # Check ACCOUNTDISABLE bit (0x2)
+        if (( (UAC & 2) != 0 )); then
+            log_info "♻️ Computer object is disabled (userAccountControl=$UAC). Re-enabling..."
 
-    NEW_UAC=$((UAC & ~2))  # Clear only the disable bit, preserve other flags
-    LDAP_OUT="/dev/null"
-    $VERBOSE && LDAP_OUT="/dev/stderr"
+            NEW_UAC=$((UAC & ~2))  # Clear only the disable bit, preserve other flags
+            LDAP_OUT="/dev/null"
+            $VERBOSE && LDAP_OUT="/dev/stderr"
 
-    ldapmodify -Y GSSAPI -H "ldap://${DC_SERVER}" >"$LDAP_OUT" 2>&1 <<EOF
+            ldapmodify -Y GSSAPI -H "ldap://${DC_SERVER}" >"$LDAP_OUT" 2>&1 <<EOF
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: userAccountControl
 userAccountControl: $NEW_UAC
 EOF
 
-    log_info "✅ Computer object re-enabled successfully (userAccountControl=$NEW_UAC)"
-else
-    $VERBOSE && log_info "ℹ️ userAccountControl=$UAC (object is enabled or no action needed)"
+            log_info "✅ Computer object re-enabled successfully (userAccountControl=$NEW_UAC)"
+        else
+            $VERBOSE && log_info "ℹ userAccountControl=$UAC (object is already enabled or no action required)"
+        fi
+    fi
 fi
+
+# -------------------------------------------------------------------------
+# Kerberos trust checking
+# -------------------------------------------------------------------------
+log_info "🔑 Rechecking Kerberos trust after re-enabling computer object"
+kdestroy -q 2>/dev/null || true
+kinit -kt /etc/krb5.keytab "${HOST_SHORT_U}\$@${REALM}" >/dev/null 2>&1 \
+    && log_info "✅ Trust OK after re-enable" \
+    || log_info "⚠️ Trust still not valid after re-enable (replication delay?)"
 
 # -------------------------------------------------------------------------
 # Configure SSSD
@@ -2036,14 +2135,6 @@ if [[ -f $SSSD_CONF ]]; then
 fi
 
 log_info "🛠️ Writing SSSD configuration (auto-discovery mode for DNS updates)"
-
-# Detect responders available
-AVAILABLE_RESPONDERS=()
-for svc in nss pam pac; do
-    [ -x "/usr/libexec/sssd/sssd_${svc}" ] && AVAILABLE_RESPONDERS+=("$svc")
-done
-SERVICES_LINE=$(IFS=,; echo "${AVAILABLE_RESPONDERS[*]}")
-
 cat >"$SSSD_CONF" <<EOF
 # ============================================================================
 # File:        /etc/sssd/sssd.conf
@@ -2059,7 +2150,7 @@ cat >"$SSSD_CONF" <<EOF
 # ============================================================================
 [sssd]
 config_file_version = 2
-services = $SERVICES_LINE
+services = nss,pam
 domains = $REALM
 
 
@@ -2140,46 +2231,89 @@ else
     log_info "ℹ️ sssctl not available, skipping validation"
 fi
 
-# Configure su file
+# -------------------------------------------------------------------------
+# Non-destructive su PAM integration (ensure pam_sss without overwriting file)
+# -------------------------------------------------------------------------
 PAM_SU_FILE="/etc/pam.d/su"
-log_info "🔐 Configuring /etc/pam.d/su for unified AD integration"
+log_info "🔐 Validating /etc/pam.d/su for SSSD integration (non-destructive)"
 
-# Define base PAM configuration content
-pam_su_base_content=$(cat <<EOF
+if [[ -f "$PAM_SU_FILE" ]]; then
+    # Backup existing PAM su file
+    su_backup="${PAM_SU_FILE}.bak.$(date +%s)"
+    cp -p "$PAM_SU_FILE" "$su_backup"
+    log_info "💾 Backup saved: $su_backup"
+
+    # If pam_sss is already referenced in auth stack, do not touch the file
+	if grep -Eq '^[[:space:]]*auth[[:space:]]+(required|requisite|sufficient|include)[[:space:]].*pam_sss\.so' "$PAM_SU_FILE"; then
+        log_info "ℹ pam_sss already present in $PAM_SU_FILE (no changes applied)"
+    else
+        # Inject pam_sss.so right after pam_unix.so in the auth stack
+        tmp_su="$(mktemp)"
+        awk '
+          BEGIN { inserted=0 }
+          /^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_unix\.so/ && !inserted {
+              print $0
+              print "auth   sufficient pam_sss.so use_first_pass"
+              inserted=1
+              next
+          }
+          { print $0 }
+          END {
+              if (inserted == 0) {
+                  print ""
+                  print "auth   sufficient pam_sss.so use_first_pass"
+              }
+          }
+        ' "$PAM_SU_FILE" >"$tmp_su"
+
+        mv -f "$tmp_su" "$PAM_SU_FILE"
+        chmod 644 "$PAM_SU_FILE"
+        log_info "✅ pam_sss binding injected into $PAM_SU_FILE (original preserved in $su_backup)"
+    fi
+else
+    log_info "⚠ $PAM_SU_FILE not found — creating minimal SSSD-aware su configuration"
+
+    case "$OS_FAMILY" in
+      debian)
+        cat >"$PAM_SU_FILE" <<'EOF'
+# PAM configuration for the su command - generated by linux-ad-domain-join.sh
 auth   [success=1 default=ignore] pam_succeed_if.so quiet uid = 0
 auth   [success=done default=ignore] pam_localuser.so
 auth   sufficient pam_unix.so try_first_pass nullok
 auth   sufficient pam_sss.so use_first_pass
 auth   required   pam_deny.so
-session required pam_env.so readenv=1
-session required pam_env.so readenv=1 envfile=/etc/default/locale
-session optional pam_mail.so nopen
-session required pam_limits.so
-EOF
-)
 
-case "$OS_FAMILY" in
-  debian)
-    pam_su_final_content="$pam_su_base_content
 @include common-account
-@include common-session"
-    ;;
-  rhel|suse)
-    pam_su_final_content="$pam_su_base_content
+@include common-session
+EOF
+        ;;
+      rhel|suse)
+        cat >"$PAM_SU_FILE" <<'EOF'
+# PAM configuration for the su command - generated by linux-ad-domain-join.sh
+auth   [success=1 default=ignore] pam_succeed_if.so quiet uid = 0
+auth   [success=done default=ignore] pam_localuser.so
+auth   sufficient pam_unix.so try_first_pass nullok
+auth   sufficient pam_sss.so use_first_pass
+auth   required   pam_deny.so
+
 account include system-auth
-session include system-auth"
-    ;;
-esac
+session include system-auth
+EOF
+        ;;
+      *)
+        # Fallback: very conservative minimal config
+        cat >"$PAM_SU_FILE" <<'EOF'
+# PAM configuration for the su command - generated by linux-ad-domain-join.sh
+auth   sufficient pam_unix.so try_first_pass nullok
+auth   sufficient pam_sss.so use_first_pass
+auth   required   pam_deny.so
+EOF
+        ;;
+    esac
 
-# Backup and apply
-if [[ -f "$PAM_SU_FILE" ]]; then
-    cp -p "$PAM_SU_FILE" "${PAM_SU_FILE}.bak.$(date +%s)"
-    log_info "💾 Backup saved: ${PAM_SU_FILE}.bak.$(date +%s)"
+    chmod 644 "$PAM_SU_FILE"
+    log_info "✅ PAM su file created with SSSD integration for OS family '$OS_FAMILY'"
 fi
-
-echo "$pam_su_final_content" > "$PAM_SU_FILE"
-chmod 644 "$PAM_SU_FILE"
-log_info "✅ PAM su file configured successfully"
 
 log_info "🔧 Enabling SSSD"
 run_cmd_logged "systemctl enable sssd"
@@ -2239,11 +2373,11 @@ cfg=/etc/ssh/sshd_config
 HOST_L=$(to_lower "$(hostname -s)")
 ADM="grp-adm-$HOST_L"
 ADM_ALL="grp-adm-all-linux-servers"
-RDP="grp-ssh-$HOST_L"
-RDP_ALL="grp-ssh-all-linux-servers"
+SSH="grp-ssh-$HOST_L"
+SSH_ALL="grp-ssh-all-linux-servers"
 
 # Build AllowGroups safely (skip empty or '(none)')
-ALLOW_GROUPS="$RDP $RDP_ALL $SSH_G root"
+ALLOW_GROUPS="$SSH $SSH_ALL $SSH_G root"
 if [[ -n "$GLOBAL_ADMIN_GROUPS" && "$GLOBAL_ADMIN_GROUPS" != "(none)" ]]; then
     ALLOW_GROUPS="$ALLOW_GROUPS $GLOBAL_ADMIN_GROUPS"
 fi
@@ -2280,11 +2414,44 @@ fi
 SUDOERS_MAIN="/etc/sudoers"
 SUDOERS_DIR="/etc/sudoers.d"
 SUDOERS_AD="${SUDOERS_DIR}/10-ad-admin-groups"
+BLOCK_FILE="${SUDOERS_DIR}/00-block-root-shell"
 
-log_info "🛡️ Configuring sudoers file: $SUDOERS_AD"
+log_info "🛡️ Configuring sudoers directory: $SUDOERS_DIR"
 
 # Ensure target directory exists
-mkdir -p "$(dirname "$SUDOERS_AD")"
+mkdir -p "$SUDOERS_DIR"
+
+# -------------------------------------------------------------------------
+# Root Shell Hardening (restrict interactive shells for all sudo groups)
+# -------------------------------------------------------------------------
+# Create ROOT_SHELLS command alias (centralized restriction control)
+# -------------------------------------------------------------------------
+log_info "🔍 Starting root shell hardening"
+log_info "🛠️ Installing ROOT_SHELLS alias at $BLOCK_FILE"
+
+cat >"$BLOCK_FILE" <<'EOF'
+# Alias for all shell binaries that must never be executed via sudo.
+# Used with "!ROOT_SHELLS" in group rules to block interactive root shells.
+Cmnd_Alias ROOT_SHELLS = \
+    /bin/su, /usr/bin/su, \
+    /bin/bash, /usr/bin/bash, \
+    /bin/sh, /usr/bin/sh, \
+    /usr/bin/env bash, \
+    /usr/bin/env bash -i, \
+    /usr/bin/env -i bash, \
+    /usr/bin/env bash -c *, \
+    /usr/bin/env -i bash -c *
+EOF
+
+chmod 440 "$BLOCK_FILE"
+visudo -cf "$BLOCK_FILE" >/dev/null 2>&1 || log_error "Invalid syntax in $BLOCK_FILE"
+
+log_info "🔒 ROOT_SHELLS alias applied"
+
+# -------------------------------------------------------------------------
+# AD admin sudoers drop-in
+# -------------------------------------------------------------------------
+log_info "🛡️ Configuring sudoers file: $SUDOERS_AD"
 
 # Create or refresh AD admin sudoers definition
 cat >"$SUDOERS_AD" <<EOF
@@ -2344,27 +2511,6 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Root Shell Hardening (restrict interactive shells for all sudo groups)
-# -------------------------------------------------------------------------
-# Create ROOT_SHELLS command alias (centralized restriction control)
-# -------------------------------------------------------------------------
-BLOCK_FILE="${SUDOERS_DIR}/00-block-root-shell"
-
-log_info "🔍 Starting root shell hardening"
-log_info "🛠️ Installing ROOT_SHELLS alias at $BLOCK_FILE"
-
-cat >"$BLOCK_FILE" <<'EOF'
-# Alias for all shell binaries that must never be executed via sudo.
-# Used with "!ROOT_SHELLS" in group rules to block interactive root shells.
-Cmnd_Alias ROOT_SHELLS = /bin/su, /usr/bin/su, /bin/bash, /usr/bin/bash, /bin/sh, /usr/bin/sh
-EOF
-
-chmod 440 "$BLOCK_FILE"
-visudo -cf "$BLOCK_FILE" >/dev/null 2>&1 || log_error "Invalid syntax in $BLOCK_FILE"
-
-log_info "🔒 ROOT_SHELLS alias applied"
-
-# -------------------------------------------------------------------------
 # Enumerate sudoers files (main file + drop-in directory)
 # -------------------------------------------------------------------------
 log_info "🗂️ Enumerating sudoers configuration files"
@@ -2402,83 +2548,86 @@ for g in "${RAW_GROUPS[@]}"; do
     [[ "$exists" == false ]] && TARGET_GROUPS+=("$g")
 done
 
-log_info "📌 Sudo groups detected: ${TARGET_GROUPS[*]}"
+if [[ ${#TARGET_GROUPS[@]} -eq 0 ]]; then
+    log_info "📌 No sudo groups detected for hardening (nothing to patch)."
+else
+	# -------------------------------------------------------------------------
+	# Patch sudo rules to enforce !ROOT_SHELLS restriction
+	# -------------------------------------------------------------------------
+    log_info "📌 Sudo groups detected: ${TARGET_GROUPS[*]}"
+	log_info "⚙️ Updating rules"
 
-# -------------------------------------------------------------------------
-# Patch sudo rules to enforce !ROOT_SHELLS restriction
-# -------------------------------------------------------------------------
-log_info "⚙️ Updating rules"
+	for f in "${FILES[@]}"; do
+		patched=()
+		compliant=()
 
-for f in "${FILES[@]}"; do
-    patched=()
-    compliant=()
+		tmp="${f}.tmp"
+		: >"$tmp"
 
-    tmp="${f}.tmp"
-    : >"$tmp"
+		while IFS= read -r line; do
+			original="$line"
+			handled=false
 
-    while IFS= read -r line; do
-        original="$line"
-        handled=false
+			for grp in "${TARGET_GROUPS[@]}"; do
+				good_all="%${grp} ALL=(ALL:ALL) ALL, !ROOT_SHELLS"
+				good_npw="%${grp} ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS"
 
-        for grp in "${TARGET_GROUPS[@]}"; do
-            good_all="%${grp} ALL=(ALL:ALL) ALL, !ROOT_SHELLS"
-            good_npw="%${grp} ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS"
+				pat_all="^%${grp}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+ALL$"
+				pat_npw="^%${grp}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]+ALL$"
 
-            pat_all="^%${grp}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+ALL$"
-            pat_npw="^%${grp}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]+ALL$"
+				# Already compliant
+				if [[ "$line" == "$good_all" || "$line" == "$good_npw" ]]; then
+					compliant+=("$grp")
+					echo "$line" >>"$tmp"
+					handled=true
+					break
+				fi
 
-            # Already compliant
-            if [[ "$line" == "$good_all" || "$line" == "$good_npw" ]]; then
-                compliant+=("$grp")
-                echo "$line" >>"$tmp"
-                handled=true
-                break
-            fi
+				# Needs patching: ALL=(ALL:ALL) ALL
+				if [[ "$line" =~ $pat_all ]]; then
+					echo "# ORIGINAL (disabled by hardening $(date +%F))" >>"$tmp"
+					echo "# $original" >>"$tmp"
+					echo "$good_all" >>"$tmp"
+					echo "" >>"$tmp"
+					patched+=("$grp")
+					handled=true
+					break
+				fi
 
-            # Needs patching: ALL=(ALL:ALL) ALL
-            if [[ "$line" =~ $pat_all ]]; then
-                echo "# ORIGINAL (disabled by hardening $(date +%F))" >>"$tmp"
-                echo "# $original" >>"$tmp"
-                echo "$good_all" >>"$tmp"
-				echo "" >>"$tmp"
-                patched+=("$grp")
-                handled=true
-                break
-            fi
+				# Needs patching: ALL with NOPASSWD
+				if [[ "$line" =~ $pat_npw ]]; then
+					echo "# ORIGINAL (disabled by hardening $(date +%F))" >>"$tmp"
+					echo "# $original" >>"$tmp"
+					echo "$good_npw" >>"$tmp"
+					echo "" >>"$tmp"
+					patched+=("$grp")
+					handled=true
+					break
+				fi
+			done
 
-            # Needs patching: ALL with NOPASSWD
-            if [[ "$line" =~ $pat_npw ]]; then
-                echo "# ORIGINAL (disabled by hardening $(date +%F))" >>"$tmp"
-                echo "# $original" >>"$tmp"
-                echo "$good_npw" >>"$tmp"
-				echo "" >>"$tmp"
-                patched+=("$grp")
-                handled=true
-                break
-            fi
-        done
+			[[ "$handled" == false ]] && echo "$line" >>"$tmp"
 
-        [[ "$handled" == false ]] && echo "$line" >>"$tmp"
+		done <"$f"
 
-    done <"$f"
+		# Validate syntax before committing changes
+		if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+			rm -f "$tmp"
+			log_error "Invalid syntax after modifying $f (changes discarded, original file preserved)"
+			continue
+		fi
 
-    # Validate syntax before committing changes
-    if ! visudo -cf "$tmp" >/dev/null 2>&1; then
-        rm -f "$tmp"
-        log_error "Invalid syntax after modifying $f"
-    fi
+		mv -f "$tmp" "$f"
+		chmod 440 "$f"
 
-    mv -f "$tmp" "$f"
-    chmod 440 "$f"
-
-    # Standardized log output format
-    if [[ ${#patched[@]} -gt 0 ]]; then
-        log_info "📄 $f → patched: ${patched[*]}"
-    elif [[ ${#compliant[@]} -gt 0 ]]; then
-        log_info "📄 $f → unchanged: ${compliant[*]}"
-    fi
-done
-
+		# Standardized log output format
+		if [[ ${#patched[@]} -gt 0 ]]; then
+			log_info "📄 $f → patched: ${patched[*]}"
+		elif [[ ${#compliant[@]} -gt 0 ]]; then
+			log_info "📄 $f → unchanged: ${compliant[*]}"
+		fi
+	done
+fi
 log_info "🚀 Completed domain join for $DOMAIN"
 
 # -------------------------------------------------------------------------
