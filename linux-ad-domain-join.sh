@@ -98,7 +98,7 @@ sanitize_log_msg() {
         # Warnings / Alerts
         s/⚠|⚠️|❗|❕|🚨|📛|🧯|🔥|💣|🧨/[!]/g;
         # Informational / Neutral
-        s/ℹ|ℹ️|🧵|🕒|📌|📡|🌐|💡|🧬|🧭|⏰|🧾|🪪|🧠|🪶|🔢|💬|📘|🔋|🧮|🟡/[i]/g;
+        s/ℹ|ℹ️|✔|🧵|🕒|📌|📡|🌐|💡|🧬|🧭|⏰|🧾|🪪|🧠|🪶|🔢|💬|📘|🔋|🧮|🟡/[i]/g;
         # Operational / Progress / Configuration
         s/🖥️|🖥|🔁|🔧|🛠|📄|🛠️|🧩|🏷|💾|♻|🚚|⚙️|⚙|🏷️|🧹|🔗|🔌|🔄|↪|🛡️|🧱|🗂|🗂️|🧰|🛡|📦|📎|🪄/[>]/g;
         # Errors / Failures
@@ -747,6 +747,29 @@ for var in DOMAIN OU DC_SERVER DOMAIN_USER DOMAIN_PASS NTP_SERVER; do
 done
 
 # -------------------------------------------------------------------------
+# Global admin group(s) for SSH AllowGroups
+# -------------------------------------------------------------------------
+if $NONINTERACTIVE; then
+    : "${GLOBAL_ADMIN_GROUPS:?GLOBAL_ADMIN_GROUPS required in non-interactive mode}"
+else
+    printf "[?] Define the global admin group(s) allowed SSH access (space-separated):\n" >&2
+
+    # prompt shown via stderr (unbuffered, ordered)
+    printf "[?] Global admin group(s): " >&2
+    read -r GLOBAL_ADMIN_GROUPS
+    GLOBAL_ADMIN_GROUPS="$(echo "$GLOBAL_ADMIN_GROUPS" | xargs)"  # trim spaces
+
+    # handle optional input gracefully
+    [[ -z "$GLOBAL_ADMIN_GROUPS" ]] && GLOBAL_ADMIN_GROUPS="(none)"
+fi
+printf "%s\n" "$DIVIDER" >&2
+
+# Only log if GLOBAL_ADMIN_GROUPS is defined and not "(none)"
+if [ -n "$GLOBAL_ADMIN_GROUPS" ] && [ "$GLOBAL_ADMIN_GROUPS" != "(none)" ]; then
+    log_info "🔐 Using global admin group(s) for SSH access: $GLOBAL_ADMIN_GROUPS"
+fi
+
+# -------------------------------------------------------------------------
 # Build BASE_DN and normalize OU format
 # -------------------------------------------------------------------------
 DOMAIN_DN=$(awk -F'.' '{
@@ -795,29 +818,6 @@ fi
 # -------------------------------------------------------------------------
 log_info "✔ OU DN: $OU"
 log_info "✔ BaseDN: $BASE_DN"
-
-# -------------------------------------------------------------------------
-# Global admin group(s) for SSH AllowGroups
-# -------------------------------------------------------------------------
-if $NONINTERACTIVE; then
-    : "${GLOBAL_ADMIN_GROUPS:?GLOBAL_ADMIN_GROUPS required in non-interactive mode}"
-else
-    printf "[?] Define the global admin group(s) allowed SSH access (space-separated):\n" >&2
-
-    # prompt shown via stderr (unbuffered, ordered)
-    printf "[?] Global admin group(s): " >&2
-    read -r GLOBAL_ADMIN_GROUPS
-    GLOBAL_ADMIN_GROUPS="$(echo "$GLOBAL_ADMIN_GROUPS" | xargs)"  # trim spaces
-
-    # handle optional input gracefully
-    [[ -z "$GLOBAL_ADMIN_GROUPS" ]] && GLOBAL_ADMIN_GROUPS="(none)"
-fi
-printf "%s\n" "$DIVIDER" >&2
-
-# Only log if GLOBAL_ADMIN_GROUPS is defined and not "(none)"
-if [ -n "$GLOBAL_ADMIN_GROUPS" ] && [ "$GLOBAL_ADMIN_GROUPS" != "(none)" ]; then
-    log_info "🔐 Using global admin group(s) for SSH access: $GLOBAL_ADMIN_GROUPS"
-fi
 
 # Prepare environment
 REALM=${DOMAIN^^}
