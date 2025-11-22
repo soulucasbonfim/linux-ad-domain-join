@@ -1795,11 +1795,17 @@ else
     log_info "ℹ Time synchronization confirmed in ${elapsed}s - proceeding with Kerberos setup"
 fi
 
+# -------------------------------------------------------------------------
+# Obtain Kerberos ticket for domain operations
+# -------------------------------------------------------------------------
 log_info "🔑 Getting Kerberos ticket for user $DOMAIN_USER"
 echo "$DOMAIN_PASS" | kinit "${DOMAIN_USER}@${REALM}" >/dev/null || {
     log_error "Failed to obtain Kerberos ticket for $DOMAIN_USER"
 }
 
+# -------------------------------------------------------------------------
+# Optional: Verbose LDAP debugging
+# -------------------------------------------------------------------------
 if $VERBOSE; then
     log_info "🧪 DEBUG: Testing LDAP search for computer object..."
     echo "🔸 HOST_SHORT_U: $HOST_SHORT_U"
@@ -1818,15 +1824,19 @@ if $VERBOSE; then
     echo "$LDAP_RAW"
 fi
 
-# ensure computer object is in correct OU (if exists)
+# -------------------------------------------------------------------------
+# Check computer object existence and OU alignment
+# -------------------------------------------------------------------------
 log_info "🔍 Checking if computer object exists in AD"
 
+# Perform search allowing non-fatal exit codes (e.g. not found)
 set +e
 LDAP_OUT=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${DC_SERVER}" \
   -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U}\$)" distinguishedName 2>/dev/null)
 LDAP_CODE=$?
 set -e
 
+# Extract DN using grep/PCRE
 CURRENT_DN=$(echo "$LDAP_OUT" | grep -oP '^distinguishedName: \K.+' || true)
 $VERBOSE && echo "$LDAP_OUT"
 
@@ -1837,33 +1847,55 @@ if [[ -n "$CURRENT_DN" ]]; then
         $VERBOSE && log_info "ℹ️ Computer object is already in the correct OU"
     else
         log_info "♻️ Computer object is currently in OU: $CURRENT_DN"
-        log_info "🚚 Moving object to target OU: $OU"
+        log_info "🚚 Attempting to move object to target OU: $OU"
+
+        # Prepare LDIF for move operation
+        TMP_LDIF=$(mktemp)
+        cat >"$TMP_LDIF" <<EOF
+dn: $CURRENT_DN
+changetype: modrdn
+newrdn: CN=${HOST_SHORT_U}
+deleteoldrdn: 1
+newsuperior: $OU
+EOF
+
+        # =====================================================================
+        # SAFETY ZONE: OU Move Operation (Handle Permission Denied Gracefully)
+        # =====================================================================
+        # Temporarily disable global error trap to prevent script abort on LDAP error
+        trap - ERR
+        set +e
 
         if $VERBOSE; then
-            ldapmodify -Y GSSAPI -H "ldap://${DC_SERVER}" <<EOF
-dn: $CURRENT_DN
-changetype: modrdn
-newrdn: CN=${HOST_SHORT_U}
-deleteoldrdn: 1
-newsuperior: $OU
-EOF
+            ldapmodify -Y GSSAPI -H "ldap://${DC_SERVER}" -f "$TMP_LDIF"
             LDAP_MOVE_CODE=$?
         else
-            TMP_LDIF=$(mktemp)
-			cat >"$TMP_LDIF" <<EOF
-dn: $CURRENT_DN
-changetype: modrdn
-newrdn: CN=${HOST_SHORT_U}
-deleteoldrdn: 1
-newsuperior: $OU
-EOF
             ldapmodify -Y GSSAPI -H "ldap://${DC_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1
             LDAP_MOVE_CODE=$?
-            rm -f "$TMP_LDIF"
         fi
 
-        if [[ "$LDAP_MOVE_CODE" -ne 0 ]]; then
-            log_error "Failed to move computer object in AD (code $LDAP_MOVE_CODE)" 4
+        # Restore global error trap immediately
+        set -e
+        trap 'log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?' ERR
+        # =====================================================================
+
+        rm -f "$TMP_LDIF"
+
+        # Analyze result
+        if [[ "$LDAP_MOVE_CODE" -eq 0 ]]; then
+            log_info "✅ Computer object moved successfully to target OU."
+        elif [[ "$LDAP_MOVE_CODE" -eq 50 ]]; then
+            # LDAP Error 50: Insufficient Access Rights
+            # Common scenario: User can join, but cannot move objects created by others
+            log_info "ℹ️ Access denied moving computer object (AD restriction). Keeping current location."
+            log_info "↪ Continuing with object in: $CURRENT_DN"
+            
+            # Update OU variable to point to the current location so join/update succeeds
+            OU="${CURRENT_DN#*,}"
+        else
+            # Handle other LDAP errors gracefully
+            log_info "⚠️ Unable to move object (LDAP Code $LDAP_MOVE_CODE). Proceeding in current location."
+            OU="${CURRENT_DN#*,}"
         fi
     fi
 else
