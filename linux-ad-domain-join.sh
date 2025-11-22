@@ -1024,7 +1024,7 @@ DOMAIN_DN=$(awk -F'.' '{
 BASE_DN="$DOMAIN_DN"
 
 if [[ "$OU" != *"DC="* ]]; then
-    log_info "⚠ OU missing DC= — using default Computers container"
+    log_info "⚠ OU missing DC= - using default Computers container"
     OU="CN=Computers,${DOMAIN_DN}"
 fi
 
@@ -1042,7 +1042,7 @@ LDAP_CODE=$?
 set -e
 
 if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
-    log_info "⚠ OU not found — applying fallback"
+    log_info "⚠ OU not found - applying fallback"
     OU="CN=Computers,${DOMAIN_DN}"
     log_info "↪ Using fallback: $OU"
 
@@ -1055,14 +1055,8 @@ if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
     LDAP_CODE=$?
     set -e
 
-    [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]] && log_error "Invalid OU and fallback missing — aborting" 4
+    [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]] && log_error "Invalid OU and fallback missing - aborting" 4
 fi
-
-# -------------------------------------------------------------------------
-# Final OU and BaseDN
-# -------------------------------------------------------------------------
-log_info "✔ OU DN: $OU"
-log_info "✔ BaseDN: $BASE_DN"
 
 # checking existing realm
 log_info "🧭 Verifying local realm join state"
@@ -2061,7 +2055,7 @@ if [[ $EXIT_CODE -eq 0 ]]; then
     TRUST_STATUS="✅ Kerberos trust OK"
 else
     TRUST_STATUS="⚠️ Kerberos trust failed"
-    log_info "⚠️ Kerberos trust check failed — review trace: $KRB_LOG"
+    log_info "⚠️ Kerberos trust check failed - review trace: $KRB_LOG"
 fi
 
 # Save for summary
@@ -2295,7 +2289,7 @@ if [[ -f "$PAM_SU_FILE" ]]; then
         log_info "✅ pam_sss binding injected into $PAM_SU_FILE (original preserved in $su_backup)"
     fi
 else
-    log_info "⚠ $PAM_SU_FILE not found — creating minimal SSSD-aware su configuration"
+    log_info "⚠ $PAM_SU_FILE not found - creating minimal SSSD-aware su configuration"
 
     case "$OS_FAMILY" in
       debian)
