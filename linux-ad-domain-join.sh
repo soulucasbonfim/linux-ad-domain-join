@@ -1028,13 +1028,16 @@ trap - ERR
 echo "$DOMAIN_PASS" | KRB5_TRACE="$KRB_TRACE" kinit "$DOMAIN_USER@$REALM" >/dev/null 2>&1
 KINIT_CODE=$?
 
-# Restore previous shell options and ERR trap
+# Restore shell options
 eval "$__kinit_old_opts"
+
+# Restore previous ERR trap safely
 if [[ -n "$__kinit_old_trap" ]]; then
-    eval "$__kinit_old_trap"
+    trap "$__kinit_old_trap"
 else
     trap 'log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?' ERR
 fi
+
 unset __kinit_old_opts __kinit_old_trap
 
 # analyze both return code AND trace contents
@@ -2070,7 +2073,7 @@ if [[ -n "${__old_opts:-}" ]]; then
 fi
 
 if [[ -n "${__old_trap:-}" ]]; then
-    eval "$__old_trap"
+    trap "$__old_trap"
 else
     trap 'log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?' ERR
 fi
