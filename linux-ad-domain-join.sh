@@ -690,6 +690,7 @@ if $NONINTERACTIVE; then
 	: "${NTP_SERVER:?NTP_SERVER required}"
     : "${DOMAIN_USER:?DOMAIN_USER required}"
     : "${DOMAIN_PASS:?DOMAIN_PASS required}"
+	: "${GLOBAL_ADMIN_GROUPS:?GLOBAL_ADMIN_GROUPS required}"
 else
     log_info "🧪 Collecting inputs"
     printf "%s\n" "$DIVIDER" >&2
@@ -738,21 +739,8 @@ else
         [[ -n "$DOMAIN_PASS" ]] && break
         echo "[!] Password cannot be empty."
     done
-fi
 
-# -------------------------------------------------------------------------
-# Validate non-interactive env vars
-# -------------------------------------------------------------------------
-for var in DOMAIN OU DC_SERVER DOMAIN_USER DOMAIN_PASS NTP_SERVER; do
-    [[ -n "${!var}" ]] || log_error "$var is required" 1
-done
-
-# -------------------------------------------------------------------------
-# Global admin group(s) for SSH AllowGroups
-# -------------------------------------------------------------------------
-if $NONINTERACTIVE; then
-    : "${GLOBAL_ADMIN_GROUPS:?GLOBAL_ADMIN_GROUPS required in non-interactive mode}"
-else
+	# Set Global Admin group(s) for SSH AllowGroups
     printf "[?] Define the global admin group(s) allowed SSH access (space-separated):\n" >&2
 
     # prompt shown via stderr (unbuffered, ordered)
