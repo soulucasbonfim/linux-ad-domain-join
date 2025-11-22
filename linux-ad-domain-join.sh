@@ -994,6 +994,8 @@ else
         log_error "Kerberos time synchronization problem (check NTP/chrony)" 13
     elif grep -qiE 'Password incorrect|Preauthentication failed' "$KRB_TRACE"; then
         log_error "Invalid credentials (authentication rejected by KDC)" 2
+	elif grep -qiE 'Client not found in Kerberos database' "$KRB_TRACE"; then
+        log_error "User principal not found in Active Directory or wrong realm specified" 23
     else
         last_msg=$(grep -E 'krb5|KRB5|error|revoked|denied' "$KRB_TRACE" | tail -n 1 | sed -E 's/\s+/ /g')
         [[ -n "$last_msg" ]] && log_info "ℹ Last trace line: $last_msg"
