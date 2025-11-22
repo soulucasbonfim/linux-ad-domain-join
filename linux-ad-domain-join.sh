@@ -154,7 +154,8 @@ get_divider() {
 # -------------------------------------------------------------------------
 # Global error trap - catches any unexpected command failure
 # -------------------------------------------------------------------------
-trap 'log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?' ERR
+ERROR_TRAP_CMD='log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?'
+trap "$ERROR_TRAP_CMD" ERR
 
 # -------------------------------------------------------------------------
 # Privilege check
@@ -1017,28 +1018,16 @@ log_info "✅ DNS and KDC reachability OK"
 log_info "🔐 Verifying credentials for $DOMAIN_USER@$REALM"
 KRB_TRACE=$(mktemp)
 
-# Save current shell options and ERR trap to restore later
-__kinit_old_opts="$(set +o)"
-__kinit_old_trap="$(trap -p ERR | sed -E 's/^trap -- //')"
-
 # Temporarily relax -e and disable ERR trap to classify kinit failures
-set +e
 trap - ERR
+set +e
 
 echo "$DOMAIN_PASS" | KRB5_TRACE="$KRB_TRACE" kinit "$DOMAIN_USER@$REALM" >/dev/null 2>&1
 KINIT_CODE=$?
 
-# Restore shell options
-eval "$__kinit_old_opts"
-
-# Restore previous ERR trap safely
-if [[ -n "$__kinit_old_trap" ]]; then
-    trap "$__kinit_old_trap"
-else
-    trap 'log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?' ERR
-fi
-
-unset __kinit_old_opts __kinit_old_trap
+set -e
+# Restore ERR trap safely
+trap "$ERROR_TRAP_CMD" ERR
 
 # analyze both return code AND trace contents
 if (( KINIT_CODE == 0 )) && ! grep -qiE 'CLIENT_LOCKED_OUT|revoked|disabled|locked out|denied|expired' "$KRB_TRACE"; then
@@ -1993,14 +1982,8 @@ log_info "ℹ Obtaining Kerberos ticket for synchronization"
 echo "$DOMAIN_PASS" | kinit "${DOMAIN_USER}@${REALM}" >/dev/null 2>&1 || \
     log_error "Failed to obtain Kerberos ticket for ${DOMAIN_USER}@${REALM}" 2
 
-# -------------------------------------------------------------------------
-# Prepare safe context for subsequent validation steps
-# -------------------------------------------------------------------------
-# Temporarily relax '-e' and 'pipefail' and neutralize the global ERR trap to make this validation tolerant.
-# Failures here must not abort the script.
-# -------------------------------------------------------------------------
+# Temporarily relax -e and disable ERR trap to classify kinit failures
 __old_opts="$(set +o)"    # Save current 'set' options
-__old_trap="$(trap -p ERR | sed -E 's/^trap -- //')"
 set +e +o pipefail
 trap - ERR
 
@@ -2072,12 +2055,8 @@ if [[ -n "${__old_opts:-}" ]]; then
     unset __old_opts
 fi
 
-if [[ -n "${__old_trap:-}" ]]; then
-    trap "$__old_trap"
-else
-    trap 'log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?' ERR
-fi
-unset __old_trap
+# Restore the global ERR trap explicitly using the predefined command
+trap "$ERROR_TRAP_CMD" ERR
 
 # -------------------------------------------------------------------------
 # Validate and re-enable computer object if disabled in AD
