@@ -691,7 +691,7 @@ if $NONINTERACTIVE; then
     : "${DOMAIN_PASS:?DOMAIN_PASS required}"
 else
     log_info "🧪 Collecting inputs"
-    printf "\n%s\n" "$DIVIDER" >&2
+    printf "%s\n" "$DIVIDER" >&2
 
     # Require DOMAIN
     while true; do
@@ -765,25 +765,29 @@ fi
 # -------------------------------------------------------------------------
 log_info "🔍 Checking OU: $OU"
 
-ldapsearch -x -LLL \
+set +e
+LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
     -H "ldap://${DC_SERVER}" \
     -D "${DOMAIN_USER}@${DOMAIN}" -w "$DOMAIN_PASS" \
-    -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" \
-    >/dev/null 2>&1
+    -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>/dev/null)
+LDAP_CODE=$?
+set -e
 
-if [[ $? -ne 0 ]]; then
+if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
     log_info "⚠ OU not found — applying fallback"
-
     OU="CN=Computers,${DOMAIN_DN}"
     log_info "↪ Using fallback: $OU"
 
-    ldapsearch -x -LLL \
+    # Test fallback OU also under safe mode
+    set +e
+    LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
         -H "ldap://${DC_SERVER}" \
         -D "${DOMAIN_USER}@${DOMAIN}" -w "$DOMAIN_PASS" \
-        -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" \
-        >/dev/null 2>&1
+        -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>/dev/null)
+    LDAP_CODE=$?
+    set -e
 
-    [[ $? -ne 0 ]] && log_error "Invalid OU and fallback missing — aborting" 4
+    [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]] && log_error "Invalid OU and fallback missing — aborting" 4
 fi
 
 # -------------------------------------------------------------------------
@@ -808,7 +812,7 @@ else
     # handle optional input gracefully
     [[ -z "$GLOBAL_ADMIN_GROUPS" ]] && GLOBAL_ADMIN_GROUPS="(none)"
 fi
-printf "\n%s\n" "$DIVIDER" >&2
+printf "%s\n" "$DIVIDER" >&2
 
 # Only log if GLOBAL_ADMIN_GROUPS is defined and not "(none)"
 if [ -n "$GLOBAL_ADMIN_GROUPS" ] && [ "$GLOBAL_ADMIN_GROUPS" != "(none)" ]; then
@@ -2678,9 +2682,9 @@ fi
 
 # Summary output
 DIVIDER=$(get_divider)
-printf "\n%s\n" "$DIVIDER" >&2
+printf "%s\n" "$DIVIDER" >&2
 log_info "🌟 DOMAIN JOIN VALIDATION SUMMARY"
-printf "\n%s\n" "$DIVIDER" >&2
+printf "%s\n" "$DIVIDER" >&2
 printf "%-25s %s\n" "Realm:"              "$REALM_JOINED"
 printf "%-25s %s\n" "DC Server:"          "$DC_SERVER"
 printf "%-25s %s\n" "Computer Name:"      "$HOST_SHORT_U"
@@ -2691,7 +2695,7 @@ printf "%-25s %s\n" "Handshake (ms):"     "${TRUST_ELAPSED:-n/a}"
 printf "%-25s %s\n" "Network RTT:"        "${TRUST_RTT:-n/a}"
 printf "%-25s %s\n" "SSSD Service:"       "${SSSD_STATUS,,}"
 printf "%-25s %s\n" "SSH Service:"        "${SSH_STATUS,,}"
-printf "\n%s\n" "$DIVIDER" >&2
+printf "%s\n" "$DIVIDER" >&2
 
 # Insert short pause and newline without spawning a subshell
 sleep 0.05
