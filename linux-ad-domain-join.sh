@@ -2525,7 +2525,8 @@ fi
 if visudo -cf "$tmp_sudo" >/dev/null 2>&1; then
     mv -f "$tmp_sudo" "$SUDOERS_MAIN"
     chmod 440 "$SUDOERS_MAIN"
-    log_info "✅ Sudoers includes normalized successfully (backup: $SUDO_BAK)"
+    log_info "✅ Sudoers includes normalized successfully"
+	rm -f "$SUDO_BAK"
 else
     rm -f "$tmp_sudo"
     mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
