@@ -66,7 +66,6 @@
 # Author:      Lucas Bonfim de Oliveira Lima
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # Created:     2025-04-27
-# Updated:     2025-10-31
 # Version:     1.8.1
 # License:     MIT
 #
@@ -827,75 +826,63 @@ cp -p "$HOSTS_FILE" "$BACKUP_FILE"
 log_info "💾 Backup saved as $BACKUP_FILE"
 
 # -------------------------------------------------------------------------
-# Cloud-aware canonical mapping with preservation of provider aliases
-# -------------------------------------------------------------------------
-# Goal:
-#   - Ensure a single canonical /etc/hosts entry per PRIMARY_IP:
-#       PRIMARY_IP  HOST_FQDN  HOST_SHORT  [aliases...]
-#   - Preserve any existing provider/DHCP aliases (e.g., cloud hostnames).
-#   - Be 100% safe under "set -u" (no unbound array expansions).
-# Requirements (assumed defined before this block):
-#   - PRIMARY_IP   → primary IPv4 of this host
-#   - HOST_FQDN    → canonical FQDN (e.g., odrl-sp-mx05.odrl.net)
-#   - HOST_SHORT   → short hostname (e.g., odrl-sp-mx05)
-#   - HOSTS_FILE   → usually /etc/hosts
+# Canonicalizes /etc/hosts for the primary IP while preserving aliases
 # -------------------------------------------------------------------------
 
 # Defensive initialization for strict mode (set -u)
 CLOUD_ALIASES=""
 
-# Get the first matching line for this IP (if any)
-EXISTING_LINE=$(grep -E "^[[:space:]]*${PRIMARY_IP}[[:space:]]+" "$HOSTS_FILE" | head -n1 || true)
+# Collect ALL entries for this IP (not only the first one)
+mapfile -t MATCHING_LINES < <(grep -E "^[[:space:]]*${PRIMARY_IP}[[:space:]]+" "$HOSTS_FILE" || true)
 
-if [[ -n "$EXISTING_LINE" ]]; then
-    log_info "🧩 Found existing /etc/hosts entry for ${PRIMARY_IP}, analyzing for drift and aliases"
+if [[ ${#MATCHING_LINES[@]} -gt 0 ]]; then
+    log_info "🧩 Found ${#MATCHING_LINES[@]} existing /etc/hosts entries for ${PRIMARY_IP}, consolidating aliases"
 
-    # Split the existing line into tokens:
-    #   TOKENS[0] = IP
-    #   TOKENS[1..N] = hostnames/aliases
-    read -r -a TOKENS <<< "$EXISTING_LINE"
+    declare -A ALIAS_MAP=()
 
-    if [[ ${#TOKENS[@]} -gt 1 ]]; then
-        # Iterate over all names (skip index 0 which is the IP)
+    # Extract aliases from ALL lines
+    for line in "${MATCHING_LINES[@]}"; do
+        read -r -a TOKENS <<< "$line"
         for (( i=1; i<${#TOKENS[@]}; i++ )); do
             name="${TOKENS[i]}"
 
-            # Keep only non-canonical names as "cloud/DHCP aliases"
-            if [[ "$name" != "$HOST_FQDN" && "$name" != "$HOST_SHORT" ]]; then
-                if [[ -z "$CLOUD_ALIASES" ]]; then
-                    CLOUD_ALIASES="$name"
-                else
-                    CLOUD_ALIASES+=" $name"
-                fi
+            # Skip canonical names
+            [[ "$name" == "$HOST_FQDN" ]] && continue
+            [[ "$name" == "$HOST_SHORT" ]] && continue
+
+            # Validate hostname alias (RFC 952 / 1123 compliant)
+			if [[ "$name" =~ ^[A-Za-z0-9][A-Za-z0-9-]*(\.[A-Za-z0-9][A-Za-z0-9-]*)*$ ]]; then
+                ALIAS_MAP["$name"]=1
+            else
+                log_info "⚠️ Ignoring invalid hostname alias: $name"
             fi
         done
+    done
+
+    # Build final alias list (deduplicated, sorted)
+    if [[ ${#ALIAS_MAP[@]} -gt 0 ]]; then
+        CLOUD_ALIASES="$(printf '%s\n' "${!ALIAS_MAP[@]}" | sort | tr '\n' ' ')"
     fi
 
     if [[ -n "$CLOUD_ALIASES" ]]; then
         log_info "🌐 Preserving cloud/DHCP aliases: $CLOUD_ALIASES"
     fi
 
-    # Build the canonical line that must exist in /etc/hosts
+    # Build canonical line using ONLY spaces
     CANONICAL_LINE="${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}"
-    if [[ -n "$CLOUD_ALIASES" ]]; then
-        CANONICAL_LINE+=" ${CLOUD_ALIASES}"
-    fi
+    [[ -n "$CLOUD_ALIASES" ]] && CANONICAL_LINE+=" ${CLOUD_ALIASES}"
 
     # Remove any previous entries for this IP (avoid duplicates/drift)
     sed -i "\|^[[:space:]]*${PRIMARY_IP}[[:space:]]\+|d" "$HOSTS_FILE"
 
-    # Append the canonical entry
-    # %b ensures that "\t" is interpreted as a real tab
-    printf "%b\n" "$CANONICAL_LINE" >> "$HOSTS_FILE"
+    # Append canonical entry (spaces only, no TAB)
+    echo "$CANONICAL_LINE" >> "$HOSTS_FILE"
 
-    # Log a human-readable version (tabs replaced by spaces implicitly)
-    log_info "✅ Applied canonical mapping: ${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}${CLOUD_ALIASES:+ $CLOUD_ALIASES}"
+    log_info "✅ Applied canonical mapping: ${CANONICAL_LINE}"
 
 else
-    # No existing entry for this IP → create a fresh canonical mapping
     log_info "➕ No entry found for ${PRIMARY_IP}; adding canonical host mapping"
-
-    printf "%s\t%s %s\n" "$PRIMARY_IP" "$HOST_FQDN" "$HOST_SHORT" >> "$HOSTS_FILE"
+    echo "${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}" >> "$HOSTS_FILE"
 fi
 
 # -------------------------------------------------------------------------
@@ -1700,7 +1687,10 @@ if [[ "$chrony_service" == "chronyd" && "$(readlink -f /etc/systemd/system/chron
 fi
 
 # Enable and restart safely
+log_info "🔧 Enabling Chrony"
 run_cmd_logged "systemctl enable --now $chrony_service"
+
+log_info "🔄 Restarting Chrony"
 run_cmd "systemctl restart $chrony_service"
 
 # -------------------------------------------------------------------------
@@ -1985,7 +1975,7 @@ DC_SERVER="$DC_NAME"
 TRUST_ELAPSED="$ELAPSED"
 TRUST_RTT="$PING_RTT"
 
-# Verbose trace (optional)
+# Verbose trace
 if [[ "${VERBOSE:-false}" == "true" ]]; then
     echo "--------------------------------------------------------------------------"
     echo "[*] Kerberos trace summary:"
@@ -2071,6 +2061,7 @@ cat >"$SSSD_CONF" <<EOF
 config_file_version = 2
 services = $SERVICES_LINE
 domains = $REALM
+
 
 # -------------------------------------------------------------------------
 # Core identity & authentication providers
@@ -2190,103 +2181,52 @@ echo "$pam_su_final_content" > "$PAM_SU_FILE"
 chmod 644 "$PAM_SU_FILE"
 log_info "✅ PAM su file configured successfully"
 
-log_info "🔄 Restarting SSSD"
+log_info "🔧 Enabling SSSD"
 run_cmd_logged "systemctl enable sssd"
+
+log_info "🔄 Restarting SSSD"
 run_cmd_logged "systemctl restart sssd"
 
 # -------------------------------------------------------------------------
-# FUNÇÃO: Intelligent Restart for systemd-logind (Systemd Only, High Compatibility)
+# Restarts systemd-logind to refresh PAM and D-Bus session handling
 # -------------------------------------------------------------------------
-restart_logind_service() {
-    log_info "🔄 Initiating intelligent restart for systemd-logind service"
-    
-    local logind_unit="systemd-logind.service"
-    
-    # 1. Check for systemctl presence (Systemd environments)
-    if command -v systemctl &>/dev/null; then
-        
-        # Check if the logind unit file exists and is active
-        if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${logind_unit}"; then
-            
-            log_info "✅ Systemd detected. Attempting restart of ${logind_unit} to refresh PAM/D-Bus"
-            
-            # Attempt a full restart first (most reliable for resolving login issues)
-            if run_cmd "systemctl restart ${logind_unit}" &>/dev/null; then
-                log_info "🚀 ${logind_unit} restarted successfully."
-                return 0
-            else
-                log_info "⚠️ Failed to restart ${logind_unit}. Attempting safe reload instead."
-                if run_cmd "systemctl reload ${logind_unit}" &>/dev/null; then
-                    log_info "🚀 ${logind_unit} reloaded successfully."
-                    return 0
-                fi
-            fi
-            
-            log_info "🛑 Failed to restart or reload ${logind_unit}. Continuing script execution."
-            return 1
-            
-        else
-            log_info "ℹ️ Systemd found, but ${logind_unit} unit file is missing. Skipping restart."
-        fi
-        
-    elif command -v service &>/dev/null; then
-        # 2. SysVinit/Upstart environments (Using 'service' command)
-        
-        # The service 'systemd-logind' does not exist in these environments.
-        # If the system uses 'service' instead of 'systemctl', the component 
-        # that caused the slowdown (systemd-logind) is not present.
-        
-        log_info "ℹ️ SysVinit/Upstart detected. systemd-logind is not applicable; skipping restart."
-        
-    else
-        # 3. No known service manager
-        log_info "ℹ️ Neither systemctl nor service command found. Skipping systemd-logind action."
-    fi
-}
-
-# -------------------------------------------------------------------------
-# Intelligent Restart for systemd-logind (PAM / D-Bus Session Refresh)
-# -------------------------------------------------------------------------
-log_info "🔍 Checking systemd-logind availability for session refresh"
+log_info "🔄 Starting direct execution block for systemd-logind restart"
 
 LOGIND_UNIT="systemd-logind.service"
 
-# Detect init system
-if command -v systemctl >/dev/null 2>&1; then
-    log_info "🖥️ systemctl detected (systemd environment)"
-
-    # Validate existence of the unit file
-    if systemctl list-unit-files --type=service 2>/dev/null \
-        | grep -q -E "^${LOGIND_UNIT}[[:space:]]"; then
+# 1. Check for systemctl presence (Systemd environments)
+if command -v systemctl &>/dev/null; then
+    
+    # Check if the logind unit file exists
+    if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${LOGIND_UNIT}"; then
         
-        log_info "📦 ${LOGIND_UNIT} found. Preparing restart sequence"
-
-        # Restart attempt (preferred)
-        if systemctl restart "${LOGIND_UNIT}" >/dev/null 2>&1; then
-            log_info "🚀 ${LOGIND_UNIT} restarted successfully"
+        log_info "✅ Systemd detected. Attempting restart of ${LOGIND_UNIT} to refresh PAM/D-Bus"
+        
+        # Attempt a full restart first (most reliable)
+        if run_cmd "systemctl restart ${LOGIND_UNIT}" &>/dev/null; then
+            log_info "🚀 ${LOGIND_UNIT} restarted successfully."
         else
-            log_info "⚠️ Restart failed. Attempting reload operation"
-
-            # Reload fallback
-            if systemctl reload "${LOGIND_UNIT}" >/dev/null 2>&1; then
-                log_info "🔃 ${LOGIND_UNIT} reloaded successfully"
+            log_info "⚠️ Failed to restart ${LOGIND_UNIT}. Attempting safe reload instead."
+            if run_cmd "systemctl reload ${LOGIND_UNIT}" &>/dev/null; then
+                log_info "🚀 ${LOGIND_UNIT} reloaded successfully."
             else
-                log_info "🛑 Failed to restart or reload ${LOGIND_UNIT}. Continuing script execution"
+                log_info "🛑 Failed to restart or reload ${LOGIND_UNIT}. Continuing script execution."
             fi
         fi
-
+        
     else
-        log_info "ℹ️ systemd detected, but ${LOGIND_UNIT} is not installed. Skipping"
+        log_info "ℹ️ Systemd found, but ${LOGIND_UNIT} unit file is missing. Skipping restart."
     fi
-
-
-elif command -v service >/dev/null 2>&1; then
-    # SysVinit / Upstart environments do not support systemd-logind
-    log_info "ℹ️ SysVinit/Upstart detected. systemd-logind not applicable; skipping"
-
+    
+elif command -v service &>/dev/null; then
+    # 2. SysVinit/Upstart environments (Using 'service' command)
+    
+    # systemd-logind is not a SysV service; skip action gracefully.
+    log_info "ℹ️ SysVinit/Upstart detected. systemd-logind is not applicable; skipping restart."
+    
 else
-    # No recognized service manager
-    log_info "ℹ️ No service manager detected (no systemctl/service). Skipping logind handling"
+    # 3. No known service manager
+    log_info "ℹ️ Neither systemctl nor service command found. Skipping systemd-logind action."
 fi
 
 unset DOMAIN_PASS
@@ -2335,66 +2275,92 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Ensure explicit inclusion of AD admin sudoers file
+# AD admin sudoers drop-in + base variables
 # -------------------------------------------------------------------------
 SUDOERS_MAIN="/etc/sudoers"
 SUDOERS_DIR="/etc/sudoers.d"
-SUDOERS_AD="/etc/sudoers.d/ad-admin-groups"
-BLOCK_FILE="${SUDOERS_DIR}/00-block-root-shell"
+SUDOERS_AD="${SUDOERS_DIR}/10-ad-admin-groups"
 
 log_info "🛡️ Configuring sudoers file: $SUDOERS_AD"
 
-# 1. Ensure target directory exists
+# Ensure target directory exists
 mkdir -p "$(dirname "$SUDOERS_AD")"
 
-# 2. Create or refresh AD admin sudoers definition
+# Create or refresh AD admin sudoers definition
 cat >"$SUDOERS_AD" <<EOF
-%$ADM ALL=(ALL) NOPASSWD: ALL
-%$ADM_ALL ALL=(ALL) NOPASSWD: ALL
+# Host-level admin group: full sudo access without password, but no interactive root shells.
+%$ADM ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS
+
+# Global Linux admin group: full sudo access across all servers, but no interactive root shells.
+%$ADM_ALL ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS
 EOF
 chmod 440 "$SUDOERS_AD"
 
-# 3. Check if /etc/sudoers already includes this specific file
-if ! grep -Eq "^[[:space:]]*#include[[:space:]]+$SUDOERS_AD" "$SUDOERS_MAIN"; then
-	log_info "⚙️ Adding explicit include for $SUDOERS_AD in $SUDOERS_MAIN"
+# -------------------------------------------------------------------------
+# Normalize /etc/sudoers includes (use includedir, drop explicit includes)
+# -------------------------------------------------------------------------
+log_info "🔧 Normalizing sudoers includes in $SUDOERS_MAIN"
 
-	# Backup before modification
-	SUDO_BAK="${SUDOERS_MAIN}.bak.$(date +%Y%m%d%H%M%S)"
-	cp -p "$SUDOERS_MAIN" "$SUDO_BAK"
+SUDO_BAK="${SUDOERS_MAIN}.bak.$(date +%Y%m%d%H%M%S)"
+cp -p "$SUDOERS_MAIN" "$SUDO_BAK"
 
-	# Append safely at the end of file
-	echo -e "\n# Include AD-specific sudo policy\n#include $SUDOERS_AD" >> "$SUDOERS_MAIN"
+tmp_sudo="$(mktemp)"
+includedir_present=false
 
-	# Syntax validation (rollback on error)
-	if visudo -c >/dev/null 2>&1; then
-		log_info "✅ Sudoers include added successfully"
-	else
-		log_info "🛑 visudo syntax check failed - restoring previous configuration"
-		mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
-	fi
+while IFS= read -r line; do
+    # Remove any explicit "#include /etc/sudoers.d/..." lines
+    if [[ "$line" =~ ^[[:space:]]*#include[[:space:]]+/etc/sudoers\.d/ ]]; then
+        # Skipping explicit include to rely on #includedir instead
+        continue
+    fi
+
+    # Detect existing "#includedir /etc/sudoers.d"
+    if [[ "$line" =~ ^[[:space:]]*#includedir[[:space:]]+/etc/sudoers\.d ]]; then
+        includedir_present=true
+    fi
+
+    echo "$line" >>"$tmp_sudo"
+done <"$SUDOERS_MAIN"
+
+# If no includedir was found, append it at the end with a short comment
+if [[ "$includedir_present" == false ]]; then
+    {
+        echo ""
+        echo "# Include all drop-in sudoers policies"
+        echo "# This is the preferred way to manage role-based sudo rules."
+        echo "#includedir /etc/sudoers.d"
+    } >>"$tmp_sudo"
+fi
+
+# Validate new sudoers before committing
+if visudo -cf "$tmp_sudo" >/dev/null 2>&1; then
+    mv -f "$tmp_sudo" "$SUDOERS_MAIN"
+    chmod 440 "$SUDOERS_MAIN"
+    log_info "✅ Sudoers includes normalized successfully (backup: $SUDO_BAK)"
 else
-	log_info "✅ Explicit include for $SUDOERS_AD already present in $SUDOERS_MAIN"
+    rm -f "$tmp_sudo"
+    mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
+    log_error "visudo syntax check failed after include normalization; restored backup $SUDO_BAK"
 fi
 
 # -------------------------------------------------------------------------
 # Root Shell Hardening (restrict interactive shells for all sudo groups)
 # -------------------------------------------------------------------------
-
-log_info "🔍 Starting root shell hardening"
-
-# -------------------------------------------------------------------------
 # Create ROOT_SHELLS command alias (centralized restriction control)
 # -------------------------------------------------------------------------
+BLOCK_FILE="${SUDOERS_DIR}/00-block-root-shell"
+
+log_info "🔍 Starting root shell hardening"
 log_info "🛠️ Installing ROOT_SHELLS alias at $BLOCK_FILE"
 
 cat >"$BLOCK_FILE" <<'EOF'
+# Alias for all shell binaries that must never be executed via sudo.
+# Used with "!ROOT_SHELLS" in group rules to block interactive root shells.
 Cmnd_Alias ROOT_SHELLS = /bin/su, /usr/bin/su, /bin/bash, /usr/bin/bash, /bin/sh, /usr/bin/sh
 EOF
 
 chmod 440 "$BLOCK_FILE"
-
-visudo -cf "$BLOCK_FILE" >/dev/null 2>&1 || \
-    log_error "Invalid syntax in $BLOCK_FILE"
+visudo -cf "$BLOCK_FILE" >/dev/null 2>&1 || log_error "Invalid syntax in $BLOCK_FILE"
 
 log_info "🔒 ROOT_SHELLS alias applied"
 
@@ -2474,6 +2440,7 @@ for f in "${FILES[@]}"; do
                 echo "# ORIGINAL (disabled by hardening $(date +%F))" >>"$tmp"
                 echo "# $original" >>"$tmp"
                 echo "$good_all" >>"$tmp"
+				echo "" >>"$tmp"
                 patched+=("$grp")
                 handled=true
                 break
@@ -2484,6 +2451,7 @@ for f in "${FILES[@]}"; do
                 echo "# ORIGINAL (disabled by hardening $(date +%F))" >>"$tmp"
                 echo "# $original" >>"$tmp"
                 echo "$good_npw" >>"$tmp"
+				echo "" >>"$tmp"
                 patched+=("$grp")
                 handled=true
                 break
