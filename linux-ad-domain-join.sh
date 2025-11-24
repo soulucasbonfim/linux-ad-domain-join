@@ -2480,15 +2480,15 @@ cp -p "$SUDOERS_MAIN" "$SUDO_BAK"
 tmp_sudo="$(mktemp)"
 includedir_present=false
 
-while IFS= read -r line; do
+while IFS= read -r line || [[ -n "$line" ]]; do
     # Remove any explicit "#include /etc/sudoers.d/..." lines
     if [[ "$line" =~ ^[[:space:]]*#include[[:space:]]+/etc/sudoers\.d/ ]]; then
         # Skipping explicit include to rely on #includedir instead
         continue
     fi
 
-    # Detect existing "#includedir /etc/sudoers.d"
-    if [[ "$line" =~ ^[[:space:]]*#includedir[[:space:]]+/etc/sudoers\.d ]]; then
+    # Detect existing "#includedir /etc/sudoers.d" or "@includedir /etc/sudoers.d"
+    if [[ "$line" =~ ^[[:space:]]*[@#]includedir[[:space:]]+/etc/sudoers\.d ]]; then
         includedir_present=true
     fi
 
@@ -2497,63 +2497,78 @@ done <"$SUDOERS_MAIN"
 
 # If no includedir was found, append it at the end with a short comment
 if [[ "$includedir_present" == false ]]; then
-    # Use sequential echo commands appended to the temp file (no unnecessary shell block needed)
+    # Use sequential echo commands appended to the temp file
     echo "" >>"$tmp_sudo"
     echo "# Include all drop-in sudoers policies" >>"$tmp_sudo"
     echo "# This is the preferred way to manage role-based sudo rules." >>"$tmp_sudo"
     echo "#includedir /etc/sudoers.d" >>"$tmp_sudo"
 fi
 
+# Align temporary sudoers file permissions/ownership with visudo expectations
+chown root:root "$tmp_sudo" 2>/dev/null || true
+chmod 440 "$tmp_sudo"
+
 # Validate new sudoers before committing (Capture output for detailed error logging)
 log_info "🔍 Validating temporary sudoers configuration..."
 
-# 1. Execute visudo, capture exit code and full output
-VISUDO_OUTPUT=$( visudo -cf "$tmp_sudo" 2>&1 )
+# Execute visudo using a temp file for log capture
+VISUDO_LOG=$(mktemp)
+
+# Temporarily disable 'set -e' so a visudo warning/error doesn't crash the script immediately
+set +e
+visudo -cf "$tmp_sudo" >"$VISUDO_LOG" 2>&1
 VISUDO_RC=$?
+set -e
+
+# Read the content of the log file into the variable
+VISUDO_OUTPUT=$(< "$VISUDO_LOG")
+rm -f "$VISUDO_LOG"
 
 if [[ $VISUDO_RC -eq 0 ]]; then
-    # SUCCESS: Log the detailed output (including warnings and 'parsed OK' messages)
-    echo "$VISUDO_OUTPUT" | while IFS= read -r line; do
-        log_info "ℹ️ $line"
-    done
-    
-    # Commit the changes
-    mv -f "$tmp_sudo" "$SUDOERS_MAIN"
-    chmod 440 "$SUDOERS_MAIN"
-    log_info "✅ Sudoers includes normalized successfully"
-    rm -f "$SUDO_BAK"
+    # SUCCESS: Log the detailed output (including warnings and 'parsed OK' messages)
+    if [[ -n "$VISUDO_OUTPUT" ]]; then
+        echo "$VISUDO_OUTPUT" | while IFS= read -r line; do
+            log_info "ℹ️ $line"
+        done
+    fi
+    
+    # Commit the changes
+    mv -f "$tmp_sudo" "$SUDOERS_MAIN"
+    chmod 440 "$SUDOERS_MAIN"
+    log_info "✅ Sudoers includes normalized successfully"
+    rm -f "$SUDO_BAK"
 else
-    # FAILURE: Syntax Error Detected
-    log_info "❌ visudo syntax check failed. Details:"
-    
-    # Log the detailed error from visudo
-    echo "$VISUDO_OUTPUT" | while IFS= read -r line; do
-        log_info "   visudo: $line"
-    done
-    
-    # Clean up temp file (always clean the temp file)
-    rm -f "$tmp_sudo"
-    
-    # 3. Decision to continue based on mode
-    if $NONINTERACTIVE; then
-        # NON-INTERACTIVE MODE: Must rollback and abort
-        mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
-        log_info "💾 Restored backup: $SUDO_BAK"
-        log_error "visudo syntax check failed during normalization (restored $SUDO_BAK)" 1
-    else
-        # INTERACTIVE MODE: Ask user to continue or abort
-        read_sanitized "⚠️ Sudoers check failed. Continue script execution anyway? [y/N]: " REPLY
-        
-        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-            log_info "ℹ️ Ignoring visudo error (manual correction required). Proceeding with original $SUDOERS_MAIN."
-            rm -f "$SUDO_BAK" # Cleanup backup if user chooses to proceed without rollback
-        else
-            # User chooses to abort: Must rollback and abort
-            mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
-            log_info "💾 Restored backup: $SUDO_BAK"
-            log_error "visudo syntax check failed during normalization (abort requested)" 1
-        fi
-    fi
+    # FAILURE: Syntax Error Detected
+    log_info "❌ visudo syntax check failed. Details:"
+    
+    # Log the detailed error from visudo
+    echo "$VISUDO_OUTPUT" | while IFS= read -r line; do
+        log_info "   visudo: $line"
+    done
+    
+    # Clean up temp file (always clean the temp file)
+    rm -f "$tmp_sudo"
+    
+    # Decision to continue based on mode
+    if $NONINTERACTIVE; then
+        # NON-INTERACTIVE MODE: Must rollback and abort
+        mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
+        log_info "💾 Restored backup: $SUDO_BAK"
+        log_error "visudo syntax check failed during normalization (restored $SUDO_BAK)" 1
+    else
+        # INTERACTIVE MODE: Ask user to continue or abort
+        read_sanitized "⚠️ Sudoers check failed. Continue script execution anyway? [y/N]: " REPLY
+        
+        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+            log_info "ℹ️ Ignoring visudo error (manual correction required). Proceeding with original $SUDOERS_MAIN."
+            rm -f "$SUDO_BAK" # Cleanup backup if user chooses to proceed without rollback
+        else
+            # User chooses to abort: Must rollback and abort
+            mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
+            log_info "💾 Restored backup: $SUDO_BAK"
+            log_error "visudo syntax check failed during normalization (abort requested)" 1
+        fi
+    fi
 fi
 
 # -------------------------------------------------------------------------
@@ -2656,9 +2671,16 @@ else
 
 		done <"$f"
 
+		# Align temporary drop-in file permissions with visudo expectations
+		chown root:root "$tmp" 2>/dev/null || true
+		chmod 440 "$tmp"
+
 		# Validate syntax before committing changes
+		# Temporarily disable 'set -e' so a syntax error doesn't crash the script immediately
+		set +e
 		VISUDO_OUTPUT=$(visudo -cf "$tmp" 2>&1)
 		VISUDO_RC=$?
+		set -e
 
 		if [[ $VISUDO_RC -ne 0 ]]; then
 			log_info "❌ Sudoers drop-in check failed for $f. Details:"
