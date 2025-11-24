@@ -1543,7 +1543,7 @@ for key in passwd shadow group services netgroup; do
 
     # 4. Skip if entry already includes 'sss'
     if grep -Eq "${pattern}[^#]*[[:space:]]sss([[:space:]]|\$)" "$NSS_FILE"; then
-        log_info "ℹ️ '${key}' already includes sss"
+        $VERBOSE && log_info "ℹ️ '${key}' already includes sss"
         continue
     fi
 
@@ -1585,7 +1585,7 @@ if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
 
     # Insert or patch as needed
     if grep -Eq "${pattern}[^#]*[[:space:]]sss([[:space:]]|\$)" "$NSS_FILE"; then
-        log_info "ℹ️ '${key}' already includes sss"
+        $VERBOSE && log_info "ℹ️ '${key}' already includes sss"
     elif grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
         log_info "🧩 Updating existing '${key}' entry to include sss"
         sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_FILE"
