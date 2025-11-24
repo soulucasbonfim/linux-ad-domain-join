@@ -2497,12 +2497,11 @@ done <"$SUDOERS_MAIN"
 
 # If no includedir was found, append it at the end with a short comment
 if [[ "$includedir_present" == false ]]; then
-    {
-        echo ""
-        echo "# Include all drop-in sudoers policies"
-        echo "# This is the preferred way to manage role-based sudo rules."
-        echo "#includedir /etc/sudoers.d"
-    } >>"$tmp_sudo"
+    # Use sequential echo commands appended to the temp file (no unnecessary shell block needed)
+    echo "" >>"$tmp_sudo"
+    echo "# Include all drop-in sudoers policies" >>"$tmp_sudo"
+    echo "# This is the preferred way to manage role-based sudo rules." >>"$tmp_sudo"
+    echo "#includedir /etc/sudoers.d" >>"$tmp_sudo"
 fi
 
 # Validate new sudoers before committing (Capture output for detailed error logging)
