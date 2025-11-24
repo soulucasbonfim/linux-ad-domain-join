@@ -2497,24 +2497,59 @@ done <"$SUDOERS_MAIN"
 
 # If no includedir was found, append it at the end with a short comment
 if [[ "$includedir_present" == false ]]; then
-    {
-        echo ""
-        echo "# Include all drop-in sudoers policies"
-        echo "# This is the preferred way to manage role-based sudo rules."
-        echo "#includedir /etc/sudoers.d"
-    } >>"$tmp_sudo"
+    {
+        echo ""
+        echo "# Include all drop-in sudoers policies"
+        echo "# This is the preferred way to manage role-based sudo rules."
+        echo "#includedir /etc/sudoers.d"
+    } >>"$tmp_sudo"
 fi
 
-# Validate new sudoers before committing
-if visudo -cf "$tmp_sudo" >/dev/null 2>&1; then
+# Validate new sudoers before committing (Capture output for detailed error logging)
+log_info "🔍 Validating temporary sudoers configuration..."
+
+# 1. Execute visudo, capture exit code and full output
+VISUDO_OUTPUT=$(visudo -cf "$tmp_sudo" 2>&1)
+VISUDO_RC=$?
+
+if [[ $VISUDO_RC -eq 0 ]]; then
+    # SUCCESS: Commit the changes
     mv -f "$tmp_sudo" "$SUDOERS_MAIN"
     chmod 440 "$SUDOERS_MAIN"
     log_info "✅ Sudoers includes normalized successfully"
-	rm -f "$SUDO_BAK"
+    rm -f "$SUDO_BAK"
 else
+    # FAILURE: Syntax Error Detected
+    log_info "❌ visudo syntax check failed. Details:"
+    
+    # Log the detailed error from visudo
+    echo "$VISUDO_OUTPUT" | while IFS= read -r line; do
+        log_info "   visudo: $line"
+    done
+    
+    # Clean up temp file (always clean the temp file)
     rm -f "$tmp_sudo"
-    mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
-    log_error "visudo syntax check failed after include normalization; restored backup $SUDO_BAK"
+    
+    # 3. Decision to continue based on mode
+    if $NONINTERACTIVE; then
+        # NON-INTERACTIVE MODE: Must rollback and abort
+        mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
+        log_info "💾 Restored backup: $SUDO_BAK"
+        log_error "visudo syntax check failed during normalization (restored $SUDO_BAK)" 1
+    else
+        # INTERACTIVE MODE: Ask user to continue or abort
+        read_sanitized "⚠️ Sudoers check failed. Continue script execution anyway? [y/N]: " REPLY
+        
+        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+            log_info "ℹ️ Ignoring visudo error (manual correction required). Proceeding with original $SUDOERS_MAIN."
+            rm -f "$SUDO_BAK" # Cleanup backup if user chooses to proceed without rollback
+        else
+            # User chooses to abort: Must rollback and abort
+            mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
+            log_info "💾 Restored backup: $SUDO_BAK"
+            log_error "visudo syntax check failed during normalization (abort requested)" 1
+        fi
+    fi
 fi
 
 # -------------------------------------------------------------------------
@@ -2618,8 +2653,16 @@ else
 		done <"$f"
 
 		# Validate syntax before committing changes
-		if ! visudo -cf "$tmp" >/dev/null 2>&1; then
+		VISUDO_OUTPUT=$(visudo -cf "$tmp" 2>&1)
+		VISUDO_RC=$?
+
+		if [[ $VISUDO_RC -ne 0 ]]; then
+			log_info "❌ Sudoers drop-in check failed for $f. Details:"
+			# Log the detailed error from visudo
+			echo "$VISUDO_OUTPUT" | while IFS= read -r line; do log_info "   visudo: $line"; done
+
 			rm -f "$tmp"
+			# The 'continue' statement prevents committing the bad file, relying on the backup.
 			log_error "Invalid syntax after modifying $f (changes discarded, original file preserved)"
 			continue
 		fi
