@@ -2508,7 +2508,7 @@ fi
 log_info "🔍 Validating temporary sudoers configuration..."
 
 # 1. Execute visudo, capture exit code and full output
-VISUDO_OUTPUT=$(visudo -cf "$tmp_sudo" 2>&1)
+VISUDO_OUTPUT=$( visudo -cf "$tmp_sudo" 2>&1 )
 VISUDO_RC=$?
 
 if [[ $VISUDO_RC -eq 0 ]]; then
