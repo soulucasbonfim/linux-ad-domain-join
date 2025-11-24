@@ -2513,43 +2513,48 @@ VISUDO_OUTPUT=$(visudo -cf "$tmp_sudo" 2>&1)
 VISUDO_RC=$?
 
 if [[ $VISUDO_RC -eq 0 ]]; then
-    # SUCCESS: Commit the changes
-    mv -f "$tmp_sudo" "$SUDOERS_MAIN"
-    chmod 440 "$SUDOERS_MAIN"
-    log_info "✅ Sudoers includes normalized successfully"
-    rm -f "$SUDO_BAK"
+    # SUCCESS: Log the detailed output (including warnings and 'parsed OK' messages)
+    echo "$VISUDO_OUTPUT" | while IFS= read -r line; do
+        log_info "ℹ️ $line"
+    done
+    
+    # Commit the changes
+    mv -f "$tmp_sudo" "$SUDOERS_MAIN"
+    chmod 440 "$SUDOERS_MAIN"
+    log_info "✅ Sudoers includes normalized successfully"
+    rm -f "$SUDO_BAK"
 else
-    # FAILURE: Syntax Error Detected
-    log_info "❌ visudo syntax check failed. Details:"
-    
-    # Log the detailed error from visudo
-    echo "$VISUDO_OUTPUT" | while IFS= read -r line; do
-        log_info "   visudo: $line"
-    done
-    
-    # Clean up temp file (always clean the temp file)
-    rm -f "$tmp_sudo"
-    
-    # 3. Decision to continue based on mode
-    if $NONINTERACTIVE; then
-        # NON-INTERACTIVE MODE: Must rollback and abort
-        mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
-        log_info "💾 Restored backup: $SUDO_BAK"
-        log_error "visudo syntax check failed during normalization (restored $SUDO_BAK)" 1
-    else
-        # INTERACTIVE MODE: Ask user to continue or abort
-        read_sanitized "⚠️ Sudoers check failed. Continue script execution anyway? [y/N]: " REPLY
-        
-        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
-            log_info "ℹ️ Ignoring visudo error (manual correction required). Proceeding with original $SUDOERS_MAIN."
-            rm -f "$SUDO_BAK" # Cleanup backup if user chooses to proceed without rollback
-        else
-            # User chooses to abort: Must rollback and abort
-            mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
-            log_info "💾 Restored backup: $SUDO_BAK"
-            log_error "visudo syntax check failed during normalization (abort requested)" 1
-        fi
-    fi
+    # FAILURE: Syntax Error Detected
+    log_info "❌ visudo syntax check failed. Details:"
+    
+    # Log the detailed error from visudo
+    echo "$VISUDO_OUTPUT" | while IFS= read -r line; do
+        log_info "   visudo: $line"
+    done
+    
+    # Clean up temp file (always clean the temp file)
+    rm -f "$tmp_sudo"
+    
+    # 3. Decision to continue based on mode
+    if $NONINTERACTIVE; then
+        # NON-INTERACTIVE MODE: Must rollback and abort
+        mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
+        log_info "💾 Restored backup: $SUDO_BAK"
+        log_error "visudo syntax check failed during normalization (restored $SUDO_BAK)" 1
+    else
+        # INTERACTIVE MODE: Ask user to continue or abort
+        read_sanitized "⚠️ Sudoers check failed. Continue script execution anyway? [y/N]: " REPLY
+        
+        if [[ "$REPLY" =~ ^[Yy]$ ]]; then
+            log_info "ℹ️ Ignoring visudo error (manual correction required). Proceeding with original $SUDOERS_MAIN."
+            rm -f "$SUDO_BAK" # Cleanup backup if user chooses to proceed without rollback
+        else
+            # User chooses to abort: Must rollback and abort
+            mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
+            log_info "💾 Restored backup: $SUDO_BAK"
+            log_error "visudo syntax check failed during normalization (abort requested)" 1
+        fi
+    fi
 fi
 
 # -------------------------------------------------------------------------
