@@ -143,12 +143,24 @@ read_sanitized() {
     read -rp "[$(date '+%F %T')] $sanitized" "$var_name"
 }
 
-# Safe divider generator (resilient to SSH, tmux, or resizing)
-get_divider() {
+# ==========================================================================================
+# Utility: Print a safe divider, resistant to SSH/tmux/resize mismatches.
+# ==========================================================================================
+print_divider() {
     local cols
-    cols=$(tput cols 2>/dev/null || stty size 2>/dev/null | awk '{print $2}' || echo 80)
+
+    # Terminal width detection with multiple fallbacks
+    cols=$(tput cols 2>/dev/null ||
+           stty size 2>/dev/null | awk '{print $2}' ||
+           echo 80)
+
+    # Safety threshold
     [[ -z "$cols" || "$cols" -lt 20 ]] && cols=80
-    printf '%*s\n' "$cols" '' | tr ' ' '-'
+
+    # Divider generation + sync
+    sync
+    sleep 0.05
+    printf '%*s\n' "$cols" '' | tr ' ' '-' >&2
 }
 
 # -------------------------------------------------------------------------
@@ -682,7 +694,6 @@ esac
 # -------------------------------------------------------------------------
 # Collect domain join inputs
 # -------------------------------------------------------------------------
-DIVIDER=$(get_divider)
 if $NONINTERACTIVE; then
     : "${DOMAIN:?DOMAIN required}"
     : "${OU:?OU required}"
@@ -693,7 +704,7 @@ if $NONINTERACTIVE; then
 	: "${GLOBAL_ADMIN_GROUPS:?GLOBAL_ADMIN_GROUPS required}"
 else
     log_info "🧪 Collecting inputs"
-    printf "%s\n" "$DIVIDER" >&2
+    print_divider
 
     # Require DOMAIN
     while true; do
@@ -751,7 +762,7 @@ else
     # handle optional input gracefully
     [[ -z "$GLOBAL_ADMIN_GROUPS" ]] && GLOBAL_ADMIN_GROUPS="(none)"
 fi
-printf "%s\n" "$DIVIDER" >&2
+print_divider
 
 # Only log if GLOBAL_ADMIN_GROUPS is defined and not "(none)"
 if [ -n "$GLOBAL_ADMIN_GROUPS" ] && [ "$GLOBAL_ADMIN_GROUPS" != "(none)" ]; then
@@ -2749,10 +2760,9 @@ fi
 [[ -z "$REALM_JOINED" ]] && REALM_JOINED="⚠️ Not detected"
 
 # Summary output
-DIVIDER=$(get_divider)
-printf "%s\n" "$DIVIDER" >&2
+print_divider
 log_info "🌟 DOMAIN JOIN VALIDATION SUMMARY"
-printf "%s\n" "$DIVIDER" >&2
+print_divider
 printf "%-25s %s\n" "Realm:"              "$REALM_JOINED"
 printf "%-25s %s\n" "DC Server:"          "$DC_SERVER"
 printf "%-25s %s\n" "Computer Name:"      "$HOST_SHORT_U"
@@ -2763,11 +2773,7 @@ printf "%-25s %s\n" "Handshake (ms):"     "${TRUST_ELAPSED:-n/a}"
 printf "%-25s %s\n" "Network RTT:"        "${TRUST_RTT:-n/a}"
 printf "%-25s %s\n" "SSSD Service:"       "${SSSD_STATUS,,}"
 printf "%-25s %s\n" "SSH Service:"        "${SSH_STATUS,,}"
-
-# Insert short pause and sync
-sync
-sleep 0.05
-printf "%s\n" "$DIVIDER" >&2
+print_divider
 
 # Insert short pause and newline without spawning a subshell
 sleep 0.05
