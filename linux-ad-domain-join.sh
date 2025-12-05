@@ -2612,15 +2612,15 @@ for f in "${FILES[@]}"; do
 done
 
 TARGET_GROUPS=()
-for g in "${RAW_GROUPS[@]}"; do
+for g in "${RAW_GROUPS[@]:-}"; do
     exists=false
-    for e in "${TARGET_GROUPS[@]}"; do
+    for e in "${TARGET_GROUPS[@]:-}"; do
         [[ "$g" == "$e" ]] && exists=true
     done
     [[ "$exists" == false ]] && TARGET_GROUPS+=("$g")
 done
 
-if [[ ${#TARGET_GROUPS[@]} -eq 0 ]]; then
+if [[ ${#TARGET_GROUPS[@]:-0} -eq 0 ]]; then
     log_info "📌 No sudo groups detected for hardening (nothing to patch)."
 else
 	# -------------------------------------------------------------------------
@@ -2640,7 +2640,7 @@ else
 			original="$line"
 			handled=false
 
-			for grp in "${TARGET_GROUPS[@]}"; do
+			for grp in "${TARGET_GROUPS[@]:-}"; do
 				good_all="%${grp} ALL=(ALL:ALL) ALL, !ROOT_SHELLS"
 				good_npw="%${grp} ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS"
 
@@ -2696,7 +2696,7 @@ else
 		if [[ $VISUDO_RC -ne 0 ]]; then
 			log_info "❌ Sudoers drop-in check failed for $f. Details:"
 			# Log the detailed error from visudo
-			echo "$VISUDO_OUTPUT" | while IFS= read -r line; do log_info "   visudo: $line"; done
+			echo "$VISUDO_OUTPUT" | while IFS= read -r line; do log_info "   visudo: $line"; done
 
 			rm -f "$tmp"
 			# The 'continue' statement prevents committing the bad file, relying on the backup.
@@ -2708,13 +2708,14 @@ else
 		chmod 440 "$f"
 
 		# Standardized log output format
-		if [[ ${#patched[@]} -gt 0 ]]; then
+		if [[ ${#patched[@]:-0} -gt 0 ]]; then
 			log_info "📄 $f → patched: ${patched[*]}"
-		elif [[ ${#compliant[@]} -gt 0 ]]; then
+		elif [[ ${#compliant[@]:-0} -gt 0 ]]; then
 			log_info "📄 $f → unchanged: ${compliant[*]}"
 		fi
 	done
 fi
+
 log_info "🚀 Completed domain join for $DOMAIN"
 
 # -------------------------------------------------------------------------
