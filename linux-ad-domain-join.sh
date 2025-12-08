@@ -548,7 +548,7 @@ install_missing_deps() {
             run_cmd_logged "$PKG install $extra_flags -y ${to_install[*]}"
 			;;
         zypper)
-            run_cmd_logged "zypper install -n ${to_install[*]}"
+            run_cmd_logged "$PKG install -n ${to_install[*]}"
             ;;
 		*)
             log_error "Unsupported package manager: $PKG" 101
