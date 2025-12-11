@@ -2515,7 +2515,7 @@ log_info "🔒 ROOT_SHELLS alias applied"
 log_info "🛡️ Configuring sudoers file: $SUDOERS_AD"
 
 # Create or refresh AD admin sudoers definition
-cat >"$SUDOERS_AD" <<'EOF'
+cat >"$SUDOERS_AD" <<EOF
 # ========================================================================
 # 10-ad-admin-groups
 #
@@ -2558,19 +2558,19 @@ cat >"$SUDOERS_AD" <<'EOF'
 #   This group is intentionally restricted to ensure that operational
 #   administrators cannot override the security model.
 # ========================================================================
-%$ADM_ALL ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS, \
-    !/usr/sbin/visudo, \
-    !/usr/bin/vim /etc/sudoers, \
-    !/usr/bin/vim /etc/sudoers.d/*, \
-    !/usr/bin/nano /etc/sudoers, \
-    !/usr/bin/nano /etc/sudoers.d/*, \
-    !/bin/cp /etc/sudoers*, \
-    !/bin/mv /etc/sudoers*, \
-    !/usr/bin/chmod /etc/sudoers*, \
-    !/usr/bin/chown /etc/sudoers*, \
-    !/usr/bin/passwd, \
-    !/usr/bin/passwd *, \
-    !/bin/passwd, \
+%$ADM_ALL ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS, \\
+    !/usr/sbin/visudo, \\
+    !/usr/bin/vim /etc/sudoers, \\
+    !/usr/bin/vim /etc/sudoers.d/*, \\
+    !/usr/bin/nano /etc/sudoers, \\
+    !/usr/bin/nano /etc/sudoers.d/*, \\
+    !/bin/cp /etc/sudoers*, \\
+    !/bin/mv /etc/sudoers*, \\
+    !/usr/bin/chmod /etc/sudoers*, \\
+    !/usr/bin/chown /etc/sudoers*, \\
+    !/usr/bin/passwd, \\
+    !/usr/bin/passwd *, \\
+    !/bin/passwd, \\
     !/bin/passwd *
 
 
@@ -2585,19 +2585,19 @@ cat >"$SUDOERS_AD" <<'EOF'
 # Restrictions:
 #   Same as ADM-ALL, but scoped to a single host.
 # ========================================================================
-%$ADM ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS, \
-    !/usr/sbin/visudo, \
-    !/usr/bin/vim /etc/sudoers, \
-    !/usr/bin/vim /etc/sudoers.d/*, \
-    !/usr/bin/nano /etc/sudoers, \
-    !/usr/bin/nano /etc/sudoers.d/*, \
-    !/bin/cp /etc/sudoers*, \
-    !/bin/mv /etc/sudoers*, \
-    !/usr/bin/chmod /etc/sudoers*, \
-    !/usr/bin/chown /etc/sudoers*, \
-    !/usr/bin/passwd, \
-    !/usr/bin/passwd *, \
-    !/bin/passwd, \
+%$ADM ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS, \\
+    !/usr/sbin/visudo, \\
+    !/usr/bin/vim /etc/sudoers, \\
+    !/usr/bin/vim /etc/sudoers.d/*, \\
+    !/usr/bin/nano /etc/sudoers, \\
+    !/usr/bin/nano /etc/sudoers.d/*, \\
+    !/bin/cp /etc/sudoers*, \\
+    !/bin/mv /etc/sudoers*, \\
+    !/usr/bin/chmod /etc/sudoers*, \\
+    !/usr/bin/chown /etc/sudoers*, \\
+    !/usr/bin/passwd, \\
+    !/usr/bin/passwd *, \\
+    !/bin/passwd, \\
     !/bin/passwd *
 
 
@@ -2619,17 +2619,17 @@ cat >"$SUDOERS_AD" <<'EOF'
 #   No root shell is given unless intentionally permitted (not recommended).
 # ========================================================================
 %$SEC_ALL ALL=(root) NOPASSWD: \
-    /usr/sbin/visudo, \
-    /usr/bin/vim /etc/sudoers, \
-    /usr/bin/vim /etc/sudoers.d/*, \
-    /usr/bin/nano /etc/sudoers, \
-    /usr/bin/nano /etc/sudoers.d/*, \
-    /bin/cp /etc/sudoers*, \
-    /bin/mv /etc/sudoers*, \
-    /usr/bin/chmod /etc/sudoers*, \
-    /usr/bin/chown /etc/sudoers*, \
-    /usr/bin/systemctl restart sshd, \
-    /usr/bin/systemctl restart systemd-logind, \
+    /usr/sbin/visudo, \\
+    /usr/bin/vim /etc/sudoers, \\
+    /usr/bin/vim /etc/sudoers.d/*, \\
+    /usr/bin/nano /etc/sudoers, \\
+    /usr/bin/nano /etc/sudoers.d/*, \\
+    /bin/cp /etc/sudoers*, \\
+    /bin/mv /etc/sudoers*, \\
+    /usr/bin/chmod /etc/sudoers*, \\
+    /usr/bin/chown /etc/sudoers*, \\
+    /usr/bin/systemctl restart sshd, \\
+    /usr/bin/systemctl restart systemd-logind, \\
     /usr/bin/passwd root
 
 
@@ -2650,17 +2650,17 @@ cat >"$SUDOERS_AD" <<'EOF'
 #   - SEC-HOST → local authority
 # ========================================================================
 %$SEC ALL=(root) NOPASSWD: \
-    /usr/sbin/visudo, \
-    /usr/bin/vim /etc/sudoers, \
-    /usr/bin/vim /etc/sudoers.d/*, \
-    /usr/bin/nano /etc/sudoers, \
-    /usr/bin/nano /etc/sudoers.d/*, \
-    /bin/cp /etc/sudoers*, \
-    /bin/mv /etc/sudoers*, \
-    /usr/bin/chmod /etc/sudoers*, \
-    /usr/bin/chown /etc/sudoers*, \
-    /usr/bin/systemctl restart sshd, \
-    /usr/bin/systemctl restart systemd-logind, \
+    /usr/sbin/visudo, \\
+    /usr/bin/vim /etc/sudoers, \\
+    /usr/bin/vim /etc/sudoers.d/*, \\
+    /usr/bin/nano /etc/sudoers, \\
+    /usr/bin/nano /etc/sudoers.d/*, \\
+    /bin/cp /etc/sudoers*, \\
+    /bin/mv /etc/sudoers*, \\
+    /usr/bin/chmod /etc/sudoers*, \\
+    /usr/bin/chown /etc/sudoers*, \\
+    /usr/bin/systemctl restart sshd, \\
+    /usr/bin/systemctl restart systemd-logind, \\
     /usr/bin/passwd root
 EOF
 chmod 440 "$SUDOERS_AD"
