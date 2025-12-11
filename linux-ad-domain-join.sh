@@ -394,7 +394,7 @@ case "$ID" in
     ubuntu|debian) OS_FAMILY=debian; PKG=apt; SSH_G=sudo ;;
 	rhel|rocky|almalinux) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
 	centos) OS_FAMILY=rhel; PKG=$([[ ${VERSION_ID%%.*} -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
-    oracle|ol) OS_FAMILY=rhel; VER_NUM=$(grep -Eo '[0-9]+' /etc/oracle-release | head -1); PKG=$([[ ${VER_NUM:-0} -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
+	oracle|ol) OS_FAMILY=rhel; VER_NUM=$(grep -Eo '[0-9]+' /etc/oracle-release | head -1); PKG=$( [ -z "$VER_NUM" ] && VER_NUM=0; [ "$VER_NUM" -lt 8 ] && echo yum || echo dnf ); SSH_G=wheel ;;
     sles|suse) OS_FAMILY=suse; PKG=zypper; SSH_G=wheel ;;
     fedora) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
     amzn) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
@@ -1104,8 +1104,11 @@ if [[ -n "$REALM_JOINED" ]]; then
         else
             $REALM_LEAVE_CMD >/dev/null 2>&1 || REALMLEAVE_RC=$?
         fi
-
-        REALMLEAVE_RC=${REALMLEAVE_RC:-0}
+	
+        if [ -z "${REALMLEAVE_RC+x}" ]; then
+			REALMLEAVE_RC=0
+		fi
+		
         if [[ $REALMLEAVE_RC -eq 0 ]]; then
             log_info "✅ Successfully left current realm."
         else
@@ -2783,8 +2786,7 @@ done < <(find "$SUDOERS_DIR" -maxdepth 1 -type f)
 # -------------------------------------------------------------------------
 log_info "🔎 Enumerating administrative groups"
 
-RAW_GROUPS=()
-
+declare -a RAW_GROUPS=()
 for f in "${FILES[@]}"; do
     while IFS= read -r line; do
         if [[ "$line" =~ ^%([A-Za-z0-9._-]+)[[:space:]] ]]; then
@@ -2793,16 +2795,16 @@ for f in "${FILES[@]}"; do
     done <"$f"
 done
 
-TARGET_GROUPS=()
-for g in "${RAW_GROUPS[@]:-}"; do
+declare -a TARGET_GROUPS=()
+for g in "${RAW_GROUPS[@]}"; do
     exists=false
-    for e in "${TARGET_GROUPS[@]:-}"; do
+    for e in "${TARGET_GROUPS[@]}"; do
         [[ "$g" == "$e" ]] && exists=true
     done
     [[ "$exists" == false ]] && TARGET_GROUPS+=("$g")
 done
 
-if [[ ${#TARGET_GROUPS[@]:-0} -eq 0 ]]; then
+if [[ ${#TARGET_GROUPS[@]} -eq 0 ]]; then
     log_info "📌 No sudo groups detected for hardening (nothing to patch)."
 else
 	# -------------------------------------------------------------------------
@@ -2812,8 +2814,8 @@ else
 	log_info "⚙️ Updating rules"
 
 	for f in "${FILES[@]}"; do
-		patched=()
-		compliant=()
+		declare -a patched=()
+		declare -a compliant=()
 
 		tmp="${f}.tmp"
 		: >"$tmp"
@@ -2890,9 +2892,9 @@ else
 		chmod 440 "$f"
 
 		# Standardized log output format
-		if [[ ${#patched[@]:-0} -gt 0 ]]; then
+		if [[ ${#patched[@]} -gt 0 ]]; then
 			log_info "📄 $f → patched: ${patched[*]}"
-		elif [[ ${#compliant[@]:-0} -gt 0 ]]; then
+		elif [[ ${#compliant[@]} -gt 0 ]]; then
 			log_info "📄 $f → unchanged: ${compliant[*]}"
 		fi
 	done
