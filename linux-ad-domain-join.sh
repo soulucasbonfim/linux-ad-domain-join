@@ -2618,7 +2618,7 @@ cat >"$SUDOERS_AD" <<EOF
 #   This group holds *security authority*, not unrestricted system access.
 #   No root shell is given unless intentionally permitted (not recommended).
 # ========================================================================
-%$SEC_ALL ALL=(root) NOPASSWD: \
+%$SEC_ALL ALL=(root) NOPASSWD: \\
     /usr/sbin/visudo, \\
     /usr/bin/vim /etc/sudoers, \\
     /usr/bin/vim /etc/sudoers.d/*, \\
@@ -2649,7 +2649,7 @@ cat >"$SUDOERS_AD" <<EOF
 #   - SEC-ALL → global authority
 #   - SEC-HOST → local authority
 # ========================================================================
-%$SEC ALL=(root) NOPASSWD: \
+%$SEC ALL=(root) NOPASSWD: \\
     /usr/sbin/visudo, \\
     /usr/bin/vim /etc/sudoers, \\
     /usr/bin/vim /etc/sudoers.d/*, \\
