@@ -2556,22 +2556,20 @@ cat >"$SUDOERS_AD" <<EOF
 #   administrators cannot override the security model.
 # ========================================================================
 %$ADM_ALL ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS, \
-    # Block editing sudoers
     !/usr/sbin/visudo, \
     !/usr/bin/vim /etc/sudoers, \
     !/usr/bin/vim /etc/sudoers.d/*, \
     !/usr/bin/nano /etc/sudoers, \
     !/usr/bin/nano /etc/sudoers.d/*, \
-    # Block altering sudoers permissions
     !/bin/cp /etc/sudoers*, \
     !/bin/mv /etc/sudoers*, \
     !/usr/bin/chmod /etc/sudoers*, \
     !/usr/bin/chown /etc/sudoers*, \
-    # Block changing ANY user password (including root)
     !/usr/bin/passwd, \
     !/usr/bin/passwd *, \
     !/bin/passwd, \
     !/bin/passwd *
+
 
 
 
@@ -2585,18 +2583,15 @@ cat >"$SUDOERS_AD" <<EOF
 #   Same as ADM-ALL, but scoped to a single host.
 # ========================================================================
 %$ADM ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS, \
-    # Block editing sudoers
     !/usr/sbin/visudo, \
     !/usr/bin/vim /etc/sudoers, \
     !/usr/bin/vim /etc/sudoers.d/*, \
     !/usr/bin/nano /etc/sudoers, \
     !/usr/bin/nano /etc/sudoers.d/*, \
-    # Block altering sudoers permissions
     !/bin/cp /etc/sudoers*, \
     !/bin/mv /etc/sudoers*, \
     !/usr/bin/chmod /etc/sudoers*, \
     !/usr/bin/chown /etc/sudoers*, \
-    # Block changing ANY user password (including root)
     !/usr/bin/passwd, \
     !/usr/bin/passwd *, \
     !/bin/passwd, \
@@ -2621,21 +2616,17 @@ cat >"$SUDOERS_AD" <<EOF
 #   No root shell is given unless intentionally permitted (not recommended).
 # ========================================================================
 %$SEC_ALL ALL=(root) NOPASSWD: \
-    # Editing sudoers
     /usr/sbin/visudo, \
     /usr/bin/vim /etc/sudoers, \
     /usr/bin/vim /etc/sudoers.d/*, \
     /usr/bin/nano /etc/sudoers, \
     /usr/bin/nano /etc/sudoers.d/*, \
-    # Managing sudoers file permissions
     /bin/cp /etc/sudoers*, \
     /bin/mv /etc/sudoers*, \
     /usr/bin/chmod /etc/sudoers*, \
     /usr/bin/chown /etc/sudoers*, \
-    # Restarting services after security changes
     /usr/bin/systemctl restart sshd, \
     /usr/bin/systemctl restart systemd-logind, \
-    # Root password management (GLOBAL)
     /usr/bin/passwd root
 
 
@@ -2656,21 +2647,17 @@ cat >"$SUDOERS_AD" <<EOF
 #   - SEC-HOST → local authority
 # ========================================================================
 %$SEC ALL=(root) NOPASSWD: \
-    # Editing sudoers (global action needed locally)
     /usr/sbin/visudo, \
     /usr/bin/vim /etc/sudoers, \
     /usr/bin/vim /etc/sudoers.d/*, \
     /usr/bin/nano /etc/sudoers, \
     /usr/bin/nano /etc/sudoers.d/*, \
-    # Managing sudoers file permissions
     /bin/cp /etc/sudoers*, \
     /bin/mv /etc/sudoers*, \
     /usr/bin/chmod /etc/sudoers*, \
     /usr/bin/chown /etc/sudoers*, \
-    # Restarting services after changes
     /usr/bin/systemctl restart sshd, \
     /usr/bin/systemctl restart systemd-logind, \
-    # Root password management (LOCAL)
     /usr/bin/passwd root
 EOF
 chmod 440 "$SUDOERS_AD"
