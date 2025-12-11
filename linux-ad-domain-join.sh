@@ -2515,7 +2515,7 @@ log_info "🔒 ROOT_SHELLS alias applied"
 log_info "🛡️ Configuring sudoers file: $SUDOERS_AD"
 
 # Create or refresh AD admin sudoers definition
-cat >"$SUDOERS_AD" <<EOF
+cat >"$SUDOERS_AD" <<'EOF'
 # ========================================================================
 # 10-ad-admin-groups
 #
