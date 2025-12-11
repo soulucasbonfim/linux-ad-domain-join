@@ -737,7 +737,7 @@ else
 
     # Require Join User
     while true; do
-        read -rp "[?] Join user (e.g., adm-l.lima): " DOMAIN_USER
+        read -rp "[?] Join user (e.g., administrator): " DOMAIN_USER
         DOMAIN_USER=$(echo "$DOMAIN_USER" | xargs)
         [[ -n "$DOMAIN_USER" ]] && break
         echo "[!] Join user is required."
