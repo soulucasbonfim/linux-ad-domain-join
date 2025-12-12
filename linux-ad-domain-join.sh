@@ -2440,74 +2440,10 @@ fi
 SUDOERS_MAIN="/etc/sudoers"
 SUDOERS_DIR="/etc/sudoers.d"
 SUDOERS_AD="${SUDOERS_DIR}/10-ad-admin-groups"
-BLOCK_FILE="${SUDOERS_DIR}/00-block-root-shell"
-
-log_info "🛡️ Configuring sudoers directory: $SUDOERS_DIR"
 
 # Ensure target directory exists
+log_info "🛡️ Configuring sudoers directory: $SUDOERS_DIR"
 mkdir -p "$SUDOERS_DIR"
-
-# -------------------------------------------------------------------------
-# Root Shell Hardening (restrict interactive shells for all sudo groups)
-# -------------------------------------------------------------------------
-# Create ROOT_SHELLS command alias (centralized restriction control)
-# -------------------------------------------------------------------------
-log_info "🔍 Starting root shell hardening"
-log_info "🛠️ Installing ROOT_SHELLS alias at $BLOCK_FILE"
-
-cat >"$BLOCK_FILE" <<'EOF'
-# ========================================================================
-# 00-security-baseline
-#
-# Global security baseline for all Linux servers joined to Active Directory.
-# This file defines command aliases and security controls that enforce
-# privilege containment and prevent root shell escalation by operational
-# administrators.
-#
-# IMPORTANT:
-# - This file contains global rules only. No AD groups are configured here.
-# - Do NOT place operational or security group privileges in this file.
-# - All AD group privileges are defined in: 10-ad-linux-privilege-model
-# ========================================================================
-
-
-# ------------------------------------------------------------------------
-# ROOT_SHELLS
-# Command Alias: Denies any attempt to spawn an interactive root shell.
-# This includes direct shells (bash, sh, dash, zsh) and indirect shells
-# via /usr/bin/env or similar environment tricks.
-#
-# This alias is used with:
-#       !ROOT_SHELLS
-# in the AD group privilege definitions.
-# ------------------------------------------------------------------------
-Cmnd_Alias ROOT_SHELLS = \
-    /bin/su, /usr/bin/su, \
-    /bin/bash, /usr/bin/bash, \
-    /bin/sh, /usr/bin/sh, \
-    /bin/dash, /usr/bin/dash, \
-    /bin/zsh, /usr/bin/zsh, \
-    /usr/bin/env bash, \
-    /usr/bin/env bash -i, \
-    /usr/bin/env -i bash, \
-    /usr/bin/env bash -c *, \
-    /usr/bin/env -i bash -c *, \
-    /usr/bin/env *sh*, \
-    /usr/bin/env -i *
-
-# ------------------------------------------------------------------------
-# Optional Alias (not active by default)
-# Used for blocking common privilege-escalation capable interpreters.
-# Uncomment and enforce in 10-ad-linux-privilege-model if required.
-#
-# Cmnd_Alias PRIV_ESC = /usr/bin/python*, /usr/bin/perl*, /usr/bin/lua*, /usr/bin/ruby*
-# ------------------------------------------------------------------------
-EOF
-
-chmod 440 "$BLOCK_FILE"
-visudo -cf "$BLOCK_FILE" >/dev/null 2>&1 || log_error "Invalid syntax in $BLOCK_FILE"
-
-log_info "🔒 ROOT_SHELLS alias applied"
 
 # -------------------------------------------------------------------------
 # AD admin sudoers drop-in
@@ -2517,151 +2453,233 @@ log_info "🛡️ Configuring sudoers file: $SUDOERS_AD"
 # Create or refresh AD admin sudoers definition
 cat >"$SUDOERS_AD" <<EOF
 # ========================================================================
-# 10-ad-admin-groups
+# FILE: 10-ad-linux-privilege-model
 #
-# Active Directory privilege model for Linux servers.
-# Defines operational (ADM) and security (SEC) groups using a hybrid model:
+# PURPOSE
+# -------
+# Centralized privilege and security governance model for Linux hosts
+# integrated with Active Directory.
 #
-#   - ADM-ALL  : Operational administration across all Linux servers.
-#   - ADM-HOST : Operational administration on a single Linux server.
+# This file defines a strict separation between:
 #
-#   - SEC-ALL  : Security governance across all Linux servers.
-#   - SEC-HOST : Security governance on a single Linux server.
+#   - SECURITY administrators (SEC):
+#       * Govern authentication, authorization, identity and credentials
+#       * Execute only explicitly approved security commands
+#       * Cannot obtain interactive root shell
 #
-# HYBRID MODEL:
-# - Only SEC groups can modify the root password.
-#   (SEC-ALL globally; SEC-HOST locally)
-# - ADM groups cannot obtain root shell, edit sudoers, or modify security.
+#   - OPERATIONAL administrators (ADM):
+#       * Operate the system and applications
+#       * Can manage services and software
+#       * Cannot alter security posture
+#       * Cannot obtain interactive root shell
 #
-# All restrictions and permissions are defined clearly below.
+#
+# DESIGN PRINCIPLES
+# -----------------
+# - Single Source of Truth:
+#       All security-sensitive commands are centralized in SEC_ALL_CMDS.
+#
+# - Explicit Allow for SEC:
+#       SEC receives only what is required to govern security.
+#
+# - Explicit Deny for ADM:
+#       ADM receives ALL privileges minus security posture changes.
+#
+# - No Interactive Root Access:
+#       Neither SEC nor ADM can spawn a root shell.
+#
+#
+# SCOPE CONTROL
+# -------------
+# Group scope (global vs host-level) is handled in Active Directory:
+#
+#   - %SEC_ALL / %ADM_ALL  -> global authority
+#   - %SEC     / %ADM      -> host-level authority
+#
 # ========================================================================
 
 
-
-# ========================================================================
-# SECTION 1 — GLOBAL OPERATIONAL ADMINS ($ADM_ALL)
-#
-# Purpose:
-#   Provide operational administration across all Linux servers.
-#
-# Allowed:
-#   - Service management, log inspection, application support.
-#   - General command execution required for day-to-day operations.
-#
-# Forbidden:
-#   - Root shell escalation              (!ROOT_SHELLS)
-#   - Editing sudoers or security files
-#   - Changing root password             (!passwd)
-#   - Modifying ownership/permissions of sudoers
-#
-# Notes:
-#   This group is intentionally restricted to ensure that operational
-#   administrators cannot override the security model.
-# ========================================================================
-%$ADM_ALL ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS, \\
-    !/usr/sbin/visudo, \\
-    !/usr/bin/vim /etc/sudoers, \\
-    !/usr/bin/vim /etc/sudoers.d/*, \\
-    !/usr/bin/nano /etc/sudoers, \\
-    !/usr/bin/nano /etc/sudoers.d/*, \\
-    !/bin/cp /etc/sudoers*, \\
-    !/bin/mv /etc/sudoers*, \\
-    !/usr/bin/chmod /etc/sudoers*, \\
-    !/usr/bin/chown /etc/sudoers*, \\
-    !/usr/bin/passwd, \\
-    !/usr/bin/passwd *, \\
-    !/bin/passwd, \\
-    !/bin/passwd *
-
-
-
-
-# ========================================================================
-# SECTION 2 — HOST-LEVEL OPERATIONAL ADMINS ($ADM)
-#
-# Purpose:
-#   Provide operational administration only on this server.
-#
-# Restrictions:
-#   Same as ADM-ALL, but scoped to a single host.
-# ========================================================================
-%$ADM ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS, \\
-    !/usr/sbin/visudo, \\
-    !/usr/bin/vim /etc/sudoers, \\
-    !/usr/bin/vim /etc/sudoers.d/*, \\
-    !/usr/bin/nano /etc/sudoers, \\
-    !/usr/bin/nano /etc/sudoers.d/*, \\
-    !/bin/cp /etc/sudoers*, \\
-    !/bin/mv /etc/sudoers*, \\
-    !/usr/bin/chmod /etc/sudoers*, \\
-    !/usr/bin/chown /etc/sudoers*, \\
-    !/usr/bin/passwd, \\
-    !/usr/bin/passwd *, \\
-    !/bin/passwd, \\
-    !/bin/passwd *
-
-
-
-# ========================================================================
-# SECTION 3 — GLOBAL SECURITY ADMINS ($SEC_ALL)
-#
-# Purpose:
-#   Security administration, governance and maintenance of sudo policy.
-#
-# Allowed:
-#   - Editing sudoers via visudo, vim, nano
-#   - Adjusting ownership/permissions of sudoers files
-#   - Restarting sshd and systemd-logind after configuration changes
-#   - Changing the root password (global authority)
-#
-# Notes:
-#   This group holds *security authority*, not unrestricted system access.
-#   No root shell is given unless intentionally permitted (not recommended).
-# ========================================================================
-%$SEC_ALL ALL=(root) NOPASSWD: \\
+# ------------------------------------------------------------------------
+# SUDOERS security management
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_SUDOERS = \\
     /usr/sbin/visudo, \\
-    /usr/bin/vim /etc/sudoers, \\
-    /usr/bin/vim /etc/sudoers.d/*, \\
-    /usr/bin/nano /etc/sudoers, \\
-    /usr/bin/nano /etc/sudoers.d/*, \\
+    /usr/bin/vim /etc/sudoers*, \\
+    /usr/bin/nano /etc/sudoers*, \\
     /bin/cp /etc/sudoers*, \\
     /bin/mv /etc/sudoers*, \\
     /usr/bin/chmod /etc/sudoers*, \\
-    /usr/bin/chown /etc/sudoers*, \\
+    /usr/bin/chown /etc/sudoers*
+
+
+# ------------------------------------------------------------------------
+# Security-critical authentication services
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_SECURITY_SERVICES = \\
     /usr/bin/systemctl restart sshd, \\
+    /usr/bin/systemctl reload sshd, \\
     /usr/bin/systemctl restart systemd-logind, \\
+    /usr/bin/systemctl daemon-reload
+
+
+# ------------------------------------------------------------------------
+# Credential management (root authority)
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_CREDENTIALS = \\
     /usr/bin/passwd root
+
+
+# ------------------------------------------------------------------------
+# Block inline editors on security files (sed -i)
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_INLINE_EDIT = \\
+    /bin/sed -i* /etc/sudoers*, \\
+    /bin/sed -i* /etc/ssh/*
+
+
+# ------------------------------------------------------------------------
+# Block overwrite via tee on security files
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_TEE = \\
+    /usr/bin/tee /etc/sudoers*, \\
+    /usr/bin/tee /etc/ssh/*
+
+
+# ------------------------------------------------------------------------
+# PAM authentication stack
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_PAM = \\
+    /usr/bin/vim /etc/pam.d/*, \\
+    /usr/bin/nano /etc/pam.d/*, \\
+    /bin/cp /etc/pam.d/*, \\
+    /bin/mv /etc/pam.d/*, \\
+    /usr/bin/chmod /etc/pam.d/*, \\
+    /usr/bin/chown /etc/pam.d/*
+
+
+# ------------------------------------------------------------------------
+# Identity and NSS (local users, groups, resolution)
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_IDENTITY = \\
+    /usr/bin/vim /etc/nsswitch.conf, \\
+    /usr/bin/nano /etc/nsswitch.conf, \\
+    /usr/bin/vim /etc/passwd, \\
+    /usr/bin/vim /etc/shadow, \\
+    /usr/bin/vim /etc/group, \\
+    /usr/bin/vim /etc/gshadow, \\
+    /bin/cp /etc/passwd /etc/shadow /etc/group /etc/gshadow, \\
+    /bin/mv /etc/passwd /etc/shadow /etc/group /etc/gshadow, \\
+    /usr/bin/chmod /etc/passwd /etc/shadow /etc/group /etc/gshadow, \\
+    /usr/bin/chown /etc/passwd /etc/shadow /etc/group /etc/gshadow
+
+
+# ------------------------------------------------------------------------
+# SSSD / Active Directory integration
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_SSSD = \\
+    /usr/bin/vim /etc/sssd/sssd.conf, \\
+    /usr/bin/nano /etc/sssd/sssd.conf, \\
+    /bin/cp /etc/sssd/sssd.conf, \\
+    /bin/mv /etc/sssd/sssd.conf, \\
+    /usr/bin/chmod /etc/sssd/sssd.conf, \\
+    /usr/bin/chown /etc/sssd/sssd.conf
+
+
+# ------------------------------------------------------------------------
+# Polkit privilege rules (modern privilege escalation layer)
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_POLKIT = \\
+    /usr/bin/vim /etc/polkit-1/*, \\
+    /usr/bin/nano /etc/polkit-1/*, \\
+    /bin/cp /etc/polkit-1/*, \\
+    /bin/mv /etc/polkit-1/*, \\
+    /usr/bin/chmod /etc/polkit-1/*, \\
+    /usr/bin/chown /etc/polkit-1/*
+
+
+# ------------------------------------------------------------------------
+# systemd overrides for security services
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_SYSTEMD_OVERRIDES = \\
+    /usr/bin/vim /etc/systemd/system/sshd.service*, \\
+    /usr/bin/nano /etc/systemd/system/sshd.service*, \\
+    /bin/cp /etc/systemd/system/sshd.service*, \\
+    /bin/mv /etc/systemd/system/sshd.service*
+
+
+# ------------------------------------------------------------------------
+# Optional: advanced PAM / security tuning
+# (Enable only if these controls are actively used)
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_SECURITY_MISC = \\
+    /usr/bin/vim /etc/security/*, \\
+    /usr/bin/nano /etc/security/*, \\
+    /bin/cp /etc/security/*, \\
+    /bin/mv /etc/security/*
+
+
+# ------------------------------------------------------------------------
+# Central Security Authority (single source of truth)
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_ALL_CMDS = \\
+    SEC_SUDOERS, \\
+    SEC_SECURITY_SERVICES, \\
+    SEC_CREDENTIALS, \\
+    SEC_INLINE_EDIT, \\
+    SEC_TEE, \\
+    SEC_PAM, \\
+    SEC_IDENTITY, \\
+    SEC_SSSD, \\
+    SEC_POLKIT, \\
+    SEC_SYSTEMD_OVERRIDES, \\
+    SEC_SECURITY_MISC
 
 
 
 # ========================================================================
-# SECTION 4 — HOST-LEVEL SECURITY ADMINS ($SEC)
-#
-# Purpose:
-#   Local security administration only on this host.
-#
-# Allowed:
-#   Same capabilities of SEC-ALL, but for changing root password only:
-#   - SEC-HOST can change the root password of this server only.
-#
-# Notes:
-#   This enforces the hybrid model:
-#   - SEC-ALL → global authority
-#   - SEC-HOST → local authority
+# ROOT SHELL ESCALATION PREVENTION
 # ========================================================================
-%$SEC ALL=(root) NOPASSWD: \\
-    /usr/sbin/visudo, \\
-    /usr/bin/vim /etc/sudoers, \\
-    /usr/bin/vim /etc/sudoers.d/*, \\
-    /usr/bin/nano /etc/sudoers, \\
-    /usr/bin/nano /etc/sudoers.d/*, \\
-    /bin/cp /etc/sudoers*, \\
-    /bin/mv /etc/sudoers*, \\
-    /usr/bin/chmod /etc/sudoers*, \\
-    /usr/bin/chown /etc/sudoers*, \\
-    /usr/bin/systemctl restart sshd, \\
-    /usr/bin/systemctl restart systemd-logind, \\
-    /usr/bin/passwd root
+Cmnd_Alias ROOT_SHELLS = \\
+    /bin/su, /usr/bin/su, \\
+    /bin/bash, /usr/bin/bash, \\
+    /bin/sh, /usr/bin/sh, \\
+    /bin/dash, /usr/bin/dash, \\
+    /bin/zsh, /usr/bin/zsh, \\
+    /usr/bin/env bash, \\
+    /usr/bin/env bash -i, \\
+    /usr/bin/env -i bash, \\
+    /usr/bin/env bash -c *, \\
+    /usr/bin/env -i bash -c *, \\
+    /usr/bin/env *sh*, \\
+    /usr/bin/env -i *
+
+
+
+# ========================================================================
+# SECURITY ADMINISTRATORS (SEC)
+# ========================================================================
+# Security authority:
+# - Can change security posture
+# - Cannot obtain interactive root shell
+# ========================================================================
+%$SEC_ALL ALL=(root) NOPASSWD: SEC_ALL_CMDS, !ROOT_SHELLS
+%$SEC     ALL=(root) NOPASSWD: SEC_ALL_CMDS, !ROOT_SHELLS
+
+
+
+# ========================================================================
+# OPERATIONAL ADMINISTRATORS (ADM)
+# ========================================================================
+# ADM = ALL privileges minus:
+#   - Security posture changes
+#   - Root shell escalation
+#
+# Applies to both:
+#   - Global operational admins   (%ADM_ALL)
+#   - Host-level operational admins (%ADM)
+# ========================================================================
+%$ADM_ALL ALL=(ALL) NOPASSWD: ALL, !SEC_ALL_CMDS, !ROOT_SHELLS
+%$ADM     ALL=(ALL) NOPASSWD: ALL, !SEC_ALL_CMDS, !ROOT_SHELLS
 EOF
 chmod 440 "$SUDOERS_AD"
 
@@ -2775,7 +2793,6 @@ log_info "🗂️ Enumerating sudoers configuration files"
 FILES=("$SUDOERS_MAIN")
 
 while IFS= read -r f; do
-    [[ "$f" == "$BLOCK_FILE" ]] && continue
     [[ "$f" =~ README ]] && continue
     [[ "$f" =~ \.bak ]] && continue
     FILES+=("$f")
