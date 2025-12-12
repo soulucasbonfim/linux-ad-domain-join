@@ -2439,11 +2439,71 @@ fi
 # -------------------------------------------------------------------------
 SUDOERS_MAIN="/etc/sudoers"
 SUDOERS_DIR="/etc/sudoers.d"
-SUDOERS_AD="${SUDOERS_DIR}/10-ad-admin-groups"
+SUDOERS_AD="${SUDOERS_DIR}/10-ad-linux-privilege-model"
+BLOCK_FILE="${SUDOERS_DIR}/00-block-root-shell"
 
 # Ensure target directory exists
 log_info "🛡️ Configuring sudoers directory: $SUDOERS_DIR"
 mkdir -p "$SUDOERS_DIR"
+
+# -------------------------------------------------------------------------
+# Create ROOT_SHELLS command alias (centralized restriction control)
+# -------------------------------------------------------------------------
+log_info "🛠️ Installing ROOT_SHELLS alias at $BLOCK_FILE"
+
+cat >"$BLOCK_FILE" <<'EOF'
+# ========================================================================
+# 00-security-baseline
+#
+# Global security baseline for all Linux servers joined to Active Directory.
+# This file defines command aliases and security controls that enforce
+# privilege containment and prevent root shell escalation by operational
+# administrators.
+#
+# IMPORTANT:
+# - This file contains global rules only. No AD groups are configured here.
+# - Do NOT place operational or security group privileges in this file.
+# - All AD group privileges are defined in: 10-ad-linux-privilege-model
+# ========================================================================
+
+
+# ------------------------------------------------------------------------
+# ROOT_SHELLS
+# Command Alias: Denies any attempt to spawn an interactive root shell.
+# This includes direct shells (bash, sh, dash, zsh) and indirect shells
+# via /usr/bin/env or similar environment tricks.
+#
+# This alias is used with:
+#       !ROOT_SHELLS
+# in the AD group privilege definitions.
+# ------------------------------------------------------------------------
+Cmnd_Alias ROOT_SHELLS = \
+    /bin/su, /usr/bin/su, \
+    /bin/bash, /usr/bin/bash, \
+    /bin/sh, /usr/bin/sh, \
+    /bin/dash, /usr/bin/dash, \
+    /bin/zsh, /usr/bin/zsh, \
+    /usr/bin/env bash, \
+    /usr/bin/env bash -i, \
+    /usr/bin/env -i bash, \
+    /usr/bin/env bash -c *, \
+    /usr/bin/env -i bash -c *, \
+    /usr/bin/env *sh*, \
+    /usr/bin/env -i *
+
+# ------------------------------------------------------------------------
+# Optional Alias (not active by default)
+# Used for blocking common privilege-escalation capable interpreters.
+# Uncomment and enforce in 10-ad-linux-privilege-model if required.
+#
+# Cmnd_Alias PRIV_ESC = /usr/bin/python*, /usr/bin/perl*, /usr/bin/lua*, /usr/bin/ruby*
+# ------------------------------------------------------------------------
+EOF
+
+chmod 440 "$BLOCK_FILE"
+visudo -cf "$BLOCK_FILE" >/dev/null 2>&1 || log_error "Invalid syntax in $BLOCK_FILE"
+
+log_info "🔒 ROOT_SHELLS alias applied"
 
 # -------------------------------------------------------------------------
 # AD admin sudoers drop-in
@@ -2474,28 +2534,12 @@ cat >"$SUDOERS_AD" <<EOF
 #       * Cannot obtain interactive root shell
 #
 #
-# DESIGN PRINCIPLES
-# -----------------
-# - Single Source of Truth:
-#       All security-sensitive commands are centralized in SEC_ALL_CMDS.
-#
-# - Explicit Allow for SEC:
-#       SEC receives only what is required to govern security.
-#
-# - Explicit Deny for ADM:
-#       ADM receives ALL privileges minus security posture changes.
-#
-# - No Interactive Root Access:
-#       Neither SEC nor ADM can spawn a root shell.
-#
-#
 # SCOPE CONTROL
 # -------------
 # Group scope (global vs host-level) is handled in Active Directory:
 #
 #   - %SEC_ALL / %ADM_ALL  -> global authority
 #   - %SEC     / %ADM      -> host-level authority
-#
 # ========================================================================
 
 
@@ -2635,26 +2679,6 @@ Cmnd_Alias SEC_ALL_CMDS = \\
     SEC_SECURITY_MISC
 
 
-
-# ========================================================================
-# ROOT SHELL ESCALATION PREVENTION
-# ========================================================================
-Cmnd_Alias ROOT_SHELLS = \\
-    /bin/su, /usr/bin/su, \\
-    /bin/bash, /usr/bin/bash, \\
-    /bin/sh, /usr/bin/sh, \\
-    /bin/dash, /usr/bin/dash, \\
-    /bin/zsh, /usr/bin/zsh, \\
-    /usr/bin/env bash, \\
-    /usr/bin/env bash -i, \\
-    /usr/bin/env -i bash, \\
-    /usr/bin/env bash -c *, \\
-    /usr/bin/env -i bash -c *, \\
-    /usr/bin/env *sh*, \\
-    /usr/bin/env -i *
-
-
-
 # ========================================================================
 # SECURITY ADMINISTRATORS (SEC)
 # ========================================================================
@@ -2664,7 +2688,6 @@ Cmnd_Alias ROOT_SHELLS = \\
 # ========================================================================
 %$SEC_ALL ALL=(root) NOPASSWD: SEC_ALL_CMDS, !ROOT_SHELLS
 %$SEC     ALL=(root) NOPASSWD: SEC_ALL_CMDS, !ROOT_SHELLS
-
 
 
 # ========================================================================
@@ -2793,6 +2816,7 @@ log_info "🗂️ Enumerating sudoers configuration files"
 FILES=("$SUDOERS_MAIN")
 
 while IFS= read -r f; do
+    [[ "$f" == "$BLOCK_FILE" ]] && continue
     [[ "$f" =~ README ]] && continue
     [[ "$f" =~ \.bak ]] && continue
     FILES+=("$f")
