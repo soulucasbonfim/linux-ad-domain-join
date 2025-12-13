@@ -2395,6 +2395,8 @@ SSH="grp-ssh-$HOST_L"
 SSH_ALL="grp-ssh-all-linux-servers"
 SEC="grp-sec-$HOST_L"
 SEC_ALL="grp-sec-all-linux-servers"
+SUPER="grp-super-$HOST_L"
+SUPER_ALL="grp-super-all-linux-servers"
 
 # -------------------------------------------------------------------------
 # Configure SSH AllowGroups
@@ -2453,7 +2455,7 @@ log_info "🛠️ Installing ROOT_SHELLS alias at $BLOCK_FILE"
 
 cat >"$BLOCK_FILE" <<'EOF'
 # ========================================================================
-# 00-security-baseline
+# FILE: 00-block-root-shell
 #
 # Global security baseline for all Linux servers joined to Active Directory.
 # This file defines command aliases and security controls that enforce
@@ -2682,9 +2684,11 @@ Cmnd_Alias SEC_ALL_CMDS = \\
 # ========================================================================
 # SECURITY ADMINISTRATORS (SEC)
 # ========================================================================
-# Security authority:
-# - Can change security posture
-# - Cannot obtain interactive root shell
+# Scope:
+# - Security configuration only
+# - Authentication, authorization, identity and credentials
+# - No operational administration
+# - No interactive root shell
 # ========================================================================
 %$SEC_ALL ALL=(root) NOPASSWD: SEC_ALL_CMDS, !ROOT_SHELLS
 %$SEC     ALL=(root) NOPASSWD: SEC_ALL_CMDS, !ROOT_SHELLS
@@ -2693,16 +2697,30 @@ Cmnd_Alias SEC_ALL_CMDS = \\
 # ========================================================================
 # OPERATIONAL ADMINISTRATORS (ADM)
 # ========================================================================
-# ADM = ALL privileges minus:
-#   - Security posture changes
-#   - Root shell escalation
-#
-# Applies to both:
-#   - Global operational admins   (%ADM_ALL)
-#   - Host-level operational admins (%ADM)
+# Scope:
+# - Full operational administration
+# - Explicitly excluded from security posture changes
+# - No interactive root shell
 # ========================================================================
-%$ADM_ALL ALL=(ALL) NOPASSWD: ALL, !SEC_ALL_CMDS, !ROOT_SHELLS
-%$ADM     ALL=(ALL) NOPASSWD: ALL, !SEC_ALL_CMDS, !ROOT_SHELLS
+%$ADM_ALL ALL=(root) NOPASSWD: ALL, !SEC_ALL_CMDS, !ROOT_SHELLS
+%$ADM     ALL=(root) NOPASSWD: ALL, !SEC_ALL_CMDS, !ROOT_SHELLS
+
+
+# ========================================================================
+# FULL ADMINISTRATORS (SUPER)
+# ========================================================================
+# Scope:
+# - Full operational administration
+# - Full security administration
+# - Union of ADM and SEC privileges
+# - No interactive root shell
+#
+# NOTE:
+# - Membership in SUPER replaces ADM and SEC
+# - Users must NOT be assigned to ADM and SEC simultaneously
+# ========================================================================
+%$SUPER_ALL ALL=(root) NOPASSWD: ALL, !ROOT_SHELLS
+%$SUPER     ALL=(root) NOPASSWD: ALL, !ROOT_SHELLS
 EOF
 chmod 440 "$SUDOERS_AD"
 
