@@ -1240,7 +1240,7 @@ LDAP_OUT=$(ldapsearch -Y GSSAPI -N -LLL -o ldif-wrap=no \
       -b "$OU" -s base "(objectClass=*)" dn 2>&1)
 LDAP_RC=$?
 
-# 3. Restaura proteções globais
+# 3. Restaura proteções globais IMEDIATAMENTE
 set -e
 trap "$ERROR_TRAP_CMD" ERR
 
@@ -1262,7 +1262,7 @@ elif echo "$LDAP_OUT" | grep -qi "No such object"; then
     LDAP_RC=$?
     set -e; trap "$ERROR_TRAP_CMD" ERR
     
-    # Se o fallback também falhar, aborta.
+    # Se o fallback também falhar, aborta (Rigoroso)
     if [[ $LDAP_RC -ne 0 ]]; then
          if $VERBOSE; then log_info "🐛 Fallback Debug: $LDAP_OUT"; fi
          log_error "Target OU not found and Fallback OU validation failed (Code $LDAP_RC)." 4
