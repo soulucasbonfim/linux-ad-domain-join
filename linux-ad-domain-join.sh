@@ -1231,7 +1231,7 @@ set +e
 LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
     -H "ldap://${DC_SERVER}" \
     -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
-    -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>/dev/null)
+    -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
 LDAP_CODE=$?
 set -e
 
@@ -1245,7 +1245,7 @@ if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
     LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
         -H "ldap://${DC_SERVER}" \
         -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
-        -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>/dev/null)
+        -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
     LDAP_CODE=$?
     set -e
 
