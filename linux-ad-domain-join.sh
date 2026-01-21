@@ -1127,7 +1127,7 @@ create_secret_passfile() {
 
     # Ensure tools support safe password file usage (ldapsearch -y)
     if command -v ldapsearch >/dev/null 2>&1; then
-        if ! ldapsearch -h 2>&1 | grep -qE '(^|[[:space:]])-y([[:space:]]|,|$)'; then
+        if ! (command ldapsearch --help 2>&1 || command ldapsearch -? 2>&1 || true) | grep -qE -- '(^|[[:space:]])-y([[:space:]]|,|$)'; then
             log_error "ldapsearch does not support -y (password file). Refusing insecure -w usage." 1
         fi
     fi
