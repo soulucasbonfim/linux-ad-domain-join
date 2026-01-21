@@ -1223,71 +1223,56 @@ if [[ "$OU" != *"DC="* ]]; then
 fi
 
 # -------------------------------------------------------------------------
-# Validate OU existence (Strict Mode)
+# Validate OU existence (Inline Strict Mode)
 # -------------------------------------------------------------------------
 log_info "🔍 Checking OU: $OU"
 
-check_ou_strict() {
-    local target="$1"
-    local out rc
-    
-    # Desliga traps temporariamente para capturar o código de retorno sem matar o script
-    trap - ERR
-    set +e
-    
-    # Flags cruciais:
-    # -Y GSSAPI: Usa o ticket Kerberos (já que kinit funcionou)
-    # -N: NÃO canonicaliza o hostname (evita o erro 254/DNS reverso)
-    # -s base: Busca rápida apenas no objeto alvo
-    out=$(ldapsearch -Y GSSAPI -N -LLL -o ldif-wrap=no \
-          -H "ldap://${DC_SERVER}" \
-          -b "$target" -s base "(objectClass=*)" dn 2>&1)
-    
-    rc=$?
-    
-    # Restaura traps imediatamente
-    set -e
-    trap "$ERROR_TRAP_CMD" ERR
-    
-    if [[ $rc -eq 0 ]]; then
-        return 0 # Sucesso
-    elif echo "$out" | grep -qi "No such object"; then
-        return 32 # Falha específica: Objeto não encontrado (permite fallback)
-    else
-        # Falha técnica real (Erro 254 persistente, 49, timeout, etc)
-        # Loga o erro detalhado para debug antes de retornar o código
-        if $VERBOSE; then log_info "🐛 LDAP Debug Output: $out"; fi
-        return $rc 
-    fi
-}
+# 1. Desliga proteções globais para executar o teste sem crash
+trap - ERR
+set +e
 
-# 1. Tenta a OU principal
-check_ou_strict "$OU"
-ou_rc=$?
+# 2. Executa validação na OU Principal
+# -Y GSSAPI: Usa ticket Kerberos
+# -N: Tenta forçar não-canonicalização (ajuda no erro 254)
+# -s base: Busca rápida
+LDAP_OUT=$(ldapsearch -Y GSSAPI -N -LLL -o ldif-wrap=no \
+      -H "ldap://${DC_SERVER}" \
+      -b "$OU" -s base "(objectClass=*)" dn 2>&1)
+LDAP_RC=$?
 
-if [[ $ou_rc -eq 0 ]]; then
+# 3. Restaura proteções globais
+set -e
+trap "$ERROR_TRAP_CMD" ERR
+
+# 4. Analisa o resultado
+if [[ $LDAP_RC -eq 0 ]]; then
     log_info "✅ OU verified via AD."
 
-elif [[ $ou_rc -eq 32 ]]; then
-    # Caso: OU não existe -> Tenta Fallback
+elif echo "$LDAP_OUT" | grep -qi "No such object"; then
+    # Erro 32: OU não existe -> Tenta Fallback
     log_info "⚠ OU not found (LDAP Code 32) - applying fallback"
     OU="CN=Computers,${DOMAIN_DN}"
     log_info "↪ Using fallback: $OU"
     
-    # 2. Valida o Fallback (Rigoroso: se o fallback falhar, aborta)
-    check_ou_strict "$OU"
-    fallback_rc=$?
+    # Validação do Fallback (também inline e segura)
+    trap - ERR; set +e
+    LDAP_OUT=$(ldapsearch -Y GSSAPI -N -LLL -o ldif-wrap=no \
+          -H "ldap://${DC_SERVER}" \
+          -b "$OU" -s base "(objectClass=*)" dn 2>&1)
+    LDAP_RC=$?
+    set -e; trap "$ERROR_TRAP_CMD" ERR
     
-    if [[ $fallback_rc -ne 0 ]]; then
-        # Se nem o fallback existe ou deu erro técnico, aborta.
-        log_error "Target OU not found and Fallback OU validation failed (Code $fallback_rc)." 4
+    # Se o fallback também falhar, aborta.
+    if [[ $LDAP_RC -ne 0 ]]; then
+         if $VERBOSE; then log_info "🐛 Fallback Debug: $LDAP_OUT"; fi
+         log_error "Target OU not found and Fallback OU validation failed (Code $LDAP_RC)." 4
     fi
-    # Se chegou aqui, fallback é válido.
-    
+
 else
-    # Caso: Erro técnico na ferramenta (254, 49, 255, etc) na primeira OU.
-    # Como solicitado: NÃO PROSSEGUE. Aborta com o código de erro original.
-    log_error "LDAP validation failed with tool error code $ou_rc. Aborting." "$ou_rc"
+    # Erro Técnico (254, 49, etc) na OU principal
+    # Aborta imediatamente conforme solicitado
+    if $VERBOSE; then log_info "🐛 LDAP Debug Output: $LDAP_OUT"; fi
+    log_error "LDAP validation failed with tool error code $LDAP_RC. Aborting." "$LDAP_RC"
 fi
 
 # checking existing realm
