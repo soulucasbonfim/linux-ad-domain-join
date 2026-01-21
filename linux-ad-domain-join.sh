@@ -1120,7 +1120,7 @@ create_secret_passfile() {
     chmod 600 "$PASS_FILE" 2>/dev/null || true
 
     # Store password (single line). Newlines in password are not supported.
-    printf '%s\n' "$DOMAIN_PASS" > "$PASS_FILE" || log_error "Failed to write PASS_FILE" 1
+    printf '%s' "$DOMAIN_PASS" > "$PASS_FILE" || log_error "Failed to write PASS_FILE" 1
 
     # Remove from memory ASAP
     unset DOMAIN_PASS
@@ -1223,56 +1223,33 @@ if [[ "$OU" != *"DC="* ]]; then
 fi
 
 # -------------------------------------------------------------------------
-# Validate OU existence (Inline Strict Mode)
+# Validate OU existence (with fallback, simple bind)
 # -------------------------------------------------------------------------
 log_info "🔍 Checking OU: $OU"
 
-# 1. Desliga proteções globais para executar o teste sem crash
-trap - ERR
 set +e
-
-# 2. Executa validação na OU Principal
-# -Y GSSAPI: Usa ticket Kerberos
-# -N: Tenta forçar não-canonicalização (ajuda no erro 254)
-# -s base: Busca rápida
-LDAP_OUT=$(ldapsearch -Y GSSAPI -N -LLL -o ldif-wrap=no \
-      -H "ldap://${DC_SERVER}" \
-      -b "$OU" -s base "(objectClass=*)" dn 2>&1)
-LDAP_RC=$?
-
-# 3. Restaura proteções globais IMEDIATAMENTE
+LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
+    -H "ldap://${DC_SERVER}" \
+    -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
+    -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
+LDAP_CODE=$?
 set -e
-trap "$ERROR_TRAP_CMD" ERR
 
-# 4. Analisa o resultado
-if [[ $LDAP_RC -eq 0 ]]; then
-    log_info "✅ OU verified via AD."
-
-elif echo "$LDAP_OUT" | grep -qi "No such object"; then
-    # Erro 32: OU não existe -> Tenta Fallback
-    log_info "⚠ OU not found (LDAP Code 32) - applying fallback"
+if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
+    log_info "⚠ OU not found - applying fallback"
     OU="CN=Computers,${DOMAIN_DN}"
     log_info "↪ Using fallback: $OU"
-    
-    # Validação do Fallback (também inline e segura)
-    trap - ERR; set +e
-    LDAP_OUT=$(ldapsearch -Y GSSAPI -N -LLL -o ldif-wrap=no \
-          -H "ldap://${DC_SERVER}" \
-          -b "$OU" -s base "(objectClass=*)" dn 2>&1)
-    LDAP_RC=$?
-    set -e; trap "$ERROR_TRAP_CMD" ERR
-    
-    # Se o fallback também falhar, aborta (Rigoroso)
-    if [[ $LDAP_RC -ne 0 ]]; then
-         if $VERBOSE; then log_info "🐛 Fallback Debug: $LDAP_OUT"; fi
-         log_error "Target OU not found and Fallback OU validation failed (Code $LDAP_RC)." 4
-    fi
 
-else
-    # Erro Técnico (254, 49, etc) na OU principal
-    # Aborta imediatamente conforme solicitado
-    if $VERBOSE; then log_info "🐛 LDAP Debug Output: $LDAP_OUT"; fi
-    log_error "LDAP validation failed with tool error code $LDAP_RC. Aborting." "$LDAP_RC"
+    # Test fallback OU also under safe mode
+    set +e
+    LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
+        -H "ldap://${DC_SERVER}" \
+        -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
+        -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
+    LDAP_CODE=$?
+    set -e
+
+    [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]] && log_error "Invalid OU and fallback missing - aborting" 4
 fi
 
 # checking existing realm
