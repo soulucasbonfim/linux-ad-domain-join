@@ -1223,31 +1223,38 @@ if [[ "$OU" != *"DC="* ]]; then
 fi
 
 # -------------------------------------------------------------------------
-# Validate OU existence (with fallback, simple bind)
+# Validate OU existence (GSSAPI preferred, safe trap handling)
 # -------------------------------------------------------------------------
 log_info "🔍 Checking OU: $OU"
 
+# Desabilita temporariamente o trap de erro para evitar crash se a OU não existir
+trap - ERR
 set +e
-LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
+
+# ALTERAÇÃO: Trocado de -x (Simple) para -Y GSSAPI (Kerberos) pois já temos ticket
+LDAP_OUT=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
     -H "ldap://${DC_SERVER}" \
-    -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
     -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
 LDAP_CODE=$?
-set -e
 
+set -e
+trap "$ERROR_TRAP_CMD" ERR
+
+# Verifica sucesso ou falha
 if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
-    log_info "⚠ OU not found - applying fallback"
+    log_info "⚠ OU not found or access denied (Code $LDAP_CODE) - applying fallback"
     OU="CN=Computers,${DOMAIN_DN}"
     log_info "↪ Using fallback: $OU"
 
-    # Test fallback OU also under safe mode
+    # Testa o fallback (também via GSSAPI)
+    trap - ERR
     set +e
-    LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
+    LDAP_OUT=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
         -H "ldap://${DC_SERVER}" \
-        -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
         -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
     LDAP_CODE=$?
     set -e
+    trap "$ERROR_TRAP_CMD" ERR
 
     [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]] && log_error "Invalid OU and fallback missing - aborting" 4
 fi
