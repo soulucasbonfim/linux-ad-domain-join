@@ -1325,7 +1325,7 @@ log_info "✅ DNS and KDC reachability OK"
 create_secret_passfile() {
     local old_umask
     old_umask="$(umask)"              # Save current umask
-    trap 'umask "$old_umask"' RETURN  # Restore umask when the function returns
+    trap 'umask "$old_umask"; trap - RETURN' RETURN  # Restore umask when the function returns
 
     umask 077                         # Secure temp file permissions for this function only
 
@@ -1885,8 +1885,6 @@ if [[ ! -f "$NSS_FILE" ]]; then
     log_info "⚙ Creating minimal $NSS_FILE"
 
     old_umask="$(umask)"              # Save current umask
-    trap 'umask "$old_umask"' RETURN  # Restore umask when the current function returns (if inside one)
-
     umask 022                         # Ensure default readable system file permissions
 
     write_file 0644 "$NSS_FILE" <<'EOF'
@@ -1899,9 +1897,7 @@ netgroup:	files
 EOF
 
     chown root:root "$NSS_FILE" 2>/dev/null || true
-
     umask "$old_umask"                # Restore umask for the rest of the script
-    trap - RETURN                     # Clear the RETURN trap to avoid side effects
 fi
 
 # Basic access checks (after creation above to avoid false negatives)
@@ -2273,7 +2269,7 @@ LDAP_CODE=$?
 set -e
 
 # Extract DN using grep/PCRE
-CURRENT_DN=$(echo "$LDAP_OUT" | grep -oP '^distinguishedName: \K.+' || true)
+CURRENT_DN="$(printf '%s\n' "$LDAP_OUT" | sed -n 's/^distinguishedName:[[:space:]]*//p' | head -n1)"
 $VERBOSE && echo "$LDAP_OUT"
 
 if [[ -n "$CURRENT_DN" ]]; then
