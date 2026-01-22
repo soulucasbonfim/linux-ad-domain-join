@@ -177,7 +177,7 @@ if (( EUID != 0 )); then
 fi
 
 # -------------------------------------------------------------------------
-# Validate hostname length (AD supports up to 15 characters for NetBIOS)
+# Hostname validation (15-char NetBIOS limit + valid chars)
 # -------------------------------------------------------------------------
 HOSTNAME_SHORT=$(hostname -s)
 HOSTNAME_LEN=${#HOSTNAME_SHORT}
@@ -192,6 +192,10 @@ if (( HOSTNAME_LEN > 15 )); then
     echo "    2. Log off and back on (or restart the session) to apply the change."
     echo ""
     log_error "Hostname '$HOSTNAME_SHORT' has ${HOSTNAME_LEN} characters and cannot be used for domain join."
+fi
+
+if [[ ! "$HOSTNAME_SHORT" =~ ^[A-Za-z0-9-]+$ ]]; then
+    log_error "Hostname '$HOSTNAME_SHORT' contains invalid characters for AD join. Use only letters, digits, and hyphen (-)." 1
 fi
 
 # -------------------------------------------------------------------------
@@ -343,14 +347,19 @@ validate_sshd_config_or_die() {
     "$sshd_bin" -t -f "$file" || log_error "Invalid sshd_config after changes. Backup preserved; refusing to restart SSH." 1
 }
 
-# Extract the first real command (ignores VAR=VAL)
+# Extract the first real command (ignores env wrapper, flags, and VAR=VAL)
 first_bin_from_cmd() {
-    awk '{
-        for (i=1; i<=NF; i++) {
-            if ($i ~ /^[A-Za-z_][A-Za-z0-9_]*=/) continue;
-            print $i; exit
-        }
-    }' <<< "$*"
+    local arg
+    for arg in "$@"; do
+        [[ "$arg" == "env" ]] && continue
+        [[ "$arg" == -- ]] && continue
+        [[ "$arg" == -* ]] && continue
+        [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && continue
+        echo "$arg"
+        return 0
+    done
+    echo ""
+    return 1
 }
 
 # Package manager error parser
@@ -428,49 +437,131 @@ parse_pkg_error() {
     return 1
 }
 
-run_cmd(){
-    if $DRY_RUN; then echo "[DRY-RUN] $*"; else eval "$@"; fi
+# -------------------------------------------------------------------------
+# Safe command runners (no eval)
+# - run_cmd:     executes a command (array-style) and respects DRY_RUN
+# - run_cmd_logged: captures output on failure and classifies package manager errors
+# - run_cmd_logged_in: same as above, but reads stdin from a file (safe for passwords)
+# -------------------------------------------------------------------------
+print_cmd_quoted() {
+    # Print a command in a shell-escaped form for logs
+    local a
+    for a in "$@"; do
+        printf '%q ' "$a"
+    done
+}
+
+run_cmd() {
+    # Usage: run_cmd <cmd> [args...]
+    if $DRY_RUN; then
+        echo -n "[DRY-RUN] "
+        print_cmd_quoted "$@"
+        echo
+        return 0
+    fi
+    "$@"
 }
 
 run_cmd_logged() {
+    # Usage: run_cmd_logged <cmd> [args...]
+    local -a cmd=( "$@" )
+    local exec_bin="${cmd[0]}"
+    local parse_bin
+    parse_bin="$(first_bin_from_cmd "${cmd[@]}")"
+    [[ -z "$parse_bin" ]] && parse_bin="$exec_bin"
+
     if $VERBOSE; then
         set +e
-        LC_ALL=C LANG=C eval "$@"
+        LC_ALL=C LANG=C "${cmd[@]}"
         local ret=$?
         set -e
-        (( ret == 0 )) || log_error "Command failed: $* (exit $ret)" "$ret"
-        return
+        (( ret == 0 )) || log_error "Command failed: $(print_cmd_quoted "${cmd[@]}") (exit $ret)" "$ret"
+        return 0
     fi
 
-    $DRY_RUN && { echo "[DRY-RUN] $*"; return; }
+    if $DRY_RUN; then
+        echo -n "[DRY-RUN] "
+        print_cmd_quoted "${cmd[@]}"
+        echo
+        return 0
+    fi
 
-    # identify the real binary (ignores VAR=VAL)
-    local bin; bin="$(first_bin_from_cmd "$*")"
-    [[ -n "$bin" ]] || bin="${1%% *}"
-    command -v "$bin" &>/dev/null || log_error "Command not found: $bin" 127
+    command -v "$exec_bin" >/dev/null 2>&1 || log_error "Command not found: $exec_bin" 127
 
-    local tmp_out ret; tmp_out="$(mktemp)"
+    local tmp_out ret
+    tmp_out="$(mktemp)"
     set +e
-    LC_ALL=C LANG=C eval "$@" >"$tmp_out" 2>&1
+    LC_ALL=C LANG=C "${cmd[@]}" >"$tmp_out" 2>&1
     ret=$?
     set -e
 
     if (( ret != 0 )); then
-        # try to parse friendly output; if no match, show the last useful line
-        if ! parse_pkg_error "$tmp_out" "$bin"; then
-            local last; last=$(sed -n '/./p' "$tmp_out" | tail -n1 | trim_line)
+        if ! parse_pkg_error "$tmp_out" "$parse_bin"; then
+            local last
+            last="$(sed -n '/./p' "$tmp_out" | tail -n1 | trim_line)"
             [[ -n "$last" ]] && log_info "❗ $last"
         fi
         rm -f "$tmp_out"
-        log_error "Command failed: $* (exit code $ret)" "$ret"
-    else
-        local last; last=$(sed -n '/./p' "$tmp_out" | tail -n1 | trim_line)
-        rm -f "$tmp_out"
+        log_error "Command failed: $(print_cmd_quoted "${cmd[@]}") (exit code $ret)" "$ret"
     fi
+
+    rm -f "$tmp_out"
+    return 0
 }
 
-check_cmd(){
-    command -v "$1" >/dev/null || log_error "Required command '$1' not found" 1
+run_cmd_logged_in() {
+    # Usage: run_cmd_logged_in <stdin_file> <cmd> [args...]
+    local stdin_file="$1"
+    shift
+
+    local -a cmd=( "$@" )
+    local exec_bin="${cmd[0]}"
+    local parse_bin
+    parse_bin="$(first_bin_from_cmd "${cmd[@]}")"
+    [[ -z "$parse_bin" ]] && parse_bin="$exec_bin"
+
+    if $VERBOSE; then
+        set +e
+        LC_ALL=C LANG=C "${cmd[@]}" <"$stdin_file"
+        local ret=$?
+        set -e
+        (( ret == 0 )) || log_error "Command failed: $(print_cmd_quoted "${cmd[@]}") (exit $ret)" "$ret"
+        return 0
+    fi
+
+    if $DRY_RUN; then
+        echo -n "[DRY-RUN] "
+        print_cmd_quoted "${cmd[@]}"
+        echo " < $stdin_file"
+        return 0
+    fi
+
+    [[ -r "$stdin_file" ]] || log_error "stdin file not readable: $stdin_file" 1
+    command -v "$exec_bin" >/dev/null 2>&1 || log_error "Command not found: $exec_bin" 127
+
+    local tmp_out ret
+    tmp_out="$(mktemp)"
+    set +e
+    LC_ALL=C LANG=C "${cmd[@]}" <"$stdin_file" >"$tmp_out" 2>&1
+    ret=$?
+    set -e
+
+    if (( ret != 0 )); then
+        if ! parse_pkg_error "$tmp_out" "$parse_bin"; then
+            local last
+            last="$(sed -n '/./p' "$tmp_out" | tail -n1 | trim_line)"
+            [[ -n "$last" ]] && log_info "❗ $last"
+        fi
+        rm -f "$tmp_out"
+        log_error "Command failed: $(print_cmd_quoted "${cmd[@]}") (exit code $ret)" "$ret"
+    fi
+
+    rm -f "$tmp_out"
+    return 0
+}
+
+check_cmd() {
+    command -v "$1" >/dev/null 2>&1 || log_error "Required command '$1' not found" 1
 }
 
 # -------------------------------------------------------------------------
@@ -499,8 +590,135 @@ safe_realm_list() {
     rm -f "$tmp_out"
 }
 
-# distro detection
-. /etc/os-release
+# -------------------------------------------------------------------------
+# Dry-run aware file operations
+# -------------------------------------------------------------------------
+backup_file() {
+    # Usage: backup_file /path/file -> prints backup path to stdout
+    local path="$1"
+    local bak="${path}.bak.$(date +%s)"
+
+    if $DRY_RUN; then
+        log_info "[DRY-RUN] Would backup $path to $bak"
+        echo "$bak"
+        return 0
+    fi
+
+    [[ -f "$path" ]] || { echo "$bak"; return 0; }
+    cp -p -- "$path" "$bak"
+    echo "$bak"
+}
+
+write_file() {
+    # Usage: write_file <mode> <path>  (content via stdin)
+    # Uses install for permissions and parent dir creation.
+    local mode="$1"
+    local path="$2"
+
+    if $DRY_RUN; then
+        log_info "[DRY-RUN] Would write $path (mode $mode)"
+        # Consume stdin to avoid blocking callers using heredoc
+        cat >/dev/null
+        return 0
+    fi
+
+    install -m "$mode" -o root -g root -D /dev/stdin "$path"
+}
+
+append_line() {
+    # Usage: append_line <path> <line>
+    local path="$1"
+    local line="$2"
+
+    if $DRY_RUN; then
+        log_info "[DRY-RUN] Would append to $path: $line"
+        return 0
+    fi
+
+    printf '%s\n' "$line" >>"$path"
+}
+
+# -------------------------------------------------------------------------
+# OS metadata loader (os-release with legacy fallbacks)
+# - Prefers /etc/os-release, then /usr/lib/os-release
+# - Falls back to common legacy release files if os-release is missing
+# -------------------------------------------------------------------------
+load_os_release() {
+    local f pretty ver
+
+    for f in /etc/os-release /usr/lib/os-release; do
+        if [[ -r "$f" ]]; then
+            # shellcheck source=/dev/null
+            . "$f"
+            [[ -n "${ID:-}" ]] || log_error "OS release file loaded but ID is empty: $f" 1
+            return 0
+        fi
+    done
+
+    # Legacy fallbacks
+    if [[ -r /etc/redhat-release ]]; then
+        pretty="$(cat /etc/redhat-release)"
+        ver="$(grep -Eo '[0-9]+(\.[0-9]+)?' /etc/redhat-release | head -n1)"
+        PRETTY_NAME="$pretty"
+        VERSION_ID="${ver:-0}"
+
+        case "$pretty" in
+            *Rocky*|*rocky*)       ID="rocky" ;;
+            *AlmaLinux*|*alma*)    ID="almalinux" ;;
+            *CentOS*|*centos*)     ID="centos" ;;
+            *Oracle*|*oracle*)     ID="ol" ;;
+            *Amazon*Linux*|*amzn*) ID="amzn" ;;
+            *Red\ Hat*|*redhat*|*RHEL*|*rhel*) ID="rhel" ;;
+            *) ID="rhel" ;;
+        esac
+        return 0
+    fi
+
+    if [[ -r /etc/oracle-release ]]; then
+        PRETTY_NAME="$(cat /etc/oracle-release)"
+        VERSION_ID="$(grep -Eo '[0-9]+(\.[0-9]+)?' /etc/oracle-release | head -n1)"
+        ID="ol"
+        return 0
+    fi
+
+    if [[ -r /etc/centos-release ]]; then
+        PRETTY_NAME="$(cat /etc/centos-release)"
+        VERSION_ID="$(grep -Eo '[0-9]+(\.[0-9]+)?' /etc/centos-release | head -n1)"
+        ID="centos"
+        return 0
+    fi
+
+    if [[ -r /etc/SuSE-release ]]; then
+        PRETTY_NAME="$(head -n1 /etc/SuSE-release)"
+        VERSION_ID="$(grep -Eo '[0-9]+(\.[0-9]+)?' /etc/SuSE-release | head -n1)"
+        ID="sles"
+        return 0
+    fi
+
+    log_error "Unable to detect OS release metadata (missing os-release and legacy release files)." 1
+}
+
+validate_allowgroups_tokens() {
+    local raw="${1:-}"
+    local bad=()
+
+    [[ -z "$raw" || "$raw" == "(none)" ]] && return 0
+
+    # tokens separados por espaço
+    for g in $raw; do
+        # sshd AllowGroups e nomes POSIX/SSSD típicos
+        [[ "$g" =~ ^[A-Za-z0-9._-]+$ ]] || bad+=("$g")
+    done
+
+    if (( ${#bad[@]} > 0 )); then
+        log_error "GLOBAL_ADMIN_GROUPS contains invalid token(s): ${bad[*]}. Use AD sAMAccountName (no spaces; allowed: A-Z a-z 0-9 . _ -)." 1
+    fi
+}
+
+# -------------------------------------------------------------------------
+# OS detection
+# -------------------------------------------------------------------------
+load_os_release
 case "$ID" in
     ubuntu|debian) OS_FAMILY=debian; PKG=apt; SSH_G=sudo ;;
 	rhel|rocky|almalinux) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
@@ -628,40 +846,33 @@ fi
 # -------------------------------------------------------------------------
 install_missing_deps() {
     # Define the list of packages to install from the function arguments first
-    local to_install=( "$@" )
-	
-	# ---------------------------------------------------------------------
+    local -a to_install=( "$@" )
+
     # Enforce connectivity check result before installation
-    # ---------------------------------------------------------------------
-    if [[ "$HAS_INTERNET" == "false" ]]; then
+    if [[ "${HAS_INTERNET}" == "false" ]]; then
         log_error "System is offline and missing required packages: ${to_install[*]}" 100
     fi
-	
+
     log_info "🔌 Installing missing packages: ${to_install[*]}"
     $VERBOSE && log_info "🧬 install_missing_deps() entered with args: $*"
-	
-    # Proceed directly with the installation command.
-	# 'dnf/yum install' is more resilient than 'repolist' and can handle partial repo outages.
-	# Includes protections identified during field debugging.
+
     case "$PKG" in
         apt)
-            run_cmd_logged "DEBIAN_FRONTEND=noninteractive apt-get update -qq"
-            run_cmd_logged "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${to_install[*]}"
+            run_cmd_logged env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            run_cmd_logged env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${to_install[@]}"
             ;;
         yum|dnf)
-            # Start with flags common to both yum and dnf
-            local extra_flags="--noplugins"
-			
-            # Add dnf-only flags
+            # Use flags as an array (no word-splitting issues)
+            local -a extra_flags=( --noplugins )
             if [[ "$PKG" == "dnf" ]]; then
-                extra_flags+=" -4"
+                extra_flags+=( -4 )
             fi
-            run_cmd_logged "$PKG install $extra_flags -y ${to_install[*]}"
-			;;
-        zypper)
-            run_cmd_logged "$PKG install -n ${to_install[*]}"
+            run_cmd_logged "$PKG" install "${extra_flags[@]}" -y "${to_install[@]}"
             ;;
-		*)
+        zypper)
+            run_cmd_logged "$PKG" install -n "${to_install[@]}"
+            ;;
+        *)
             log_error "Unsupported package manager: $PKG" 101
             ;;
     esac
@@ -816,7 +1027,8 @@ if $NONINTERACTIVE; then
     : "${SESSION_TIMEOUT_SECONDS:?SESSION_TIMEOUT_SECONDS required (seconds)}"
     : "${PERMIT_ROOT_LOGIN:?PERMIT_ROOT_LOGIN required (yes|no)}"
 
-    # Validate + normalize
+    # Normalize and validate inputs
+    validate_allowgroups_tokens "$GLOBAL_ADMIN_GROUPS"
     require_uint_range "SESSION_TIMEOUT_SECONDS" "$SESSION_TIMEOUT_SECONDS" 30 86400
     PERMIT_ROOT_LOGIN="$(normalize_yes_no "$PERMIT_ROOT_LOGIN")"
     [[ -n "$PERMIT_ROOT_LOGIN" ]] || log_error "PERMIT_ROOT_LOGIN must be yes or no" 1
@@ -879,6 +1091,7 @@ else
 
     # handle optional input gracefully
     [[ -z "$GLOBAL_ADMIN_GROUPS" ]] && GLOBAL_ADMIN_GROUPS="(none)"
+    validate_allowgroups_tokens "$GLOBAL_ADMIN_GROUPS"
 
     # Session timeout (SSH + Shell) in seconds
     default_SESSION_TIMEOUT_SECONDS=900
@@ -1189,7 +1402,7 @@ else
     elif grep -qiE 'Password incorrect|Preauthentication failed' "$KRB_TRACE"; then
         log_error "Invalid credentials (authentication rejected by KDC)" 2
 	elif grep -qiE 'Client not found in Kerberos database' "$KRB_TRACE"; then
-        log_error "User principal not found in Active Directory or wrong realm specified" 23
+        log_error "User principal not found in Active Directory or wrong realm specified" 23
     else
         last_msg=$(grep -E 'krb5|KRB5|error|revoked|denied' "$KRB_TRACE" | tail -n 1 | sed -E 's/\s+/ /g')
         [[ -n "$last_msg" ]] && log_info "ℹ Last trace line: $last_msg"
@@ -1332,8 +1545,7 @@ DOMAIN_LOWER="${DOMAIN,,}"
 
 # Backup existing krb5.conf if present
 if [[ -f "$KRB_CONF" ]]; then
-    KRB_BAK="${KRB_CONF}.bak.$(date +%s)"
-    cp -p "$KRB_CONF" "$KRB_BAK"
+    KRB_BAK="$(backup_file "$KRB_CONF")"
     log_info "💾 Backup created: $KRB_BAK"
 fi
 
@@ -1349,7 +1561,7 @@ fi
 # -------------------------------------------------------------------------
 if dig +short _kerberos._tcp."$DOMAIN" SRV | grep -qE '^[0-9]'; then
     log_info "🌐 SRV records found for $DOMAIN - enabling DNS-based KDC discovery"
-    cat >"$KRB_CONF" <<EOF
+    write_file 0644 "$KRB_CONF" <<EOF
 [libdefaults]
     default_realm = $REALM_UPPER
     dns_lookup_realm = true
@@ -1370,7 +1582,7 @@ if dig +short _kerberos._tcp."$DOMAIN" SRV | grep -qE '^[0-9]'; then
 EOF
 else
     log_info "⚠️ No SRV records found for $DOMAIN - using static KDC configuration ($DC_SERVER)"
-    cat >"$KRB_CONF" <<EOF
+    write_file 0644 "$KRB_CONF" <<EOF
 [libdefaults]
     default_realm = $REALM_UPPER
     dns_lookup_realm = false
@@ -1404,21 +1616,21 @@ log_info "🔑 Configuring PAM for SSSD login and mkhomedir"
 
 case $OS_FAMILY in
 	debian)
-		run_cmd_logged "pam-auth-update --enable sss mkhomedir --force"
+		run_cmd_logged pam-auth-update --enable sss mkhomedir --force
 	;;
 	rhel)
 		RHEL_MAJOR=$(rpm -q --qf '%{VERSION}' $(rpm -qf /etc/redhat-release) | cut -d. -f1)
 		if (( RHEL_MAJOR < 8 )); then
 			# RHEL/CentOS/OL 6–7 -> authconfig
-			run_cmd_logged "LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --update"
+            run_cmd_logged env LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --update
 		else
 			# RHEL/OL 8+ -> authselect
-			run_cmd_logged "authselect select sssd with-mkhomedir --force"
-			run_cmd_logged "systemctl enable --now oddjobd"
+			run_cmd_logged authselect select sssd with-mkhomedir --force
+			run_cmd_logged systemctl enable --now oddjobd
 		fi
 	;;
 	suse)
-		run_cmd_logged "pam-config -a --sss --mkhomedir"
+		run_cmd_logged pam-config -a --sss --mkhomedir
 	;;
 	*)
 		log_info "⚠ Unsupported OS_FAMILY for PAM automation: $OS_FAMILY"
@@ -1483,8 +1695,8 @@ EOF
         fi
 
         log_info "🔄 Updating system management daemons (systemd and D-Bus)"
-        run_cmd_logged "systemctl daemon-reexec || true"
-        run_cmd_logged "systemctl daemon-reload || true"
+        run_cmd systemctl daemon-reexec || true
+        run_cmd systemctl daemon-reload || true
 
         # Attempt to notify D-Bus to reload configuration
         if systemctl is-active --quiet dbus.service 2>/dev/null || systemctl is-active --quiet messagebus.service 2>/dev/null; then
@@ -1502,7 +1714,7 @@ EOF
     # Ensure oddjobd service is enabled and active (RHEL/OL 6–9)
     if ! systemctl is-enabled --quiet "$ODDJOB_SERVICE" 2>/dev/null; then
         log_info "🔧 Enabling $ODDJOB_SERVICE"
-        run_cmd_logged "systemctl enable $ODDJOB_SERVICE || true"
+        run_cmd systemctl enable "$ODDJOB_SERVICE" || true
     fi
 
     # Retry start sequence for legacy systemd versions (slow registration)
@@ -1515,7 +1727,7 @@ EOF
         fi
         current_try=$((retry_count + 1))
         log_info "🔁 Starting $ODDJOB_SERVICE (attempt ${current_try}/${max_retries})"
-        run_cmd_logged "systemctl start $ODDJOB_SERVICE || true"
+        run_cmd systemctl start  "$ODDJOB_SERVICE" || true
         sleep 2
         retry_count=$((retry_count + 1))
     done
@@ -1578,13 +1790,14 @@ for file in "${PAM_FILES[@]}"; do
 	fi
 
 	PAM_BACKUP="${file}.bak.$(date +%Y%m%d%H%M%S)"
-	run_cmd "cp -p \"$file\" \"$PAM_BACKUP\"" && log_info "💾 Backup saved: $PAM_BACKUP"
+	run_cmd cp -p -- "$file" "$PAM_BACKUP"
+    log_info "💾 Backup saved: $PAM_BACKUP"
 
 	# Disable legacy PAM modules (safe-comment)
 	if grep -Eq 'pam_(ldap|winbind|nis)\.so' "$file"; then
-		run_cmd_logged "sed -i '/pam_ldap\\.so/s/^/# disabled legacy -> /' \"$file\""
-		run_cmd_logged "sed -i '/pam_winbind\\.so/s/^/# disabled legacy -> /' \"$file\""
-		run_cmd_logged "sed -i '/pam_nis\\.so/s/^/# disabled legacy -> /' \"$file\""
+        run_cmd_logged sed -i '/pam_ldap\.so/s/^/# disabled legacy -> /' "$file"
+        run_cmd_logged sed -i '/pam_winbind\.so/s/^/# disabled legacy -> /' "$file"
+        run_cmd_logged sed -i '/pam_nis\.so/s/^/# disabled legacy -> /' "$file"
 	fi
 
 	# Guarantee pam_sss.so presence per section
@@ -1612,7 +1825,7 @@ done
 # Re-run consistency for RHEL-like systems
 if [[ "$OS_FAMILY" =~ ^(rhel)$ ]]; then
 	if command -v authconfig >/dev/null 2>&1; then
-		run_cmd_logged "LANG=C LC_ALL=C authconfig --update"
+		run_cmd_logged env LANG=C LC_ALL=C authconfig --update
 	fi
 fi
 
@@ -1722,7 +1935,7 @@ fi
 
 # Backup prior to modifications
 NSS_BACKUP="${NSS_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-run_cmd "cp -p \"$NSS_FILE\" \"$NSS_BACKUP\""
+run_cmd cp -p -- "$NSS_FILE" "$NSS_BACKUP"
 log_info "💾 Backup saved as $NSS_BACKUP"
 
 # -------------------------------------------------------------------------
@@ -1828,7 +2041,7 @@ getent group root >/dev/null || log_info "⚠ NSS runtime check (group) inconclu
 
 # If legacy nslcd is present, stop it to avoid conflicts with SSSD
 if command -v systemctl &>/dev/null; then
-	systemctl list-units --type=service 2>/dev/null | grep -q '^nslcd\.service' && run_cmd_logged "systemctl stop nslcd || true"
+	systemctl list-units --type=service 2>/dev/null | grep -q '^nslcd\.service' && run_cmd systemctl stop nslcd || true
 fi
 
 # Restart order: SSSD first (reads nsswitch/sssd.conf), then NSCD to clear caches
@@ -1836,12 +2049,12 @@ if command -v systemctl &>/dev/null; then
 	# 1. SSSD
 	if systemctl list-unit-files 2>/dev/null | grep -q '^sssd' || systemctl is-active sssd &>/dev/null; then
 		log_info "🔄 Restarting SSSD"
-		run_cmd_logged "systemctl restart sssd || true"
+		run_cmd systemctl restart sssd || true
 	fi
 	# 2. NSCD
 	if systemctl list-unit-files 2>/dev/null | grep -q '^nscd' || systemctl is-active nscd &>/dev/null; then
 		log_info "🔄 Restarting NSCD"
-		run_cmd_logged "systemctl restart nscd || true"
+		run_cmd systemctl restart nscd || true
 	fi
 else
 	# Non-systemd fallback
@@ -1872,10 +2085,12 @@ if [[ "$OS_FAMILY" == "rhel" ]]; then
 
 		# Detect presence of pam_ldap.so
 		if grep -q "pam_ldap.so" "$pamfile"; then
-			run_cmd_logged "sed -i 's/^[[:space:]]*auth.*pam_ldap\\.so/# &/; \
-			                s/^[[:space:]]*account.*pam_ldap\\.so/# &/; \
-			                s/^[[:space:]]*password.*pam_ldap\\.so/# &/; \
-			                s/^[[:space:]]*session.*pam_ldap\\.so/# &/' \"$pamfile\""
+			run_cmd_logged sed -i \
+            -e 's/^[[:space:]]*auth.*pam_ldap\.so/# &/' \
+            -e 's/^[[:space:]]*account.*pam_ldap\.so/# &/' \
+            -e 's/^[[:space:]]*password.*pam_ldap\.so/# &/' \
+            -e 's/^[[:space:]]*session.*pam_ldap\.so/# &/' \
+            "$pamfile"
 		else
 			[[ $VERBOSE == true ]] && log_info "ℹ No pam_ldap.so entries in $(basename "$pamfile")"
 		fi
@@ -1901,16 +2116,14 @@ fi
 
 # Backup or initialize chrony.conf
 if [[ -f "$chrony_conf" ]]; then
-    cp "$chrony_conf" "${chrony_conf}.bak"
-    log_info "💾 Backup of chrony.conf saved as ${chrony_conf}.bak"
+    CHRONY_BAK="$(backup_file "$chrony_conf")"
+    log_info "💾 Backup of chrony.conf saved as $CHRONY_BAK"
 else
     log_info "⚠️ File $chrony_conf not found. Creating a new one from scratch"
-    mkdir -p "$(dirname "$chrony_conf")"
-    touch "$chrony_conf"
 fi
 
 # Write new configuration (universal minimal config)
-cat >"$chrony_conf" <<EOF
+write_file 0644 "$chrony_conf" <<EOF
 server $NTP_SERVER iburst
 driftfile /var/lib/chrony/drift
 makestep 1.0 3
@@ -1946,12 +2159,21 @@ if [[ "$chrony_service" == "chronyd" && "$(readlink -f /etc/systemd/system/chron
     chrony_service="chrony"
 fi
 
+# Disable conflicting NTP services (systemd-timesyncd)
+if systemctl list-unit-files 2>/dev/null | grep -q 'systemd-timesyncd.service'; then
+    if systemctl is-active --quiet systemd-timesyncd; then
+        log_info "🛑 Stopping systemd-timesyncd to allow Chrony to take over"
+        run_cmd systemctl stop systemd-timesyncd
+        run_cmd systemctl disable systemd-timesyncd
+    fi
+fi
+
 # Enable and restart safely
 log_info "🔧 Enabling Chrony"
-run_cmd_logged "systemctl enable --now $chrony_service"
+run_cmd_logged systemctl enable --now "$chrony_service"
 
 log_info "🔄 Restarting Chrony"
-run_cmd "systemctl restart $chrony_service"
+run_cmd systemctl restart "$chrony_service"
 
 # -------------------------------------------------------------------------
 # Wait for NTP synchronization (Chrony only, Debian/RHEL compatible)
@@ -2046,7 +2268,7 @@ if [[ -n "$CURRENT_DN" ]]; then
 
         # Prepare LDIF for move operation
         TMP_LDIF=$(mktemp)
-        cat >"$TMP_LDIF" <<EOF
+        write_file 0644 "$TMP_LDIF" <<EOF
 dn: $CURRENT_DN
 changetype: modrdn
 newrdn: CN=${HOST_SHORT_U}
@@ -2142,7 +2364,17 @@ if timeout 90s adcli join \
     --add-service-principal="host/${HOST_SHORT_U}" \
     --add-service-principal="host/${HOST_FQDN}" \
     --show-details <"$PASS_FILE" >"$JOIN_LOG" 2>&1; then
+
     log_info "✅ Joined domain successfully via adcli (DC: $DC_SERVER, IP: ${DC_IP:-unknown})"
+
+    # adcli testjoin (non-fatal)
+    if command -v adcli >/dev/null 2>&1; then
+        if adcli testjoin --domain="$DOMAIN" >/dev/null 2>&1; then
+            log_info "✅ adcli testjoin: OK"
+        else
+            log_info "⚠️ adcli testjoin failed (non-fatal). Keytab trust check will be authoritative."
+        fi
+    fi
 else
     log_info "❌ Domain join failed. Last output lines:"
     tail -n 5 "$JOIN_LOG" | sed -E 's/^[[:space:]]+//'
@@ -2163,7 +2395,7 @@ if [[ -n "$HOST_IP" ]]; then
 
     TMP_LDIF=$(mktemp)
 	timestamp=$(date '+%Y-%m-%dT%H:%M:%S%z')
-    cat >"$TMP_LDIF" <<EOF
+    write_file 0644 "$TMP_LDIF" <<EOF
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: description
@@ -2209,10 +2441,9 @@ log_info "ℹ Obtaining Kerberos ticket for synchronization"
 kinit "${DOMAIN_USER}@${REALM}" <"$PASS_FILE" >/dev/null 2>&1 || \
     log_error "Failed to obtain Kerberos ticket for ${DOMAIN_USER}@${REALM}" 2
 
-# Temporarily relax -e and disable ERR trap to classify kinit failures
-__old_opts="$(set +o)"    # Save current 'set' options
-set +e +o pipefail
+# Save and disable global ERR trap during trust validation
 trap - ERR
+set +e +o pipefail
 
 # -------------------------------------------------------------------------
 # Validate machine Kerberos keytab (domain trust check)
@@ -2274,15 +2505,8 @@ fi
 kdestroy -q 2>/dev/null || true
 rm -f "$KRB_LOG" 2>/dev/null || true
 
-# -------------------------------------------------------------------------
-# Restore original shell options and ERR trap after trust validation
-# -------------------------------------------------------------------------
-if [[ -n "${__old_opts:-}" ]]; then
-    eval "$__old_opts"
-    unset __old_opts
-fi
-
-# Restore the global ERR trap explicitly using the predefined command
+# Restore global error trap
+set -e -o pipefail
 trap "$ERROR_TRAP_CMD" ERR
 
 # -------------------------------------------------------------------------
@@ -2351,8 +2575,12 @@ if [[ -f $SSSD_CONF ]]; then
     cp -p "$SSSD_CONF" "$bak"
 fi
 
+# Set debug level
+SSSD_DEBUG_LEVEL=0
+$VERBOSE && SSSD_DEBUG_LEVEL=9
+
 log_info "🛠️ Writing SSSD configuration (auto-discovery mode for DNS updates)"
-cat >"$SSSD_CONF" <<EOF
+write_file 0600 "$SSSD_CONF" <<EOF
 # ============================================================================
 # File:        /etc/sssd/sssd.conf
 # Description: SSSD configuration generated automatically by linux-ad-domain-join.sh
@@ -2394,7 +2622,7 @@ realmd_tags = manages-system joined-with-adcli
 # -------------------------------------------------------------------------
 # General settings
 # -------------------------------------------------------------------------
-debug_level = 9
+debug_level = $SSSD_DEBUG_LEVEL
 cache_credentials = True
 enumerate = False
 ldap_id_mapping = True
@@ -2418,8 +2646,9 @@ dyndns_ttl = 3600
 dyndns_update_ptr = True
 EOF
 
-run_cmd "chmod 600 $SSSD_CONF"
-run_cmd "chown root:root $SSSD_CONF"
+# Ownership is enforced by write_file (install -o/-g), but keep a safety check
+run_cmd chown root:root "$SSSD_CONF"
+run_cmd chmod 600 "$SSSD_CONF"
 
 # -------------------------------------------------------------------------
 # Optional: flush old caches before restart
@@ -2533,10 +2762,10 @@ EOF
 fi
 
 log_info "🔧 Enabling SSSD"
-run_cmd_logged "systemctl enable sssd"
+run_cmd_logged systemctl enable sssd
 
 log_info "🔄 Restarting SSSD"
-run_cmd_logged "systemctl restart sssd"
+run_cmd_logged systemctl restart sssd
 
 # -------------------------------------------------------------------------
 # Restarts systemd-logind to refresh PAM and D-Bus session handling
@@ -2554,11 +2783,11 @@ if command -v systemctl &>/dev/null; then
         log_info "✅ Systemd detected. Attempting restart of ${LOGIND_UNIT} to refresh PAM/D-Bus"
         
         # Attempt a full restart first (most reliable)
-        if run_cmd "systemctl restart ${LOGIND_UNIT}" &>/dev/null; then
+        if run_cmd systemctl restart "$LOGIND_UNIT" >/dev/null 2>&1; then
             log_info "🚀 ${LOGIND_UNIT} restarted successfully."
         else
             log_info "⚠️ Failed to restart ${LOGIND_UNIT}. Attempting safe reload instead."
-            if run_cmd "systemctl reload ${LOGIND_UNIT}" &>/dev/null; then
+            if run_cmd systemctl reload "$LOGIND_UNIT" >/dev/null 2>&1; then
                 log_info "🚀 ${LOGIND_UNIT} reloaded successfully."
             else
                 log_info "🛑 Failed to restart or reload ${LOGIND_UNIT}. Continuing script execution."
@@ -2624,16 +2853,16 @@ ALLOW_GROUPS="$(echo "$ALLOW_GROUPS" | xargs)"
 
 # Apply AllowGroups config
 if grep -q '^AllowGroups' "$cfg"; then
-    run_cmd "sed -i \"/^AllowGroups/c\\AllowGroups $ALLOW_GROUPS\" $cfg"
+    run_cmd sed -i "/^AllowGroups/c\\AllowGroups $ALLOW_GROUPS" "$cfg"
 else
-    run_cmd "echo \"AllowGroups $ALLOW_GROUPS\" >> $cfg"
+    append_line "$cfg" "AllowGroups $ALLOW_GROUPS"
 fi
 log_info "🧩 AllowGroups updated -> AllowGroups $ALLOW_GROUPS"
 
 if grep -q '^PasswordAuthentication' "$cfg"; then
-    run_cmd "sed -i '/^PasswordAuthentication/c\\PasswordAuthentication yes' $cfg"
+    run_cmd sed -i "/^PasswordAuthentication/c\\PasswordAuthentication yes" "$cfg"
 else
-    run_cmd "echo 'PasswordAuthentication yes' >> $cfg"
+    append_line "$cfg" "PasswordAuthentication yes"
 fi
 
 # -------------------------------------------------------------------------
@@ -2663,9 +2892,9 @@ validate_sshd_config_or_die "$SSH_CFG"
 
 # Restart SSH safely (service name differs by distro)
 if systemctl status ssh.service &>/dev/null; then
-    run_cmd "systemctl restart ssh.service"
+    run_cmd systemctl restart ssh.service
 elif systemctl status sshd.service &>/dev/null; then
-    run_cmd "systemctl restart sshd.service"
+    run_cmd systemctl restart sshd.service
 else
     log_info "⚠️ SSH is active, but no known systemd unit found. Skipping restart."
 fi
@@ -2687,7 +2916,7 @@ mkdir -p "$SUDOERS_DIR"
 # -------------------------------------------------------------------------
 log_info "🛠️ Installing ROOT_SHELLS alias at $BLOCK_FILE"
 
-cat >"$BLOCK_FILE" <<'EOF'
+write_file 0440 "$BLOCK_FILE" <<'EOF'
 # ========================================================================
 # FILE: 00-block-root-shell
 #
@@ -2736,7 +2965,6 @@ Cmnd_Alias ROOT_SHELLS = \
 # ------------------------------------------------------------------------
 EOF
 
-chmod 440 "$BLOCK_FILE"
 visudo -cf "$BLOCK_FILE" >/dev/null 2>&1 || log_error "Invalid syntax in $BLOCK_FILE"
 
 log_info "🔒 ROOT_SHELLS alias applied"
@@ -2747,7 +2975,7 @@ log_info "🔒 ROOT_SHELLS alias applied"
 log_info "🛡️ Configuring sudoers file: $SUDOERS_AD"
 
 # Create or refresh AD admin sudoers definition
-cat >"$SUDOERS_AD" <<EOF
+write_file 0440 "$SUDOERS_AD" <<EOF
 # ========================================================================
 # FILE: 10-ad-linux-privilege-model
 #
@@ -2956,7 +3184,6 @@ Cmnd_Alias SEC_ALL_CMDS = \\
 %$SUPER_ALL ALL=(root) NOPASSWD: ALL, !ROOT_SHELLS
 %$SUPER     ALL=(root) NOPASSWD: ALL, !ROOT_SHELLS
 EOF
-chmod 440 "$SUDOERS_AD"
 
 # -------------------------------------------------------------------------
 # Normalize /etc/sudoers includes (use includedir, drop explicit includes)
