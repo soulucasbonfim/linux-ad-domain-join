@@ -91,10 +91,19 @@ scriptVersion="2.1"
 set -euo pipefail
 
 # -------------------------------------------------------------------------
+# Portable sed extended-regex flag detection (-E preferred, fallback to -r)
+# -------------------------------------------------------------------------
+SED_EXT="-E"
+if ! echo | sed -E 's/(.*)//' >/dev/null 2>&1; then
+    SED_EXT="-r"
+fi
+
+# -------------------------------------------------------------------------
 # Logging functions (ASCII-safe for non-Unicode terminals)
 # -------------------------------------------------------------------------
 sanitize_log_msg() {
-    LC_ALL=C sed -E '
+    # shellcheck disable=SC2086  # SED_EXT must be expanded as a flag (-E/-r)
+    LC_ALL=C sed $SED_EXT '
         # Warnings / Alerts
         s/⚠|⚠️|❗|❕|🚨|📛|🧯|🔥|💣|🧨/[!]/g;
         # Informational / Neutral
@@ -232,9 +241,16 @@ DRY_RUN="${DRY_RUN:-false}"
 NONINTERACTIVE="${NONINTERACTIVE:-false}"
 VERBOSE="${VERBOSE:-false}"
 
-to_lower(){ echo "$1" | tr '[:upper:]' '[:lower:]'; }
+to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
 
-trim_line(){ sed -e 's/^[[:space:]]\+//' -e 's/^[[:space:]]*[-*•][[:space:]]\+//' -e 's/[[:space:]]\+$//' -e '/[Cc]url error/ s/[[:space:]]\[[^]]*\][[:space:]]*$//'; }
+trim_line() {
+    # shellcheck disable=SC2086  # SED_EXT must be expanded as a flag (-E/-r)
+    sed $SED_EXT \
+        -e 's/^[[:space:]]+//' \
+        -e 's/^[[:space:]]*[-*•][[:space:]]+//' \
+        -e 's/[[:space:]]+$//' \
+        -e '/[Cc]url error/ s/[[:space:]]\[[^]]*][[:space:]]*$//'
+}
 
 # ==========================================================================================
 # Session timeout inputs (SSH + Shell)
@@ -438,46 +454,55 @@ parse_pkg_error() {
 }
 
 # -------------------------------------------------------------------------
-# Safe command runners (no eval)
-# - run_cmd:     executes a command (array-style) and respects DRY_RUN
-# - run_cmd_logged: captures output on failure and classifies package manager errors
-# - run_cmd_logged_in: same as above, but reads stdin from a file (safe for passwords)
+# Unified command execution (legacy+modern safe, no eval)
+# - cmd_run:      returns RC (non-fatal), respects DRY_RUN/VERBOSE, captures output on failure
+# - cmd_must:     fatal wrapper (calls log_error on non-zero RC)
+# - cmd_run_in:   same as cmd_run, but reads stdin from a file
+# - cmd_must_in:  fatal wrapper for stdin-file mode
 # -------------------------------------------------------------------------
+
 print_cmd_quoted() {
-    # Print a command in a shell-escaped form for logs
-    local a
+    # Shell-escaped single-line representation (no trailing space)
+    local a out=()
     for a in "$@"; do
-        printf '%q ' "$a"
+        out+=( "$(printf '%q' "$a")" )
     done
+    printf '%s' "${out[*]}"
 }
 
-run_cmd() {
-    # Usage: run_cmd <cmd> [args...]
-    if $DRY_RUN; then
-        echo -n "[DRY-RUN] "
-        print_cmd_quoted "$@"
-        echo
-        return 0
+_cmd_bin_exists() {
+    # Accepts either "name" or "/path/name"
+    local b="$1"
+    [[ -z "$b" ]] && return 1
+    if [[ "$b" == */* ]]; then
+        [[ -x "$b" ]]
+    else
+        command -v "$b" >/dev/null 2>&1
     fi
-    "$@"
 }
 
-run_cmd_logged() {
-    # Usage: run_cmd_logged <cmd> [args...]
+_cmd_run_capture() {
+    # Internal: runs a command (array), captures stdout+stderr into tmpfile, returns RC.
+    # Usage: _cmd_run_capture <tmp_out_path> <cmd...>
+    local tmp_out="$1"; shift
     local -a cmd=( "$@" )
-    local exec_bin="${cmd[0]}"
-    local parse_bin
-    parse_bin="$(first_bin_from_cmd "${cmd[@]}")"
-    [[ -z "$parse_bin" ]] && parse_bin="$exec_bin"
 
-    if $VERBOSE; then
-        set +e
-        LC_ALL=C LANG=C "${cmd[@]}"
-        local ret=$?
-        set -e
-        (( ret == 0 )) || log_error "Command failed: $(print_cmd_quoted "${cmd[@]}") (exit $ret)" "$ret"
-        return 0
-    fi
+    # Force C locale for predictable parsing
+    LC_ALL=C LANG=C "${cmd[@]}" >"$tmp_out" 2>&1
+    return $?
+}
+
+cmd_run() {
+    # Usage: cmd_run <cmd> [args...]
+    # Non-fatal: returns command RC. Logs failures (classified for pkg managers).
+    local -a cmd=( "$@" )
+    local first_bin exec_bin tmp_out rc
+
+    [[ ${#cmd[@]} -gt 0 ]] || { log_info "cmd_run(): empty command"; return 2; }
+
+    exec_bin="${cmd[0]}"
+    first_bin="$(first_bin_from_cmd "${cmd[@]}")"
+    [[ -z "$first_bin" ]] && first_bin="$exec_bin"
 
     if $DRY_RUN; then
         echo -n "[DRY-RUN] "
@@ -486,48 +511,90 @@ run_cmd_logged() {
         return 0
     fi
 
-    command -v "$exec_bin" >/dev/null 2>&1 || log_error "Command not found: $exec_bin" 127
+    # Validate the “real” binary, not just env-wrapper
+    if ! _cmd_bin_exists "$first_bin"; then
+        log_info "❗ Command not found: $first_bin"
+        return 127
+    fi
 
-    local tmp_out ret
-    tmp_out="$(mktemp)"
-    set +e
-    LC_ALL=C LANG=C "${cmd[@]}" >"$tmp_out" 2>&1
-    ret=$?
-    set -e
-
-    if (( ret != 0 )); then
-        if ! parse_pkg_error "$tmp_out" "$parse_bin"; then
-            local last
-            last="$(sed -n '/./p' "$tmp_out" | tail -n1 | trim_line)"
-            [[ -n "$last" ]] && log_info "❗ $last"
+    if $VERBOSE; then
+        log_info "Executing: $(print_cmd_quoted "${cmd[@]}")"
+        if LC_ALL=C LANG=C "${cmd[@]}"; then
+            return 0
+        else
+            rc=$?
+            log_info "❗ Command failed (exit $rc): $(print_cmd_quoted "${cmd[@]}")"
+            return "$rc"
         fi
+    fi
+
+    tmp_out="$(mktemp)"
+    if _cmd_run_capture "$tmp_out" "${cmd[@]}"; then
         rm -f "$tmp_out"
-        log_error "Command failed: $(print_cmd_quoted "${cmd[@]}") (exit code $ret)" "$ret"
+        return 0
+    fi
+
+    rc=$?
+
+    # Classified output for package manager errors when applicable
+    if ! parse_pkg_error "$tmp_out" "$first_bin"; then
+        # Fallback: show last non-empty line (and keep it short)
+        local last
+        last="$(sed -n '/./p' "$tmp_out" | tail -n 1 | trim_line)"
+        [[ -n "$last" ]] && log_info "❗ $last"
     fi
 
     rm -f "$tmp_out"
+    return "$rc"
+}
+
+# -------------------------------------------------------------------------
+# Strict-mode safe execution layer
+# - cmd_run/cmd_run_in: keep as-is (they return RC)
+# - cmd_try/cmd_try_in: NEVER propagate non-zero to the shell (safe under set -e)
+# - cmd_must/cmd_must_in: fatal wrappers based on CMD_LAST_RC
+# -------------------------------------------------------------------------
+
+CMD_LAST_RC=0
+
+cmd_try() {
+    # Usage: cmd_try <cmd> [args...]
+    # Never aborts the script under set -e; stores RC in CMD_LAST_RC.
+    local rc=0
+
+    trap - ERR
+    set +e
+    cmd_run "$@"
+    rc=$?
+    set -e
+    trap "$ERROR_TRAP_CMD" ERR
+
+    CMD_LAST_RC=$rc
     return 0
 }
 
-run_cmd_logged_in() {
-    # Usage: run_cmd_logged_in <stdin_file> <cmd> [args...]
+cmd_must() {
+    # Usage: cmd_must <cmd> [args...]
+    cmd_try "$@"
+    (( CMD_LAST_RC == 0 )) || log_error "Command failed: $(print_cmd_quoted "$@") (exit $CMD_LAST_RC)" "$CMD_LAST_RC"
+    return 0
+}
+
+cmd_run_in() {
+    # Usage: cmd_run_in <stdin_file> <cmd> [args...]
+    # Non-fatal: returns command RC.
     local stdin_file="$1"
     shift
 
     local -a cmd=( "$@" )
-    local exec_bin="${cmd[0]}"
-    local parse_bin
-    parse_bin="$(first_bin_from_cmd "${cmd[@]}")"
-    [[ -z "$parse_bin" ]] && parse_bin="$exec_bin"
+    local first_bin exec_bin tmp_out rc
 
-    if $VERBOSE; then
-        set +e
-        LC_ALL=C LANG=C "${cmd[@]}" <"$stdin_file"
-        local ret=$?
-        set -e
-        (( ret == 0 )) || log_error "Command failed: $(print_cmd_quoted "${cmd[@]}") (exit $ret)" "$ret"
-        return 0
-    fi
+    [[ -r "$stdin_file" ]] || { log_info "❗ stdin file not readable: $stdin_file"; return 2; }
+    [[ ${#cmd[@]} -gt 0 ]] || { log_info "cmd_run_in(): empty command"; return 2; }
+
+    exec_bin="${cmd[0]}"
+    first_bin="$(first_bin_from_cmd "${cmd[@]}")"
+    [[ -z "$first_bin" ]] && first_bin="$exec_bin"
 
     if $DRY_RUN; then
         echo -n "[DRY-RUN] "
@@ -536,29 +603,72 @@ run_cmd_logged_in() {
         return 0
     fi
 
-    [[ -r "$stdin_file" ]] || log_error "stdin file not readable: $stdin_file" 1
-    command -v "$exec_bin" >/dev/null 2>&1 || log_error "Command not found: $exec_bin" 127
+    if ! _cmd_bin_exists "$first_bin"; then
+        log_info "❗ Command not found: $first_bin"
+        return 127
+    fi
 
-    local tmp_out ret
-    tmp_out="$(mktemp)"
-    set +e
-    LC_ALL=C LANG=C "${cmd[@]}" <"$stdin_file" >"$tmp_out" 2>&1
-    ret=$?
-    set -e
-
-    if (( ret != 0 )); then
-        if ! parse_pkg_error "$tmp_out" "$parse_bin"; then
-            local last
-            last="$(sed -n '/./p' "$tmp_out" | tail -n1 | trim_line)"
-            [[ -n "$last" ]] && log_info "❗ $last"
+    if $VERBOSE; then
+        log_info "Executing: $(print_cmd_quoted "${cmd[@]}") < $stdin_file"
+        if LC_ALL=C LANG=C "${cmd[@]}" <"$stdin_file"; then
+            return 0
+        else
+            rc=$?
+            log_info "❗ Command failed (exit $rc): $(print_cmd_quoted "${cmd[@]}")"
+            return "$rc"
         fi
+    fi
+
+    tmp_out="$(mktemp)"
+    if LC_ALL=C LANG=C "${cmd[@]}" <"$stdin_file" >"$tmp_out" 2>&1; then
         rm -f "$tmp_out"
-        log_error "Command failed: $(print_cmd_quoted "${cmd[@]}") (exit code $ret)" "$ret"
+        return 0
+    fi
+
+    rc=$?
+    if ! parse_pkg_error "$tmp_out" "$first_bin"; then
+        local last
+        last="$(sed -n '/./p' "$tmp_out" | tail -n 1 | trim_line)"
+        [[ -n "$last" ]] && log_info "❗ $last"
     fi
 
     rm -f "$tmp_out"
+    return "$rc"
+}
+
+cmd_try_in() {
+    # Usage: cmd_try_in <stdin_file> <cmd> [args...]
+    local rc=0
+
+    trap - ERR
+    set +e
+    cmd_run_in "$@"
+    rc=$?
+    set -e
+    trap "$ERROR_TRAP_CMD" ERR
+
+    CMD_LAST_RC=$rc
     return 0
 }
+
+cmd_must_in() {
+    # Usage: cmd_must_in <stdin_file> <cmd> [args...]
+    cmd_try_in "$@"
+    (( CMD_LAST_RC == 0 )) || log_error "Command failed: $(print_cmd_quoted "${@:2}") < ${1} (exit $CMD_LAST_RC)" "$CMD_LAST_RC"
+    return 0
+}
+
+# -------------------------------------------------------------------------
+# Backward-compatible shims (do not remove until all call sites are migrated)
+# Semantics:
+#   run_cmd        -> non-fatal (never aborts; RC stored in CMD_LAST_RC)
+#   run_cmd_logged -> fatal on non-zero RC
+#   *_in variants  -> same behavior with stdin file
+# -------------------------------------------------------------------------
+run_cmd()             { cmd_try "$@"; }
+run_cmd_logged()      { cmd_must "$@"; }
+run_cmd_in()          { cmd_try_in "$@"; }
+run_cmd_logged_in()   { cmd_must_in "$@"; }
 
 check_cmd() {
     command -v "$1" >/dev/null 2>&1 || log_error "Required command '$1' not found" 1
@@ -638,6 +748,19 @@ append_line() {
     printf '%s\n' "$line" >>"$path"
 }
 
+write_line_file() {
+    # Usage: write_line_file <mode> <path> <single_line>
+    local mode="$1" path="$2" line="$3"
+    printf '%s\n' "$line" | write_file "$mode" "$path"
+}
+
+append_line_unique() {
+    # Usage: append_line_unique <path> <exact_line>
+    local path="$1" line="$2"
+    grep -Fxq -- "$line" "$path" 2>/dev/null && return 0
+    append_line "$path" "$line"
+}
+
 # -------------------------------------------------------------------------
 # OS metadata loader (os-release with legacy fallbacks)
 # - Prefers /etc/os-release, then /usr/lib/os-release
@@ -715,15 +838,22 @@ validate_allowgroups_tokens() {
     fi
 }
 
+get_major_version_id() {
+    local v="${VERSION_ID%%.*}"
+    if [[ "$v" =~ ^[0-9]+$ ]]; then
+        echo "$v"; return 0
+    fi
+    echo 0
+}
+
 # -------------------------------------------------------------------------
 # OS detection
 # -------------------------------------------------------------------------
 load_os_release
 case "$ID" in
     ubuntu|debian) OS_FAMILY=debian; PKG=apt; SSH_G=sudo ;;
-	rhel|rocky|almalinux) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
-	centos) OS_FAMILY=rhel; PKG=$([[ ${VERSION_ID%%.*} -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
-	oracle|ol) OS_FAMILY=rhel; VER_NUM=$(grep -Eo '[0-9]+' /etc/oracle-release | head -1); PKG=$( [ -z "$VER_NUM" ] && VER_NUM=0; [ "$VER_NUM" -lt 8 ] && echo yum || echo dnf ); SSH_G=wheel ;;
+    rhel|rocky|almalinux|centos) OS_FAMILY=rhel; ver="$(get_major_version_id)"; PKG=$([[ "$ver" -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
+    oracle|ol) OS_FAMILY=rhel; ver="$(get_major_version_id)"; [[ "$ver" -eq 0 ]] && ver="$(grep -Eo '[0-9]+' /etc/oracle-release 2>/dev/null | head -n1 || echo 0)"; PKG=$([[ "$ver" -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
     sles|suse) OS_FAMILY=suse; PKG=zypper; SSH_G=wheel ;;
     fedora) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
     amzn) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
@@ -747,7 +877,7 @@ HAS_INTERNET=false
 CONNECT_DETAILS=()
 
 # Detect default route / gateway
-DEFAULT_ROUTE=$(ip route get 1.1.1.1 2>/dev/null | awk '/via/ {print $3; exit}')
+DEFAULT_ROUTE="$(ip route get 1.1.1.1 2>/dev/null | awk '/via/ {print $3; exit}' || true)"
 if [[ -n "$DEFAULT_ROUTE" ]]; then
     CONNECT_DETAILS+=( "✅ Default route detected via gateway $DEFAULT_ROUTE" )
 else
@@ -755,7 +885,7 @@ else
 fi
 
 # Check DNS functionality (without relying on specific domains)
-DNS_SERVER=$(grep -m1 '^nameserver' /etc/resolv.conf | awk '{print $2}')
+DNS_SERVER="$(grep -m1 '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' || true)"
 if [[ -z "$DNS_SERVER" ]]; then
     CONNECT_DETAILS+=( "⚠️ No DNS servers configured in /etc/resolv.conf" )
 else
@@ -805,40 +935,44 @@ done
 # -------------------------------------------------------------------------
 if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release || -f /etc/rocky-release || -f /etc/almalinux-release ]]; then
     log_info "🧩 Checking RPM database integrity"
-	
-	release_file=""
+
+    release_file=""
     for f in /etc/redhat-release /etc/centos-release /etc/oracle-release /etc/rocky-release /etc/almalinux-release; do
         [[ -f "$f" ]] && { release_file="$f"; break; }
     done
-	
+
     if [[ -z "$release_file" ]]; then
         log_info "ℹ No release file found for rpm check, skipping RPM DB verification"
-    elif ! rpm -qf "$release_file" &>/dev/null; then
-        log_info "⚙ RPM database appears corrupted - initiating recovery"
-
-        # Backup existing RPM database
-        if [[ -d /var/lib/rpm ]]; then
-            backup_path="/var/lib/rpm.bak.$(date +%F_%H-%M)"
-            cp -a /var/lib/rpm "$backup_path" 2>/dev/null || true
-            log_info "💾 Backup created at: $backup_path"
-        fi
-
-        # Remove potential stale locks
-        rm -f /var/lib/rpm/__db.* 2>/dev/null
-
-        # Attempt rebuild
-        if rpm --rebuilddb &>/dev/null; then
-            log_info "✅ RPM database rebuilt successfully"
-        else
-            log_error "Failed to rebuild RPM database. Please investigate manually at $backup_path" 8
-        fi
-
-        # Re-test after rebuild
-        if ! rpm -qf "$release_file" &>/dev/null; then
-            log_error "RPM database still corrupted after rebuild. Aborting execution." 9
-        fi
+    elif $DRY_RUN; then
+        log_info "[DRY-RUN] Would verify rpm ownership of $release_file and rebuild RPM DB if corrupted"
     else
-        log_info "✅ RPM database integrity verified"
+        if ! rpm -qf "$release_file" &>/dev/null; then
+            log_info "⚙ RPM database appears corrupted - initiating recovery"
+
+            # Backup existing RPM database
+            if [[ -d /var/lib/rpm ]]; then
+                backup_path="/var/lib/rpm.bak.$(date +%F_%H-%M)"
+                cp -a /var/lib/rpm "$backup_path" 2>/dev/null || true
+                log_info "💾 Backup created at: $backup_path"
+            fi
+
+            # Remove potential stale locks
+            rm -f /var/lib/rpm/__db.* 2>/dev/null
+
+            # Attempt rebuild
+            if rpm --rebuilddb &>/dev/null; then
+                log_info "✅ RPM database rebuilt successfully"
+            else
+                log_error "Failed to rebuild RPM database. Please investigate manually at ${backup_path:-/var/lib/rpm.bak.*}" 8
+            fi
+
+            # Re-test after rebuild
+            if ! rpm -qf "$release_file" &>/dev/null; then
+                log_error "RPM database still corrupted after rebuild. Aborting execution." 9
+            fi
+        else
+            log_info "✅ RPM database integrity verified"
+        fi
     fi
 fi
 
@@ -1144,10 +1278,22 @@ log_info "🔍 Validating hostname and FQDN consistency"
 HOSTS_FILE="/etc/hosts"
 
 # Detect primary IPv4 address (excluding loopback interfaces)
-PRIMARY_IP=$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i!~/^127\./){print $i; exit}}')
+# Method 1: hostname -I (Modern)
+PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i!~/^127\./){print $i; exit}}' || true)"
+# Escape PRIMARY_IP for regex-safe matching (dots must be literal)
+PRIMARY_IP_RE="${PRIMARY_IP//./\\.}"
+
+# Method 2: ip route/addr (Modern/Standard)
 if [[ -z "$PRIMARY_IP" ]]; then
-    PRIMARY_IP=$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)
+    PRIMARY_IP="$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1 || true)"
 fi
+
+# Method 3: ifconfig (Legacy / Minimal RHEL 5/6) - O Fallback Solicitado
+if [[ -z "$PRIMARY_IP" ]] && command -v ifconfig >/dev/null 2>&1; then
+    # Busca o primeiro IP que não seja 127.0.0.1. Funciona em net-tools antigos.
+    PRIMARY_IP="$(ifconfig 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | awk '{print $2}' | sed 's/addr://g' | head -n1 || true)"
+fi
+
 [[ -z "$PRIMARY_IP" ]] && log_error "Unable to detect primary IP address (no active NIC found)" 15
 
 # Check for active web services (port 80 or 443)
@@ -1169,11 +1315,11 @@ fi
 if [[ -f /etc/hostname ]]; then
     CURRENT_HOSTNAME_FILE=$(< /etc/hostname)
     if [[ "$CURRENT_HOSTNAME_FILE" != "$HOST_SHORT" ]]; then
-        echo "$HOST_SHORT" > /etc/hostname
+        write_line_file 0644 /etc/hostname "$HOST_SHORT"
         log_info "🧩 Updated /etc/hostname to '$HOST_SHORT'"
     fi
 else
-    echo "$HOST_SHORT" > /etc/hostname
+    write_line_file 0644 /etc/hostname "$HOST_SHORT"
     log_info "🧩 Created /etc/hostname with '$HOST_SHORT'"
 fi
 
@@ -1182,22 +1328,23 @@ fi
 # -------------------------------------------------------------------------
 if [[ ! -f "$HOSTS_FILE" ]]; then
     log_info "⚙️ Creating new $HOSTS_FILE"
-    echo "127.0.0.1   localhost" > "$HOSTS_FILE"
+    write_file 0644 "$HOSTS_FILE" <<'EOF'
+127.0.0.1   localhost
+EOF
 else
     # Ensure a basic IPv4 localhost line exists
     if ! grep -qE '^[[:space:]]*127\.0\.0\.1[[:space:]]+.*\blocalhost\b' "$HOSTS_FILE"; then
-        echo "127.0.0.1   localhost" >> "$HOSTS_FILE"
+        append_line_unique "$HOSTS_FILE" "127.0.0.1   localhost"
     fi
 fi
 
 # Ensure IPv6 localhost line exists
 if ! grep -qE '^::1[[:space:]]+localhost' "$HOSTS_FILE"; then
-    echo "::1   localhost" >> "$HOSTS_FILE"
+    append_line_unique "$HOSTS_FILE" "::1   localhost"
 fi
 
 # Perform safe backup before modification
-BACKUP_FILE="${HOSTS_FILE}.bak.$(date +%s)"
-cp -p "$HOSTS_FILE" "$BACKUP_FILE"
+BACKUP_FILE="$(backup_file "$HOSTS_FILE")"
 log_info "💾 Backup saved as $BACKUP_FILE"
 
 # -------------------------------------------------------------------------
@@ -1208,7 +1355,7 @@ log_info "💾 Backup saved as $BACKUP_FILE"
 CLOUD_ALIASES=""
 
 # Collect ALL entries for this IP (not only the first one)
-mapfile -t MATCHING_LINES < <(grep -E "^[[:space:]]*${PRIMARY_IP}[[:space:]]+" "$HOSTS_FILE" || true)
+mapfile -t MATCHING_LINES < <(grep -E "^[[:space:]]*${PRIMARY_IP_RE}[[:space:]]+" "$HOSTS_FILE" || true)
 
 if [[ ${#MATCHING_LINES[@]} -gt 0 ]]; then
     log_info "🧩 Found ${#MATCHING_LINES[@]} existing /etc/hosts entries for ${PRIMARY_IP}, consolidating aliases"
@@ -1248,16 +1395,16 @@ if [[ ${#MATCHING_LINES[@]} -gt 0 ]]; then
     [[ -n "$CLOUD_ALIASES" ]] && CANONICAL_LINE+=" ${CLOUD_ALIASES}"
 
     # Remove any previous entries for this IP (avoid duplicates/drift)
-    sed -i "\|^[[:space:]]*${PRIMARY_IP}[[:space:]]\+|d" "$HOSTS_FILE"
+    run_cmd_logged sed -i "\|^[[:space:]]*${PRIMARY_IP_RE}[[:space:]]\+|d" "$HOSTS_FILE"
 
     # Append canonical entry (spaces only, no TAB)
-    echo "$CANONICAL_LINE" >> "$HOSTS_FILE"
+    append_line "$HOSTS_FILE" "$CANONICAL_LINE"
 
     log_info "✅ Applied canonical mapping: ${CANONICAL_LINE}"
 
 else
     log_info "➕ No entry found for ${PRIMARY_IP}; adding canonical host mapping"
-    echo "${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}" >> "$HOSTS_FILE"
+    append_line "$HOSTS_FILE" "${PRIMARY_IP} ${HOST_FQDN} ${HOST_SHORT}"
 fi
 
 # -------------------------------------------------------------------------
@@ -1265,14 +1412,16 @@ fi
 # -------------------------------------------------------------------------
 if grep -qE '^[[:space:]]*127\.0\.1\.1[[:space:]]+' "$HOSTS_FILE"; then
     log_info "⚙️ Removing obsolete 127.0.1.1 hostname entries (Ubuntu/Debian compatibility fix)"
-    sed -i '/^[[:space:]]*127\.0\.1\.1[[:space:]]\+/d' "$HOSTS_FILE"
+    run_cmd_logged sed -i '/^[[:space:]]*127\.0\.1\.1[[:space:]]\+/d' "$HOSTS_FILE"
 fi
 
 # Adjust default permissions
-chmod 644 "$HOSTS_FILE"
+run_cmd_logged chmod 644 "$HOSTS_FILE"
 
 # Final validation
-if ! grep -qE "^[[:space:]]*${PRIMARY_IP}[[:space:]]+${HOST_FQDN}" "$HOSTS_FILE"; then
+if $DRY_RUN; then
+    log_info "[DRY-RUN] Skipping /etc/hosts validation because no changes were applied."
+elif ! grep -qE "^[[:space:]]*${PRIMARY_IP_RE}[[:space:]]+${HOST_FQDN}" "$HOSTS_FILE"; then
     log_error "Host mapping not applied correctly in /etc/hosts"
 else
     log_info "✅ Host mapping verified for ${HOST_FQDN} (${PRIMARY_IP})"
@@ -1281,7 +1430,7 @@ fi
 # Ensure that the runtime hostname resolves correctly (hostname -f)
 CURRENT_FQDN=$(hostname -f 2>/dev/null || echo "")
 if [[ "$CURRENT_FQDN" != "$HOST_FQDN" ]]; then
-    hostnamectl set-hostname "$HOST_SHORT" 2>/dev/null || hostname "$HOST_SHORT"
+    run_cmd hostnamectl set-hostname "$HOST_SHORT" 2>/dev/null || run_cmd hostname "$HOST_SHORT"
     log_info "⚙️ Adjusted runtime hostname for FQDN resolution"
 fi
 
@@ -1512,16 +1661,13 @@ if [[ -n "$REALM_JOINED" ]]; then
 
         # Detect if '--force' is supported (RHEL vs Ubuntu)
         if realm leave --help 2>&1 | grep -q -- '--force'; then
-            REALM_LEAVE_CMD="realm leave --force"
+            REALM_LEAVE_CMD=( realm leave --force )
         else
-            REALM_LEAVE_CMD="realm leave --unattended"
+            REALM_LEAVE_CMD=( realm leave --unattended )
         fi
 
-        if [[ "$VERBOSE" == "true" ]]; then
-            $REALM_LEAVE_CMD || REALMLEAVE_RC=$?
-        else
-            $REALM_LEAVE_CMD >/dev/null 2>&1 || REALMLEAVE_RC=$?
-        fi
+        cmd_run "${REALM_LEAVE_CMD[@]}"
+        REALMLEAVE_RC=$?
 	
         if [ -z "${REALMLEAVE_RC+x}" ]; then
 			REALMLEAVE_RC=0
@@ -1537,7 +1683,7 @@ if [[ -n "$REALM_JOINED" ]]; then
     fi
 
     # Always perform residual cleanup
-    rm -f /etc/krb5.keytab /etc/sssd/sssd.conf /etc/realmd.conf
+    run_cmd rm -f /etc/krb5.keytab /etc/sssd/sssd.conf /etc/realmd.conf
     log_info "🧹 Residual realm configuration cleaned."
 
 else
@@ -1579,7 +1725,6 @@ if dig +short _kerberos._tcp."$DOMAIN" SRV | grep -qE '^[0-9]'; then
     ticket_lifetime = 24h
     forwardable = true
     rdns = false
-    allow_weak_crypto = false
 
 [realms]
     $REALM_UPPER = {
@@ -1600,7 +1745,6 @@ else
     ticket_lifetime = 24h
     forwardable = true
     rdns = false
-    allow_weak_crypto = false
 
 [realms]
     $REALM_UPPER = {
@@ -1616,7 +1760,7 @@ EOF
 fi
 
 # Apply standard permissions
-chmod 644 "$KRB_CONF"
+run_cmd_logged chmod 644 "$KRB_CONF"
 log_info "✅ /etc/krb5.conf regenerated for realm $REALM_UPPER"
 
 # -------------------------------------------------------------------------
@@ -1661,12 +1805,12 @@ if [[ "$OS_FAMILY" =~ ^(rhel)$ ]]; then
     ODDJOB_SERVICE="oddjobd.service"
     ODDJOB_CHANGED=0
 
-    mkdir -p "$(dirname "$DBUS_SVC")" "$(dirname "$ODDJOB_XML")"
+    run_cmd mkdir -p "$(dirname "$DBUS_SVC")" "$(dirname "$ODDJOB_XML")"
 
     # Create or repair the D-Bus service activation file
     if [[ ! -f "$DBUS_SVC" ]]; then
         log_info "🔧 Restoring D-Bus service file: $DBUS_SVC"
-        install -m 0644 -D /dev/stdin "$DBUS_SVC" <<'EOF'
+        write_file 0644 "$DBUS_SVC" <<'EOF'
 [D-BUS Service]
 Name=com.redhat.oddjob
 Exec=/usr/sbin/oddjobd -n
@@ -1679,20 +1823,20 @@ EOF
     # Create or repair the oddjob mkhomedir XML interface
     if [[ ! -f "$ODDJOB_XML" ]]; then
         log_info "🔧 Restoring oddjob mkhomedir XML: $ODDJOB_XML"
-        install -m 0644 -D /dev/stdin "$ODDJOB_XML" <<'EOF'
+        write_file 0644 "$ODDJOB_XML" <<'EOF'
 <oddjobconfig version="1.0">
-  <service name="com.redhat.oddjob_mkhomedir">
+<service name="com.redhat.oddjob_mkhomedir">
     <object name="/">
-      <interface name="com.redhat.oddjob_mkhomedir">
+    <interface name="com.redhat.oddjob_mkhomedir">
         <method name="CreateHome">
-          <arg type="string" name="username"/>
-          <arg type="string" name="homedir"/>
-          <arg type="boolean" name="create_dir"/>
-          <execute helper="/usr/sbin/oddjob-mkhomedir" user="root"/>
+        <arg type="string" name="username"/>
+        <arg type="string" name="homedir"/>
+        <arg type="boolean" name="create_dir"/>
+        <execute helper="/usr/sbin/oddjob-mkhomedir" user="root"/>
         </method>
-      </interface>
+    </interface>
     </object>
-  </service>
+</service>
 </oddjobconfig>
 EOF
         ODDJOB_CHANGED=1
@@ -1751,9 +1895,13 @@ EOF
         systemctl status "$DBUS_SERVICE" &>/dev/null || DBUS_SERVICE="messagebus.service"
 
         log_info "🔄 Restarting $DBUS_SERVICE silently (detached from current D-Bus session)"
-		nohup setsid bash -c "systemctl restart '$DBUS_SERVICE' >/dev/null 2>&1 < /dev/null" >/dev/null 2>&1 &
-		disown || true
-		sleep 3
+		if $DRY_RUN; then
+            log_info "[DRY-RUN] Would restart $DBUS_SERVICE (detached) to heal oddjob D-Bus registration"
+        else
+            nohup setsid bash -c "systemctl restart '$DBUS_SERVICE' >/dev/null 2>&1 < /dev/null" >/dev/null 2>&1 &
+            disown || true
+            sleep 3
+        fi
 
         # After D-Bus restart, re-test
         if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
@@ -1810,26 +1958,26 @@ for file in "${PAM_FILES[@]}"; do
         run_cmd_logged sed -i '/pam_nis\.so/s/^/# disabled legacy -> /' "$file"
 	fi
 
-	# Guarantee pam_sss.so presence per section
-	for context in auth account password session; do
-		if ! grep -Eq "^[[:space:]]*${context}[[:space:]].*pam_sss\\.so" "$file"; then
-			case "$context" in
-				auth)
-					echo "auth        sufficient    pam_sss.so forward_pass" >>"$file"
-					;;
-				account)
-					echo "account     [default=bad success=ok user_unknown=ignore] pam_sss.so" >>"$file"
-					;;
-				password)
-					echo "password    sufficient    pam_sss.so use_authtok" >>"$file"
-					;;
-				session)
-					echo "session     optional      pam_sss.so" >>"$file"
-					;;
-			esac
-			log_info "🧩 Added missing pam_sss.so for $context -> $(basename "$file")"
-		fi
-	done
+	# Guarantee pam_sss.so presence per section (DRY-RUN aware)
+    for context in auth account password session; do
+        if ! grep -Eq "^[[:space:]]*${context}[[:space:]].*pam_sss\\.so" "$file"; then
+            case "$context" in
+                auth)
+                    append_line "$file" "auth        sufficient    pam_sss.so forward_pass"
+                    ;;
+                account)
+                    append_line "$file" "account     [default=bad success=ok user_unknown=ignore] pam_sss.so"
+                    ;;
+                password)
+                    append_line "$file" "password    sufficient    pam_sss.so use_authtok"
+                    ;;
+                session)
+                    append_line "$file" "session     optional      pam_sss.so"
+                    ;;
+            esac
+            log_info "🧩 Added missing pam_sss.so for $context -> $(basename "$file")"
+        fi
+    done
 done
 
 # Re-run consistency for RHEL-like systems
@@ -1937,7 +2085,11 @@ else
 fi
 
 # Normalize line endings (CRLF-safe) before backup
-sed -i 's/\r$//' "$NSS_FILE"
+if $DRY_RUN; then
+    log_info "[DRY-RUN] Would normalize CRLF in $NSS_FILE"
+else
+    sed -i 's/\r$//' "$NSS_FILE"
+fi
 
 # Choose a portable sed extended-regex flag (-E preferred, fallback to -r)
 if echo | sed -E 's/(.*)//' >/dev/null 2>&1; then
@@ -1956,17 +2108,31 @@ log_info "💾 Backup saved as $NSS_BACKUP"
 # -------------------------------------------------------------------------
 # NSS/SSSD line normalization (deduplicated, legacy-safe, idempotent)
 # -------------------------------------------------------------------------
+# Work file (real or temp)
+NSS_EDIT="$NSS_FILE"
+NSS_EDIT_TMP=""
+
+if $DRY_RUN; then
+    NSS_EDIT_TMP="$(mktemp "/tmp/nsswitch.conf.XXXXXX")"
+    if [[ -f "$NSS_FILE" ]]; then
+        cp -p -- "$NSS_FILE" "$NSS_EDIT_TMP" 2>/dev/null || cat "$NSS_FILE" >"$NSS_EDIT_TMP"
+    else
+        : >"$NSS_EDIT_TMP"
+    fi
+    NSS_EDIT="$NSS_EDIT_TMP"
+fi
+
 for key in passwd shadow group services netgroup; do
     pattern="^[[:space:]]*${key}:"
 
-    # 1. Ensure file exists
-    [ -f "$NSS_FILE" ] || touch "$NSS_FILE"
+    # 1. Ensure file exists (work file)
+    [ -f "$NSS_EDIT" ] || : >"$NSS_EDIT"
 
-    # 2. Normalize whitespace early
-    sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_FILE"
+    # 2. Normalize whitespace early (work file)
+    sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
 
     # 3. Remove duplicate entries (preserve first non-commented)
-    if grep -Eq "${pattern}" "$NSS_FILE"; then
+    if grep -Eq "${pattern}" "$NSS_EDIT"; then
         awk -v key="${key}" '
             BEGIN {found=0}
             /^[[:space:]]*#/ {print; next}
@@ -1975,26 +2141,27 @@ for key in passwd shadow group services netgroup; do
                 next
             }
             {print}
-        ' "$NSS_FILE" > "${NSS_FILE}.tmp" && mv "${NSS_FILE}.tmp" "$NSS_FILE"
+        ' "$NSS_EDIT" > "${NSS_EDIT}.tmp" && mv "${NSS_EDIT}.tmp" "$NSS_EDIT"
     fi
 
     # 4. Skip if entry already includes 'sss'
-    if grep -Eq "${pattern}[^#]*[[:space:]]sss([[:space:]]|\$)" "$NSS_FILE"; then
+    if grep -Eq "${pattern}[^#]*[[:space:]]sss([[:space:]]|\$)" "$NSS_EDIT"; then
         $VERBOSE && log_info "ℹ️ '${key}' already includes sss"
         continue
     fi
 
     # 5. If entry exists but lacks 'sss', patch it
-    if grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
+    if grep -qE "${pattern}[^#]*" "$NSS_EDIT"; then
         log_info "🧩 Updating existing '${key}' entry to include sss"
-        sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_FILE"
+        # shellcheck disable=SC2086  # SED_EXT must expand to -E/-r
+        sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_EDIT"
         sed -i \
             -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
-            -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_FILE"
-        sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_FILE"
+            -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_EDIT"
+        sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_EDIT"
         log_info "✅ '${key}' updated"
     else
-        echo "${key}: files sss" >>"$NSS_FILE"
+        printf '%s\n' "${key}: files sss" >>"$NSS_EDIT"
         log_info "➕ Created missing '${key}' entry"
     fi
 done
@@ -2007,8 +2174,8 @@ if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
     pattern="^[[:space:]]*${key}:"
 
     # Normalize and deduplicate
-    sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_FILE"
-    if grep -Eq "${pattern}" "$NSS_FILE"; then
+    sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
+    if grep -Eq "${pattern}" "$NSS_EDIT"; then
         awk -v key="${key}" '
             BEGIN {found=0}
             /^[[:space:]]*#/ {print; next}
@@ -2017,73 +2184,95 @@ if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
                 next
             }
             {print}
-        ' "$NSS_FILE" > "${NSS_FILE}.tmp" && mv "${NSS_FILE}.tmp" "$NSS_FILE"
+        ' "$NSS_EDIT" > "${NSS_EDIT}.tmp" && mv "${NSS_EDIT}.tmp" "$NSS_EDIT"
     fi
 
     # Insert or patch as needed
-    if grep -Eq "${pattern}[^#]*[[:space:]]sss([[:space:]]|\$)" "$NSS_FILE"; then
+    if grep -Eq "${pattern}[^#]*[[:space:]]sss([[:space:]]|\$)" "$NSS_EDIT"; then
         $VERBOSE && log_info "ℹ️ '${key}' already includes sss"
-    elif grep -qE "${pattern}[^#]*" "$NSS_FILE"; then
+    elif grep -qE "${pattern}[^#]*" "$NSS_EDIT"; then
         log_info "🧩 Updating existing '${key}' entry to include sss"
-        sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_FILE"
+        # shellcheck disable=SC2086  # SED_EXT must expand to -E/-r
+        sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_EDIT"
         sed -i \
             -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
-            -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_FILE"
-        sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_FILE"
+            -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_EDIT"
+        sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_EDIT"
         log_info "✅ '${key}' updated"
     else
-        echo "${key}: files sss" >>"$NSS_FILE"
+        printf '%s\n' "${key}: files sss" >>"$NSS_EDIT"
         log_info "➕ Created missing '${key}' entry"
     fi
 fi
 
 # Final whitespace normalization (collapse multiple spaces, trim ends)
-awk '{$1=$1}1' "$NSS_FILE" > "${NSS_FILE}.tmp" && mv "${NSS_FILE}.tmp" "$NSS_FILE"
-
-# Restore SELinux context if applicable
-command -v restorecon >/dev/null 2>&1 && restorecon -F "$NSS_FILE" || true
+awk '{$1=$1}1' "$NSS_EDIT" > "${NSS_EDIT}.tmp" && mv "${NSS_EDIT}.tmp" "$NSS_EDIT"
 
 # -------------------------------------------------------------------------
-# Validation and cache refresh
+# Validation (validate the WORK file, not the real file in DRY-RUN)
 # -------------------------------------------------------------------------
-if ! grep -qE '^passwd:[^#]*sss' "$NSS_FILE" || ! grep -qE '^group:[^#]*sss' "$NSS_FILE"; then
-	log_error "Failed to configure NSS/SSSD for passwd/group lookups." 1
+if ! grep -qE '^passwd:[^#]*sss' "$NSS_EDIT" || ! grep -qE '^group:[^#]*sss' "$NSS_EDIT"; then
+    log_error "Failed to configure NSS/SSSD for passwd/group lookups." 1
+fi
+
+# -------------------------------------------------------------------------
+# Commit (only when not DRY-RUN)
+# -------------------------------------------------------------------------
+if $DRY_RUN; then
+    log_info "[DRY-RUN] Would update $NSS_FILE with NSS/SSSD mappings (preview):"
+    grep -E '^(passwd|shadow|group|services|netgroup|sudoers):' "$NSS_EDIT" 2>/dev/null | while IFS= read -r l; do
+        log_info "   $l"
+    done
+else
+    # Overwrite real file with edited content safely
+    # (Backup already exists earlier in your script; keep this simple)
+    cp -p -- "$NSS_EDIT" "$NSS_FILE"
+    command -v restorecon >/dev/null 2>&1 && restorecon -F "$NSS_FILE" || true
 fi
 
 # Optional runtime sanity checks (non-blocking)
 getent passwd root >/dev/null || log_info "⚠ NSS runtime check (passwd) inconclusive - verify SSSD/NSCD"
-getent group root >/dev/null || log_info "⚠ NSS runtime check (group) inconclusive - verify SSSD/NSCD"
+getent group root  >/dev/null || log_info "⚠ NSS runtime check (group) inconclusive - verify SSSD/NSCD"
 
-# If legacy nslcd is present, stop it to avoid conflicts with SSSD
-if command -v systemctl &>/dev/null; then
-	systemctl list-units --type=service 2>/dev/null | grep -q '^nslcd\.service' && run_cmd systemctl stop nslcd || true
-fi
-
-# Restart order: SSSD first (reads nsswitch/sssd.conf), then NSCD to clear caches
-if command -v systemctl &>/dev/null; then
-	# 1. SSSD
-	if systemctl list-unit-files 2>/dev/null | grep -q '^sssd' || systemctl is-active sssd &>/dev/null; then
-		log_info "🔄 Restarting SSSD"
-		run_cmd systemctl restart sssd || true
-	fi
-	# 2. NSCD
-	if systemctl list-unit-files 2>/dev/null | grep -q '^nscd' || systemctl is-active nscd &>/dev/null; then
-		log_info "🔄 Restarting NSCD"
-		run_cmd systemctl restart nscd || true
-	fi
+# -------------------------------------------------------------------------
+# Cache refresh (skip entirely in DRY-RUN)
+# -------------------------------------------------------------------------
+if $DRY_RUN; then
+    log_info "[DRY-RUN] Would stop nslcd (if present), restart sssd/nscd, and flush sss_cache"
 else
-	# Non-systemd fallback
-	pgrep sssd &>/dev/null && { pkill -HUP sssd; log_info "🔄 Reloaded sssd"; }
-	pgrep nscd &>/dev/null && { pkill -HUP nscd; log_info "🔄 Reloaded nscd"; }
-fi
+    # If legacy nslcd is present, stop it to avoid conflicts with SSSD
+    if command -v systemctl &>/dev/null; then
+        systemctl list-units --type=service 2>/dev/null | grep -q '^nslcd\.service' && run_cmd systemctl stop nslcd || true
+    fi
 
-# Explicit SSSD cache flush when available
-if command -v sss_cache >/dev/null 2>&1; then
-	# This only fails if SSSD is not running, which is fine.
-	sss_cache -E || true
+    # Restart order: SSSD first (reads nsswitch/sssd.conf), then NSCD to clear caches
+    if command -v systemctl &>/dev/null; then
+        # 1. SSSD
+        if systemctl list-unit-files 2>/dev/null | grep -q '^sssd' || systemctl is-active sssd &>/dev/null; then
+            log_info "🔄 Restarting SSSD"
+            run_cmd systemctl restart sssd || true
+        fi
+        # 2. NSCD
+        if systemctl list-unit-files 2>/dev/null | grep -q '^nscd' || systemctl is-active nscd &>/dev/null; then
+            log_info "🔄 Restarting NSCD"
+            run_cmd systemctl restart nscd || true
+        fi
+    else
+        # Non-systemd fallback
+        pgrep sssd &>/dev/null && { pkill -HUP sssd; log_info "🔄 Reloaded sssd"; }
+        pgrep nscd &>/dev/null && { pkill -HUP nscd; log_info "🔄 Reloaded nscd"; }
+    fi
+
+    # Explicit SSSD cache flush when available
+    if command -v sss_cache >/dev/null 2>&1; then
+        sss_cache -E || true
+    fi
 fi
 
 log_info "🌟 NSS/SSSD integration completed successfully"
+
+# Cleanup temp work file (DRY-RUN only)
+[[ -n "$NSS_EDIT_TMP" ]] && rm -f "$NSS_EDIT_TMP" || true
 
 # -------------------------------------------------------------------------
 # Disable legacy pam_ldap if SSSD is active (RHEL-like systems)
@@ -2094,9 +2283,10 @@ if [[ "$OS_FAMILY" == "rhel" ]]; then
 	for pamfile in /etc/pam.d/system-auth /etc/pam.d/password-auth; do
 		[[ -f "$pamfile" ]] || continue
 
-		# Backup
-		cp -p "$pamfile" "${pamfile}.bak.$(date +%Y%m%d%H%M%S)"
-		[[ $VERBOSE == true ]] && log_info "💾 Backup saved: ${pamfile}.bak.$(date +%Y%m%d%H%M%S)"
+		# Backup PAM file
+		bk="${pamfile}.bak.$(date +%Y%m%d%H%M%S)"
+        run_cmd cp -p -- "$pamfile" "$bk"
+        $VERBOSE && log_info "💾 Backup saved: $bk"
 
 		# Detect presence of pam_ldap.so
 		if grep -q "pam_ldap.so" "$pamfile"; then
@@ -2184,11 +2374,31 @@ if systemctl list-unit-files 2>/dev/null | grep -q 'systemd-timesyncd.service'; 
 fi
 
 # Enable and restart safely
-log_info "🔧 Enabling Chrony"
-run_cmd_logged systemctl enable --now "$chrony_service"
+log_info "🔧 Enabling and Restarting Chrony"
 
-log_info "🔄 Restarting Chrony"
-run_cmd systemctl restart "$chrony_service"
+if command -v systemctl >/dev/null 2>&1; then
+    # SYSTEMD (Moderno: RHEL 7+, Ubuntu 16+, Debian 8+)
+    # 1. Habilita no boot
+    run_cmd_logged systemctl enable "$chrony_service"
+    # 2. Força restart para ler o novo arquivo de conf e iniciar
+    run_cmd systemctl restart "$chrony_service"
+
+elif command -v chkconfig >/dev/null 2>&1; then
+    # SYSVINIT (Legado: RHEL 6, CentOS 6, Oracle Linux 6)
+    # 1. Habilita no boot
+    run_cmd_logged chkconfig "$chrony_service" on
+    # 2. Restart via comando service
+    run_cmd service "$chrony_service" restart
+
+elif command -v update-rc.d >/dev/null 2>&1; then
+    # DEBIAN LEGACY (SysVinit antigo)
+    # 1. Habilita no boot
+    run_cmd_logged update-rc.d "$chrony_service" defaults
+    # 2. Restart
+    run_cmd service "$chrony_service" restart
+else
+    log_info "⚠️ Could not detect init system to enable Chrony. Please start manually."
+fi
 
 # -------------------------------------------------------------------------
 # Wait for NTP synchronization (Chrony only, Debian/RHEL compatible)
@@ -2200,7 +2410,7 @@ for i in {1..30}; do
     if systemctl is-active "$chrony_service" &>/dev/null && \
        chronyc sources | grep -q '^\^\*' && \
        [[ "$(chronyc tracking | awk -F': *' '/Leap status/ {print $2}')" == "Normal" ]]; then
-        synced_server=$( chronyc tracking | awk -F '[()]' '/Reference ID/ { print $2 }' )
+        synced_server="$(chronyc tracking 2>/dev/null | awk -F '[()]' '/Reference ID/ { print $2 }' || true)"
         # clear previous line before printing success
         printf "\r\033[K" >&2
         log_info "✅ NTP synchronized successfully with: ${synced_server:-chrony}"
@@ -2340,7 +2550,7 @@ fi
 log_info "🔗 Joining domain $DOMAIN via adcli (direct mode, no realm)"
 
 # Resolve DC IP for logging
-DC_IP=$(getent hosts "$DC_SERVER" | awk '{print $1}' | head -n1)
+DC_IP="$(getent hosts "$DC_SERVER" 2>/dev/null | awk '{print $1}' | head -n1 || true)"
 [[ -z "$DC_IP" ]] && DC_IP=$(dig +short "$DC_SERVER" | head -n1)
 log_info "🔍 Target DC for join: $DC_SERVER (${DC_IP:-unresolved})"
 
@@ -2360,7 +2570,10 @@ set -e -o pipefail
 JOIN_LOG=$(mktemp)
 
 # Execute adcli join deterministically
-if timeout 90s adcli join \
+if $DRY_RUN; then
+    log_info "[DRY-RUN] Would join domain via adcli (execution suppressed)."
+    true
+elif timeout 90s adcli join \
     --verbose \
     --domain="$DOMAIN" \
     --domain-realm="$REALM" \
@@ -2416,7 +2629,10 @@ changetype: modify
 replace: description
 description: [${HOST_IP}] - Joined with adcli by ${DOMAIN_USER} on ${timestamp}
 EOF
-    if ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1; then
+    if $DRY_RUN; then
+        log_info "[DRY-RUN] Would update AD description via ldapmodify (execution suppressed)."
+        true
+    elif ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1; then
         log_info "✅ Description updated successfully in AD"
     else
         log_info "⚠️ Unable to update AD description (check permissions or ticket validity)"
@@ -2476,7 +2692,7 @@ END_MS=$(date +%s%3N)
 ELAPSED=$((END_MS - START_MS))
 
 # Resolve DC name dynamically
-DC_USED=$(grep -Eo 'to (dgram|stream) ([0-9.]+|[A-Za-z0-9._-]+)' "$KRB_LOG" | awk '{print $3}' | tail -n1)
+DC_USED="$(grep -Eo 'to (dgram|stream) ([0-9.]+|[A-Za-z0-9._-]+)' "$KRB_LOG" 2>/dev/null | awk '{print $3}' | tail -n1 || true)"
 [[ -z "$DC_USED" ]] && DC_USED=$(grep -Eo '([A-Za-z0-9._-]+\.[A-Za-z]{2,})' "$KRB_LOG" | grep -vi "$REALM" | tail -n1)
 [[ -z "$DC_USED" ]] && DC_USED="(unknown DC)"
 
@@ -2557,13 +2773,17 @@ else
             LDAP_OUT="/dev/null"
             $VERBOSE && LDAP_OUT="/dev/stderr"
 
-            ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" >"$LDAP_OUT" 2>&1 <<EOF
+            if $DRY_RUN; then
+                log_info "[DRY-RUN] Would re-enable computer object via ldapmodify (execution suppressed)."
+            else
+
+                ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" >"$LDAP_OUT" 2>&1 <<EOF
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: userAccountControl
 userAccountControl: $NEW_UAC
 EOF
-
+            fi
             log_info "✅ Computer object re-enabled successfully (userAccountControl=$NEW_UAC)"
         else
             $VERBOSE && log_info "ℹ userAccountControl=$UAC (object is already enabled or no action required)"
@@ -2587,7 +2807,7 @@ SSSD_CONF=/etc/sssd/sssd.conf
 if [[ -f $SSSD_CONF ]]; then
     bak=${SSSD_CONF}.bak.$(date +%s)
     log_info "💾 Backing up $SSSD_CONF to $bak"
-    cp -p "$SSSD_CONF" "$bak"
+    bak="$(backup_file "$SSSD_CONF")"
 fi
 
 # Set debug level
@@ -2699,10 +2919,11 @@ PAM_SU_FILE="/etc/pam.d/su"
 log_info "🔐 Validating /etc/pam.d/su for SSSD integration (non-destructive)"
 
 if [[ -f "$PAM_SU_FILE" ]]; then
+    
     # Backup existing PAM su file
-    su_backup="${PAM_SU_FILE}.bak.$(date +%s)"
-    cp -p "$PAM_SU_FILE" "$su_backup"
-    log_info "💾 Backup saved: $su_backup"
+    su_backup="${PAM_SU_FILE}.bak.$(date +%Y%m%d%H%M%S)"
+    run_cmd cp -p -- "$PAM_SU_FILE" "$su_backup"
+    [[ $VERBOSE == true ]] && log_info "💾 Backup saved: $su_backup"
 
     # If pam_sss is already referenced in auth stack, do not touch the file
 	if grep -Eq '^[[:space:]]*auth[[:space:]]+(required|requisite|sufficient|include)[[:space:]].*pam_sss\.so' "$PAM_SU_FILE"; then
@@ -2736,7 +2957,7 @@ else
 
     case "$OS_FAMILY" in
       debian)
-        cat >"$PAM_SU_FILE" <<'EOF'
+        write_file 0644 "$PAM_SU_FILE" <<'EOF'
 # PAM configuration for the su command - generated by linux-ad-domain-join.sh
 auth   [success=1 default=ignore] pam_succeed_if.so quiet uid = 0
 auth   [success=done default=ignore] pam_localuser.so
@@ -2749,7 +2970,7 @@ auth   required   pam_deny.so
 EOF
         ;;
       rhel|suse)
-        cat >"$PAM_SU_FILE" <<'EOF'
+        write_file 0644 "$PAM_SU_FILE" <<'EOF'
 # PAM configuration for the su command - generated by linux-ad-domain-join.sh
 auth   [success=1 default=ignore] pam_succeed_if.so quiet uid = 0
 auth   [success=done default=ignore] pam_localuser.so
@@ -2763,7 +2984,7 @@ EOF
         ;;
       *)
         # Fallback: very conservative minimal config
-        cat >"$PAM_SU_FILE" <<'EOF'
+        write_file 0644 "$PAM_SU_FILE" <<'EOF'
 # PAM configuration for the su command - generated by linux-ad-domain-join.sh
 auth   sufficient pam_unix.so try_first_pass nullok
 auth   sufficient pam_sss.so use_first_pass
@@ -2772,7 +2993,7 @@ EOF
         ;;
     esac
 
-    chmod 644 "$PAM_SU_FILE"
+    run_cmd_logged chmod 644 "$PAM_SU_FILE"
     log_info "✅ PAM su file created with SSSD integration for OS family '$OS_FAMILY'"
 fi
 
@@ -2796,13 +3017,14 @@ if command -v systemctl &>/dev/null; then
     if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${LOGIND_UNIT}"; then
         
         log_info "✅ Systemd detected. Attempting restart of ${LOGIND_UNIT} to refresh PAM/D-Bus"
-        
-        # Attempt a full restart first (most reliable)
-        if run_cmd systemctl restart "$LOGIND_UNIT" >/dev/null 2>&1; then
+
+        run_cmd systemctl restart "$LOGIND_UNIT" >/dev/null 2>&1
+        if (( CMD_LAST_RC == 0 )); then
             log_info "🚀 ${LOGIND_UNIT} restarted successfully."
         else
             log_info "⚠️ Failed to restart ${LOGIND_UNIT}. Attempting safe reload instead."
-            if run_cmd systemctl reload "$LOGIND_UNIT" >/dev/null 2>&1; then
+            run_cmd systemctl reload "$LOGIND_UNIT" >/dev/null 2>&1
+            if (( CMD_LAST_RC == 0 )); then
                 log_info "🚀 ${LOGIND_UNIT} reloaded successfully."
             else
                 log_info "🛑 Failed to restart or reload ${LOGIND_UNIT}. Continuing script execution."
@@ -2899,7 +3121,7 @@ fi
 
 # Deduplicated directives
 sshd_set_directive_dedup "ClientAliveInterval" "$SESSION_TIMEOUT_SECONDS" "$SSH_CFG"
-sshd_set_directive_dedup "ClientAliveCountMax" "0" "$SSH_CFG"
+sshd_set_directive_dedup "ClientAliveCountMax" "1" "$SSH_CFG"
 sshd_set_directive_dedup "PermitRootLogin" "$PERMIT_ROOT_LOGIN" "$SSH_CFG"
 
 # Validate config BEFORE restarting sshd (avoids lockout)
@@ -2980,7 +3202,11 @@ Cmnd_Alias ROOT_SHELLS = \
 # ------------------------------------------------------------------------
 EOF
 
-visudo -cf "$BLOCK_FILE" >/dev/null 2>&1 || log_error "Invalid syntax in $BLOCK_FILE"
+if $DRY_RUN; then
+    log_info "[DRY-RUN] Would validate sudoers syntax: visudo -cf $BLOCK_FILE"
+else
+    run_cmd_logged visudo -cf "$BLOCK_FILE" >/dev/null 2>&1
+fi
 
 log_info "🔒 ROOT_SHELLS alias applied"
 
@@ -3205,8 +3431,10 @@ EOF
 # -------------------------------------------------------------------------
 log_info "🔧 Normalizing sudoers includes in $SUDOERS_MAIN"
 
+# Backup main sudoers file before changes
 SUDO_BAK="${SUDOERS_MAIN}.bak.$(date +%Y%m%d%H%M%S)"
-cp -p "$SUDOERS_MAIN" "$SUDO_BAK"
+run_cmd cp -p -- "$SUDOERS_MAIN" "$SUDO_BAK"
+[[ $VERBOSE == true ]] && log_info "💾 Backup saved: $SUDO_BAK"
 
 tmp_sudo="$(mktemp)"
 includedir_present=false
@@ -3352,8 +3580,8 @@ else
 		declare -a patched=()
 		declare -a compliant=()
 
-		tmp="${f}.tmp"
-		: >"$tmp"
+		tmp="$(mktemp "/tmp/$(basename "$f").XXXXXX")"
+        : >"$tmp"
 
 		while IFS= read -r line; do
 			original="$line"
@@ -3423,8 +3651,13 @@ else
 			continue
 		fi
 
-		mv -f "$tmp" "$f"
-		chmod 440 "$f"
+		if $DRY_RUN; then
+            log_info "[DRY-RUN] Would replace $f with patched version (validated)"
+            rm -f "$tmp"
+        else
+            run_cmd_logged mv -f "$tmp" "$f"
+            run_cmd_logged chmod 440 "$f"
+        fi
 
 		# Standardized log output format
 		if [[ ${#patched[@]} -gt 0 ]]; then
