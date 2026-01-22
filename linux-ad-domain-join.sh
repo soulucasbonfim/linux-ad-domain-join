@@ -1052,7 +1052,7 @@ else
 	}' <<< "$DOMAIN")
 
 	default_OU="OU=Servers,OU=DC_ORACLE,OU=SITES,OU=OPERATIONS,OU=${DOMAIN_SHORT},OU=COMPANIES,${DOMAIN_DN}"
-    read -rp "[?] DC server [default: ${default_OU}]: " DC_SERVER
+    read -rp "[?] OU [default: ${default_OU}]: " OU
     OU="$(echo "${OU:-}" | xargs)"
     OU="${OU:-$default_OU}"
 
@@ -2600,7 +2600,7 @@ write_file 0600 "$SSSD_CONF" <<EOF
 # ============================================================================
 [sssd]
 config_file_version = 2
-services = nss,pam
+services = nss,pam,sudo
 domains = $REALM
 
 
