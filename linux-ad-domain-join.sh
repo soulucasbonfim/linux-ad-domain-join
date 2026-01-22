@@ -66,7 +66,7 @@
 # Author:      Lucas Bonfim de Oliveira Lima
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # Created:     2025-04-27
-# Version:     1.8.1
+# Version:     2.0
 # License:     MIT
 #
 # -------------------------------------------------------------------------------------------------
@@ -87,7 +87,7 @@
 #  100 - Missing packages and system offline (no installation possible)
 #
 # -------------------------------------------------------------------------------------------------
-
+version="2.0"
 set -euo pipefail
 
 # -------------------------------------------------------------------------
@@ -734,6 +734,7 @@ OS_VERSION=${VERSION_ID:-$(uname -r)}
 OS_ARCH=$(uname -m)
 KERNEL_VER=$(uname -r)
 
+log_info "🧾 Starting linux-ad-domain-join.sh version $(version)"
 log_info "🌐 Hostname: $(hostname) / IP(s): $(hostname -I | awk '{print $1}')"
 log_info "🧬 OS detected: $OS_NAME ($ID $OS_VERSION, kernel $KERNEL_VER, arch $OS_ARCH)"
 log_info "🧬 OS family: $OS_FAMILY, Package Manager: $PKG, SSH group: $SSH_G"
