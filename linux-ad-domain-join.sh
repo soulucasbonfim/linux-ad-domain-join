@@ -2224,9 +2224,10 @@ if $DRY_RUN; then
         log_info "   $l"
     done
 else
-    # Overwrite real file with edited content safely
-    # (Backup already exists earlier in your script; keep this simple)
-    cp -p -- "$NSS_EDIT" "$NSS_FILE"
+    # NSS_EDIT may already be NSS_FILE in non-DRY-RUN mode; avoid cp same-file failure.
+    if [[ "$NSS_EDIT" != "$NSS_FILE" ]]; then
+        cp -p -- "$NSS_EDIT" "$NSS_FILE"
+    fi
     command -v restorecon >/dev/null 2>&1 && restorecon -F "$NSS_FILE" || true
 fi
 
