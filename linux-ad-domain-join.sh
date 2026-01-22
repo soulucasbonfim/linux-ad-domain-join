@@ -1052,18 +1052,21 @@ else
 	}' <<< "$DOMAIN")
 
 	default_OU="OU=Servers,OU=DC_ORACLE,OU=SITES,OU=OPERATIONS,OU=${DOMAIN_SHORT},OU=COMPANIES,${DOMAIN_DN}"
-    read -rp "[?] OU [default: ${default_OU}]: " OU
-    OU=${OU:-$default_OU}
+    read -rp "[?] DC server [default: ${default_OU}]: " DC_SERVER
+    OU="$(echo "${OU:-}" | xargs)"
+    OU="${OU:-$default_OU}"
 
     # DC Server (optional, default filled)
     default_DC_SERVER="${DOMAIN_SHORT,,}-sp-ad01.${DOMAIN,,}"
     read -rp "[?] DC server [default: ${default_DC_SERVER}]: " DC_SERVER
-    DC_SERVER=${DC_SERVER:-$default_DC_SERVER}
+    DC_SERVER="$(echo "${DC_SERVER:-}" | xargs)"
+    DC_SERVER="${DC_SERVER:-$default_DC_SERVER}"
 
 	# NTP Server (optional, default filled)
     default_NTP_SERVER="ntp.${DOMAIN,,}"
     read -rp "[?] NTP server [default: ${default_NTP_SERVER}]: " NTP_SERVER
-    NTP_SERVER=${NTP_SERVER:-$default_NTP_SERVER}
+    NTP_SERVER="$(echo "${NTP_SERVER:-}" | xargs)"
+    NTP_SERVER="${NTP_SERVER:-$default_NTP_SERVER}"
 
     # Require Join User
     while true; do
@@ -1124,6 +1127,8 @@ fi
 # Prepare environment
 REALM=${DOMAIN^^}
 HOST_FQDN="$(hostname -s).$(to_lower "$DOMAIN")"
+DC_SERVER_INPUT="$DC_SERVER"
+LDAP_SERVER="$DC_SERVER_INPUT"
 
 # Hostname format for Kerberos (uppercase short name)
 HOST_SHORT=$(hostname -s)
@@ -1442,7 +1447,7 @@ log_info "🔍 Checking OU: $OU"
 
 set +e
 LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
-    -H "ldap://${DC_SERVER}" \
+    -H "ldap://${LDAP_SERVER}" \
     -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
     -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
 LDAP_CODE=$?
@@ -1456,7 +1461,7 @@ if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
     # Test fallback OU also under safe mode
     set +e
     LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
-        -H "ldap://${DC_SERVER}" \
+        -H "ldap://${LDAP_SERVER}" \
         -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
         -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
     LDAP_CODE=$?
@@ -2231,7 +2236,7 @@ if $VERBOSE; then
 
     set +e
     LDAP_RAW=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
-      -H "ldap://${DC_SERVER}" \
+      -H "ldap://${LDAP_SERVER}" \
       -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U}\$)" distinguishedName 2>&1)
     LDAP_CODE=$?
     set -e
@@ -2248,7 +2253,7 @@ log_info "🔍 Checking if computer object exists in AD"
 
 # Perform search allowing non-fatal exit codes (e.g. not found)
 set +e
-LDAP_OUT=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${DC_SERVER}" \
+LDAP_OUT=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
   -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U}\$)" distinguishedName 2>/dev/null)
 LDAP_CODE=$?
 set -e
@@ -2284,10 +2289,10 @@ EOF
         set +e
 
         if $VERBOSE; then
-            ldapmodify -Y GSSAPI -H "ldap://${DC_SERVER}" -f "$TMP_LDIF"
+            ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF"
             LDAP_MOVE_CODE=$?
         else
-            ldapmodify -Y GSSAPI -H "ldap://${DC_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1
+            ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1
             LDAP_MOVE_CODE=$?
         fi
 
@@ -2401,7 +2406,7 @@ changetype: modify
 replace: description
 description: [${HOST_IP}] - Joined with adcli by ${DOMAIN_USER} on ${timestamp}
 EOF
-    if ldapmodify -Y GSSAPI -H "ldap://${DC_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1; then
+    if ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1; then
         log_info "✅ Description updated successfully in AD"
     else
         log_info "⚠️ Unable to update AD description (check permissions or ticket validity)"
@@ -2414,7 +2419,7 @@ fi
 # Read the current msDS-KeyVersionNumber (to validate keytab update)
 set +e +o pipefail
 MSDS_KVNO=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
-    -H "ldap://${DC_SERVER}" \
+    -H "ldap://${LDAP_SERVER}" \
     -b "CN=${HOST_SHORT_U},${OU}" msDS-KeyVersionNumber 2>/dev/null | \
     awk '/^msDS-KeyVersionNumber:/ {print $2}' | head -n1)
 LDAP_RC=$?
@@ -2489,7 +2494,7 @@ else
 fi
 
 # Save for summary
-DC_SERVER="$DC_NAME"
+DC_TRUST_SERVER="$DC_NAME"
 TRUST_ELAPSED="$ELAPSED"
 TRUST_RTT="$PING_RTT"
 
@@ -2515,7 +2520,7 @@ trap "$ERROR_TRAP_CMD" ERR
 log_info "🔧 Checking if computer object is disabled in AD..."
 
 # Query userAccountControl via GSSAPI (machine trust)
-UAC_RAW=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${DC_SERVER}" \
+UAC_RAW=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
     -b "CN=${HOST_SHORT_U},${OU}" userAccountControl \
     2>$($VERBOSE && echo /dev/stderr || echo /dev/null) | \
     awk '/^userAccountControl:/ {print $2}' || true)
@@ -2542,7 +2547,7 @@ else
             LDAP_OUT="/dev/null"
             $VERBOSE && LDAP_OUT="/dev/stderr"
 
-            ldapmodify -Y GSSAPI -H "ldap://${DC_SERVER}" >"$LDAP_OUT" 2>&1 <<EOF
+            ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" >"$LDAP_OUT" 2>&1 <<EOF
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: userAccountControl
@@ -3469,7 +3474,8 @@ print_divider
 log_info "🌟 DOMAIN JOIN VALIDATION SUMMARY"
 print_divider
 printf "%-25s %s\n" "Realm:"              "$REALM_JOINED"
-printf "%-25s %s\n" "DC Server:"          "$DC_SERVER"
+printf "%-25s %s\n" "DC Server (input):"  "$DC_SERVER_INPUT"
+printf "%-25s %s\n" "KDC used (trust):"   "${DC_TRUST_SERVER:-n/a}"
 printf "%-25s %s\n" "Computer Name:"      "$HOST_SHORT_U"
 printf "%-25s %s\n" "Kerberos Principal:" "${KLIST_PRINCIPAL:-⚠️ None active}"
 printf "%-25s %s\n" "Key Version (KVNO):" "$MSDS_KVNO"
