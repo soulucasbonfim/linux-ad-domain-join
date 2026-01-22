@@ -66,7 +66,7 @@
 # Author:      Lucas Bonfim de Oliveira Lima
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.0
+# Version:     2.1
 # License:     MIT
 #
 # -------------------------------------------------------------------------------------------------
@@ -87,7 +87,7 @@
 #  100 - Missing packages and system offline (no installation possible)
 #
 # -------------------------------------------------------------------------------------------------
-scriptVersion="2.0"
+scriptVersion="2.1"
 set -euo pipefail
 
 # -------------------------------------------------------------------------
