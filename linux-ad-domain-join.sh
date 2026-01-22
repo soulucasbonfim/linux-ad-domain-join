@@ -1323,7 +1323,11 @@ log_info "✅ DNS and KDC reachability OK"
 # Secret handling: DOMAIN_PASS (no args exposure; auto-clean on exit)
 # -------------------------------------------------------------------------
 create_secret_passfile() {
-    umask 077
+    local old_umask
+    old_umask="$(umask)"              # Save current umask
+    trap 'umask "$old_umask"' RETURN  # Restore umask when the function returns
+
+    umask 077                         # Secure temp file permissions for this function only
 
     # Prefer tmpfs (best-effort), fallback to /tmp for legacy
     local base=""
@@ -1878,9 +1882,14 @@ NSS_FILE="/etc/nsswitch.conf"
 
 # If the file does not exist, create a minimal, sane default first (0644)
 if [[ ! -f "$NSS_FILE" ]]; then
-	log_info "⚙ Creating minimal $NSS_FILE"
-	umask 022
-	cat >"$NSS_FILE" <<'EOF'
+    log_info "⚙ Creating minimal $NSS_FILE"
+
+    old_umask="$(umask)"              # Save current umask
+    trap 'umask "$old_umask"' RETURN  # Restore umask when the current function returns (if inside one)
+
+    umask 022                         # Ensure default readable system file permissions
+
+    write_file 0644 "$NSS_FILE" <<'EOF'
 passwd:		files
 shadow:		files
 group:		files
@@ -1888,7 +1897,11 @@ hosts:		files dns
 services:	files
 netgroup:	files
 EOF
-	chmod 0644 "$NSS_FILE"
+
+    chown root:root "$NSS_FILE" 2>/dev/null || true
+
+    umask "$old_umask"                # Restore umask for the rest of the script
+    trap - RETURN                     # Clear the RETURN trap to avoid side effects
 fi
 
 # Basic access checks (after creation above to avoid false negatives)
