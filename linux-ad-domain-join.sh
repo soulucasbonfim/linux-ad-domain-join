@@ -66,7 +66,7 @@
 # Author:      Lucas Bonfim de Oliveira Lima
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.1
+# Version:     2.2
 # License:     MIT
 #
 # -------------------------------------------------------------------------------------------------
@@ -87,15 +87,18 @@
 #  100 - Missing packages and system offline (no installation possible)
 #
 # -------------------------------------------------------------------------------------------------
-scriptVersion="2.1"
+scriptVersion="2.2"
 set -euo pipefail
 
 # -------------------------------------------------------------------------
-# Portable sed extended-regex flag detection (-E preferred, fallback to -r)
+# Choose a portable sed extended-regex flag (-E preferred, fallback to -r)
 # -------------------------------------------------------------------------
-SED_EXT="-E"
-if ! echo | sed -E 's/(.*)//' >/dev/null 2>&1; then
-    SED_EXT="-r"
+if echo | sed -E 's/(.*)//' >/dev/null 2>&1; then
+	SED_EXT='-E'
+elif echo | sed -r 's/(.*)//' >/dev/null 2>&1; then
+	SED_EXT='-r'
+else
+	echo "[$(date '+%F %T')] [ERROR] sed without extended regex support (-E/-r) - install a compatible sed." >&2; exit 1
 fi
 
 # -------------------------------------------------------------------------
@@ -293,7 +296,7 @@ disable_tmout_in_profile_d() {
         cp -p "$f" "$bk"
 
         # Comment only TMOUT-related lines (do not destroy file logic)
-        sed -i -E \
+        sed -i $SED_EXT \
             -e 's/\r$//' \
             -e '/^[[:space:]]*(readonly[[:space:]]+)?TMOUT=/{s/^/# disabled-by-linux-ad-domain-join: /;}' \
             -e '/^[[:space:]]*export[[:space:]]+TMOUT\b/{s/^/# disabled-by-linux-ad-domain-join: /;}' \
@@ -334,16 +337,34 @@ EOF
 }
 
 sshd_set_directive_dedup() {
+    # Ensures the directive is set once in the global section (before any Match blocks),
+    # while preserving any Match-specific overrides.
     local key="$1" value="$2" file="$3"
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would set '$key $value' in $file (deduplicated)"
+        log_info "[DRY-RUN] Would set global '$key $value' in $file (deduplicated, preserving Match blocks)"
         return 0
     fi
 
-    # Remove all existing occurrences of the directive (idempotent / no duplicates)
-    sed -i -E "/^[[:space:]]*${key}[[:space:]]+/d" "$file"
-    echo "${key} ${value}" >> "$file"
+    awk -v k="$key" -v v="$value" '
+        BEGIN { in_match=0; inserted=0 }
+        /^[[:space:]]*Match[[:space:]]+/ { 
+            if (inserted==0) { print k " " v; inserted=1 }
+            in_match=1
+            print
+            next
+        }
+        {
+            if (in_match==0) {
+                # In global section: drop existing directives for key
+                if ($0 ~ "^[[:space:]]*"k"[[:space:]]+") next
+            }
+            print
+        }
+        END {
+            if (inserted==0) print k " " v
+        }
+    ' "$file" > "${file}.tmp" && mv -f "${file}.tmp" "$file"
 }
 
 validate_sshd_config_or_die() {
@@ -762,6 +783,40 @@ append_line_unique() {
 }
 
 # -------------------------------------------------------------------------
+# Netcat compatibility layer (nc vs ncat) + TCP probe helper
+# -------------------------------------------------------------------------
+detect_netcat_bin() {
+    # Prefer nc (netcat-openbsd/traditional), fallback to ncat (nmap-ncat), else empty
+    if command -v nc >/dev/null 2>&1; then
+        echo "nc"
+    elif command -v ncat >/dev/null 2>&1; then
+        echo "ncat"
+    else
+        echo ""
+    fi
+}
+
+tcp_port_open() {
+    # Usage: tcp_port_open <host> <port> <timeout_seconds>
+    local host="$1" port="$2" t="${3:-3}"
+    local ncbin
+    ncbin="$(detect_netcat_bin)"
+
+    if [[ -n "$ncbin" ]]; then
+        # Try "zero-I/O" mode first, then a legacy fallback
+        if "$ncbin" -z -w "$t" "$host" "$port" >/dev/null 2>&1; then
+            return 0
+        fi
+        if "$ncbin" -w "$t" "$host" "$port" </dev/null >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    # Final fallback: bash /dev/tcp
+    timeout "$t" bash -c "echo > /dev/tcp/${host}/${port}" >/dev/null 2>&1
+}
+
+# -------------------------------------------------------------------------
 # OS metadata loader (os-release with legacy fallbacks)
 # - Prefers /etc/os-release, then /usr/lib/os-release
 # - Falls back to common legacy release files if os-release is missing
@@ -956,11 +1011,17 @@ if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release
                 log_info "💾 Backup created at: $backup_path"
             fi
 
-            # Remove potential stale locks
+            # Ensure no package manager process is running before touching rpmdb locks
+            if pgrep -x yum >/dev/null 2>&1 || pgrep -x dnf >/dev/null 2>&1 || pgrep -x rpm >/dev/null 2>&1 || pgrep -x packagekitd >/dev/null 2>&1; then
+                log_error "RPM database repair aborted: a package manager process is running (yum/dnf/rpm/packagekitd). Stop it and retry." 1
+            fi
+
+            # Remove potential stale locks (Berkeley DB and stale rpm lock file)
             rm -f /var/lib/rpm/__db.* 2>/dev/null
+            rm -f /var/lib/rpm/.rpm.lock 2>/dev/null
 
             # Attempt rebuild
-            if rpm --rebuilddb &>/dev/null; then
+            if timeout 300 rpm --rebuilddb &>/dev/null; then
                 log_info "✅ RPM database rebuilt successfully"
             else
                 log_error "Failed to rebuild RPM database. Please investigate manually at ${backup_path:-/var/lib/rpm.bak.*}" 8
@@ -1016,7 +1077,7 @@ install_missing_deps() {
 # -------------------------------------------------------------------------
 # List required tools
 # -------------------------------------------------------------------------
-tools=( realm adcli kinit kdestroy timedatectl systemctl sed grep tput timeout hostname cp chmod tee ldapsearch ldapmodify chronyc nc host dig )
+tools=( realm adcli kinit kdestroy timedatectl systemctl sed grep tput timeout hostname cp chmod tee ldapsearch ldapmodify chronyc nc host dig ip pgrep )
 
 # Add PAM config tool based on OS family
 case "$OS_FAMILY" in
@@ -1024,7 +1085,7 @@ case "$OS_FAMILY" in
 		tools+=( pam-auth-update )
 		;;
     rhel)
-		RHEL_MAJOR=$(rpm -q --qf '%{VERSION}' $(rpm -qf /etc/redhat-release) | cut -d. -f1)
+		RHEL_MAJOR="$(get_major_version_id)"
 		if (( RHEL_MAJOR < 8 )); then
 			tools+=( authconfig )
 		else
@@ -1054,7 +1115,7 @@ case "$OS_FAMILY" in
     debian)
         pkgs=( realmd sssd sssd-tools adcli oddjob oddjob-mkhomedir \
                packagekit krb5-user libnss-sss libpam-sss libpam-runtime \
-               ldap-utils chrony dialog dnsutils )
+               ldap-utils chrony dialog dnsutils iproute2 procps )
         # Prefer netcat-openbsd, fallback to nmap-ncat
 		if apt-cache show netcat-openbsd >/dev/null 2>&1; then
 			pkgs+=( netcat-openbsd )
@@ -1065,9 +1126,9 @@ case "$OS_FAMILY" in
 		fi
 		;;
 	rhel)
-		RHEL_MAJOR=$(rpm -q --qf '%{VERSION}' "$(rpm -qf /etc/redhat-release)" | cut -d. -f1)
+		RHEL_MAJOR="$(get_major_version_id)"
 		pkgs=( realmd sssd sssd-tools adcli oddjob oddjob-mkhomedir \
-			   krb5-workstation chrony openldap-clients nmap-ncat bind-utils )
+			   krb5-workstation chrony openldap-clients nmap-ncat bind-utils iproute procps-ng )
 		if (( RHEL_MAJOR < 8 )); then
 			pkgs+=( authconfig )
 		else
@@ -1077,7 +1138,7 @@ case "$OS_FAMILY" in
 		;;
     suse)
 		pkgs=( realmd sssd adcli oddjob oddjob-mkhomedir \
-			   krb5-client pam-config chrony )
+			   krb5-client pam-config chrony iproute2 procps )
 		# DNS utils (host/dig)
         if zypper se -x bind-utils >/dev/null 2>&1; then
             pkgs+=( bind-utils )
@@ -1136,7 +1197,7 @@ case "$OS_FAMILY" in
 		check_cmd pam-auth-update
 		;;
 	rhel)
-		RHEL_MAJOR=$(rpm -q --qf '%{VERSION}' $(rpm -qf /etc/redhat-release) | cut -d. -f1)
+		RHEL_MAJOR="$(get_major_version_id)"
 		if (( RHEL_MAJOR < 8 )); then
 			check_cmd authconfig
 		else
@@ -1167,6 +1228,10 @@ if $NONINTERACTIVE; then
     require_uint_range "SESSION_TIMEOUT_SECONDS" "$SESSION_TIMEOUT_SECONDS" 30 86400
     PERMIT_ROOT_LOGIN="$(normalize_yes_no "$PERMIT_ROOT_LOGIN")"
     [[ -n "$PERMIT_ROOT_LOGIN" ]] || log_error "PERMIT_ROOT_LOGIN must be yes or no" 1
+    
+    PASSWORD_AUTHENTICATION="${PASSWORD_AUTHENTICATION:-yes}"
+    PASSWORD_AUTHENTICATION="$(normalize_yes_no "${PASSWORD_AUTHENTICATION:-yes}")"
+    [[ -n "$PASSWORD_AUTHENTICATION" ]] || log_error "PASSWORD_AUTHENTICATION must be yes or no" 1
 else
     log_info "🧪 Collecting inputs"
     print_divider
@@ -1179,6 +1244,7 @@ else
         echo "[!] Domain is required."
     done
     DOMAIN_UPPER=$(echo "$DOMAIN" | tr '[:lower:]' '[:upper:]')
+    DOMAIN_LOWER="${DOMAIN,,}"
     DOMAIN_SHORT=$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')
 
     # OU (optional, default filled)
@@ -1251,6 +1317,16 @@ else
         [[ -n "$PERMIT_ROOT_LOGIN" ]] && break
         echo "[!] Invalid value. Type 'yes' or 'no'."
     done
+
+    # Ask whether SSH password auth should be enabled.
+    while true; do
+    read -rp "[?] Allow SSH PasswordAuthentication? (yes/no) [default: yes]: " _pa
+    _pa="${_pa:-yes}"
+    PASSWORD_AUTHENTICATION="$(normalize_yes_no "$_pa")"
+    [[ -n "$PASSWORD_AUTHENTICATION" ]] && break
+    echo "[!] Invalid input. Use yes or no."
+    done
+
 fi
 print_divider
 
@@ -1280,8 +1356,6 @@ HOSTS_FILE="/etc/hosts"
 # Detect primary IPv4 address (excluding loopback interfaces)
 # Method 1: hostname -I (Modern)
 PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i!~/^127\./){print $i; exit}}' || true)"
-# Escape PRIMARY_IP for regex-safe matching (dots must be literal)
-PRIMARY_IP_RE="${PRIMARY_IP//./\\.}"
 
 # Method 2: ip route/addr (Modern/Standard)
 if [[ -z "$PRIMARY_IP" ]]; then
@@ -1295,6 +1369,9 @@ if [[ -z "$PRIMARY_IP" ]] && command -v ifconfig >/dev/null 2>&1; then
 fi
 
 [[ -z "$PRIMARY_IP" ]] && log_error "Unable to detect primary IP address (no active NIC found)" 15
+
+# Escape PRIMARY_IP for regex-safe matching (dots must be literal)
+PRIMARY_IP_RE="${PRIMARY_IP//./\\.}"
 
 # Check for active web services (port 80 or 443)
 if command -v ss >/dev/null 2>&1; then
@@ -1395,7 +1472,7 @@ if [[ ${#MATCHING_LINES[@]} -gt 0 ]]; then
     [[ -n "$CLOUD_ALIASES" ]] && CANONICAL_LINE+=" ${CLOUD_ALIASES}"
 
     # Remove any previous entries for this IP (avoid duplicates/drift)
-    run_cmd_logged sed -i "\|^[[:space:]]*${PRIMARY_IP_RE}[[:space:]]\+|d" "$HOSTS_FILE"
+    run_cmd_logged sed -i "/^[[:space:]]*${PRIMARY_IP_RE}[[:space:]]\{1,\}/d" "$HOSTS_FILE"
 
     # Append canonical entry (spaces only, no TAB)
     append_line "$HOSTS_FILE" "$CANONICAL_LINE"
@@ -1412,7 +1489,7 @@ fi
 # -------------------------------------------------------------------------
 if grep -qE '^[[:space:]]*127\.0\.1\.1[[:space:]]+' "$HOSTS_FILE"; then
     log_info "⚙️ Removing obsolete 127.0.1.1 hostname entries (Ubuntu/Debian compatibility fix)"
-    run_cmd_logged sed -i '/^[[:space:]]*127\.0\.1\.1[[:space:]]\+/d' "$HOSTS_FILE"
+    run_cmd_logged sed -i '/^[[:space:]]*127\.0\.1\.1[[:space:]]\{1,\}/d' "$HOSTS_FILE"
 fi
 
 # Adjust default permissions
@@ -1445,23 +1522,15 @@ if ! host "$DC_SERVER" &>/dev/null; then
 fi
 
 # Test Kerberos (TCP/88)
-if nc -z -w3 "$DC_SERVER" 88 &>/dev/null 2>&1; then
-    :  # ok
-elif nc -w3 "$DC_SERVER" 88 </dev/null &>/dev/null 2>&1; then
-    :  # fallback for old Ncat (no -z)
-elif timeout 3 bash -c "echo > /dev/tcp/$DC_SERVER/88" 2>/dev/null; then
-    :  # fallback for systems without working nc
+if tcp_port_open "$DC_SERVER" 88 3; then
+    :
 else
     log_error "Cannot reach Kerberos port 88 on $DC_SERVER (network/firewall issue)" 11
 fi
 
 # Test LDAP (TCP/389)
-if nc -z -w3 "$DC_SERVER" 389 &>/dev/null 2>&1; then
-    :  # ok
-elif nc -w3 "$DC_SERVER" 389 </dev/null &>/dev/null 2>&1; then
-    :  # fallback for old Ncat
-elif timeout 3 bash -c "echo > /dev/tcp/$DC_SERVER/389" 2>/dev/null; then
-    :  # fallback
+if tcp_port_open "$DC_SERVER" 389 3; then
+    :
 else
     log_error "Cannot reach LDAP port 389 on $DC_SERVER (network/firewall issue)" 12
 fi
@@ -1666,8 +1735,8 @@ if [[ -n "$REALM_JOINED" ]]; then
             REALM_LEAVE_CMD=( realm leave --unattended )
         fi
 
-        cmd_run "${REALM_LEAVE_CMD[@]}"
-        REALMLEAVE_RC=$?
+        run_cmd "${REALM_LEAVE_CMD[@]}"
+        REALMLEAVE_RC=$CMD_LAST_RC
 	
         if [ -z "${REALMLEAVE_RC+x}" ]; then
 			REALMLEAVE_RC=0
@@ -1697,7 +1766,6 @@ log_info "🔧 Ensuring /etc/krb5.conf consistency for realm $REALM"
 
 KRB_CONF="/etc/krb5.conf"
 REALM_UPPER="${REALM^^}"
-DOMAIN_LOWER="${DOMAIN,,}"
 
 # Backup existing krb5.conf if present
 if [[ -f "$KRB_CONF" ]]; then
@@ -1773,7 +1841,7 @@ case $OS_FAMILY in
 		run_cmd_logged pam-auth-update --enable sss mkhomedir --force
 	;;
 	rhel)
-		RHEL_MAJOR=$(rpm -q --qf '%{VERSION}' $(rpm -qf /etc/redhat-release) | cut -d. -f1)
+		RHEL_MAJOR="$(get_major_version_id)"
 		if (( RHEL_MAJOR < 8 )); then
 			# RHEL/CentOS/OL 6–7 -> authconfig
             run_cmd_logged env LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --update
@@ -2089,15 +2157,6 @@ if $DRY_RUN; then
     log_info "[DRY-RUN] Would normalize CRLF in $NSS_FILE"
 else
     sed -i 's/\r$//' "$NSS_FILE"
-fi
-
-# Choose a portable sed extended-regex flag (-E preferred, fallback to -r)
-if echo | sed -E 's/(.*)//' >/dev/null 2>&1; then
-	SED_EXT='-E'
-elif echo | sed -r 's/(.*)//' >/dev/null 2>&1; then
-	SED_EXT='-r'
-else
-	log_error "sed without extended regex support (-E/-r) - install a compatible sed." 1
 fi
 
 # Backup prior to modifications
@@ -2683,6 +2742,7 @@ set +e +o pipefail
 TRUST_STATUS="⚠️ Trust check failed"
 
 REALM_UPPER="${REALM^^}"
+DOMAIN_LOWER="${DOMAIN,,}"
 PRINCIPAL="$(hostname -s | tr '[:lower:]' '[:upper:]')\$@${REALM_UPPER}"
 KRB_LOG=$(mktemp)
 START_MS=$(date +%s%3N)
@@ -2831,7 +2891,7 @@ write_file 0600 "$SSSD_CONF" <<EOF
 # ============================================================================
 [sssd]
 config_file_version = 2
-services = nss,pam,sudo
+services = nss,pam
 domains = $REALM
 
 
@@ -2841,16 +2901,16 @@ domains = $REALM
 [domain/$REALM]
 id_provider = ad
 auth_provider = ad
-access_provider = simple
+access_provider = permit
 chpass_provider = ad
 
 
 # -------------------------------------------------------------------------
 # Active Directory and Kerberos parameters
 # -------------------------------------------------------------------------
-ad_domain = $REALM
+ad_domain = $DOMAIN_LOWER
 ad_hostname = $HOST_FQDN
-krb5_realm = $REALM
+krb5_realm = $REALM_UPPER
 krb5_keytab = /etc/krb5.keytab
 realmd_tags = manages-system joined-with-adcli
 
@@ -2949,8 +3009,13 @@ if [[ -f "$PAM_SU_FILE" ]]; then
           }
         ' "$PAM_SU_FILE" >"$tmp_su"
 
-        mv -f "$tmp_su" "$PAM_SU_FILE"
-        chmod 644 "$PAM_SU_FILE"
+        if $DRY_RUN; then
+            log_info "[DRY-RUN] Would update $PAM_SU_FILE to include pam_sss.so (non-destructive)"
+            rm -f "$tmp_su"
+        else
+            mv -f "$tmp_su" "$PAM_SU_FILE"
+            chmod 644 "$PAM_SU_FILE"
+        fi
         log_info "✅ pam_sss binding injected into $PAM_SU_FILE (original preserved in $su_backup)"
     fi
 else
@@ -3089,19 +3154,12 @@ fi
 # Normalize multiple spaces and trim ends
 ALLOW_GROUPS="$(echo "$ALLOW_GROUPS" | xargs)"
 
-# Apply AllowGroups config
-if grep -q '^AllowGroups' "$cfg"; then
-    run_cmd sed -i "/^AllowGroups/c\\AllowGroups $ALLOW_GROUPS" "$cfg"
-else
-    append_line "$cfg" "AllowGroups $ALLOW_GROUPS"
-fi
+# Apply AllowGroups directive
+sshd_set_directive_dedup "AllowGroups" "$ALLOW_GROUPS" "$cfg"
 log_info "🧩 AllowGroups updated -> AllowGroups $ALLOW_GROUPS"
 
-if grep -q '^PasswordAuthentication' "$cfg"; then
-    run_cmd sed -i "/^PasswordAuthentication/c\\PasswordAuthentication yes" "$cfg"
-else
-    append_line "$cfg" "PasswordAuthentication yes"
-fi
+# Configure SSH PasswordAuthentication
+sshd_set_directive_dedup "PasswordAuthentication" "$PASSWORD_AUTHENTICATION" "$cfg"
 
 # -------------------------------------------------------------------------
 # SSH session keepalive timeout (simple: user enters seconds; CountMax fixed)
@@ -3552,7 +3610,7 @@ log_info "🔎 Enumerating administrative groups"
 
 declare -a RAW_GROUPS=()
 for f in "${FILES[@]}"; do
-    while IFS= read -r line; do
+    while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" =~ ^%([A-Za-z0-9._-]+)[[:space:]] ]]; then
             RAW_GROUPS+=("${BASH_REMATCH[1]}")
         fi
@@ -3584,7 +3642,7 @@ else
 		tmp="$(mktemp "/tmp/$(basename "$f").XXXXXX")"
         : >"$tmp"
 
-		while IFS= read -r line; do
+		while IFS= read -r line || [[ -n "$line" ]]; do
 			original="$line"
 			handled=false
 
