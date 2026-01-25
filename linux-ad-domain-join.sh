@@ -338,17 +338,20 @@ EOF
 
 sshd_set_directive_dedup() {
     # Ensures the directive is set once in the global section (before any Match blocks),
-    # while preserving any Match-specific overrides.
+    # while preserving any Match-specific overrides. Preserves perms/owner.
     local key="$1" value="$2" file="$3"
+    local tmp
 
     if $DRY_RUN; then
         log_info "[DRY-RUN] Would set global '$key $value' in $file (deduplicated, preserving Match blocks)"
         return 0
     fi
 
+    tmp="$(mktemp "${file}.XXXXXX")" || log_error "Failed to create temporary file for $file" 1
+
     awk -v k="$key" -v v="$value" '
         BEGIN { in_match=0; inserted=0 }
-        /^[[:space:]]*Match[[:space:]]+/ { 
+        /^[[:space:]]*Match[[:space:]]+/ {
             if (inserted==0) { print k " " v; inserted=1 }
             in_match=1
             print
@@ -356,15 +359,17 @@ sshd_set_directive_dedup() {
         }
         {
             if (in_match==0) {
-                # In global section: drop existing directives for key
                 if ($0 ~ "^[[:space:]]*"k"[[:space:]]+") next
             }
             print
         }
-        END {
-            if (inserted==0) print k " " v
-        }
-    ' "$file" > "${file}.tmp" && mv -f "${file}.tmp" "$file"
+        END { if (inserted==0) print k " " v }
+    ' "$file" >"$tmp" || { rm -f "$tmp"; log_error "Failed to render new sshd_config content for $file" 1; }
+
+    chown --reference="$file" "$tmp" 2>/dev/null || true
+    chmod --reference="$file" "$tmp" 2>/dev/null || true
+
+    mv -f "$tmp" "$file"
 }
 
 validate_sshd_config_or_die() {
@@ -1560,7 +1565,12 @@ create_secret_passfile() {
     PASS_FILE="$(mktemp "${base}/.adjoin.pass.XXXXXX")" || log_error "Failed to create PASS_FILE in ${base}" 1
     chmod 600 "$PASS_FILE" 2>/dev/null || true
 
-    # Store password (single line). Newlines in password are not supported.
+    # Store password as a single line (no trailing newline).
+    # OpenLDAP -y reads the entire file as password; newline/CR would be treated as part of the secret.
+    if [[ "${DOMAIN_PASS:-}" == *$'\n'* || "${DOMAIN_PASS:-}" == *$'\r'* ]]; then
+        log_error "DOMAIN_PASS contains newline/CR characters; refusing because ldapsearch -y would treat them as part of the password." 1
+    fi
+
     printf '%s' "$DOMAIN_PASS" > "$PASS_FILE" || log_error "Failed to write PASS_FILE" 1
 
     # Remove from memory ASAP
@@ -2279,9 +2289,10 @@ fi
 # -------------------------------------------------------------------------
 if $DRY_RUN; then
     log_info "[DRY-RUN] Would update $NSS_FILE with NSS/SSSD mappings (preview):"
-    grep -E '^(passwd|shadow|group|services|netgroup|sudoers):' "$NSS_EDIT" 2>/dev/null | while IFS= read -r l; do
-        log_info "   $l"
-    done
+    # Read via process substitution to avoid pipefail abort when grep finds no matches
+    while IFS= read -r l || [[ -n "$l" ]]; do
+        [[ -n "$l" ]] && log_info "   $l"
+    done < <(grep -E '^(passwd|shadow|group|services|netgroup|sudoers):' "$NSS_EDIT" 2>/dev/null || true)
 else
     # NSS_EDIT may already be NSS_FILE in non-DRY-RUN mode; avoid cp same-file failure.
     if [[ "$NSS_EDIT" != "$NSS_FILE" ]]; then
@@ -3084,7 +3095,7 @@ if command -v systemctl &>/dev/null; then
         
         log_info "✅ Systemd detected. Attempting restart of ${LOGIND_UNIT} to refresh PAM/D-Bus"
 
-        run_cmd systemctl restart "$LOGIND_UNIT" >/dev/null 2>&1
+        run_cmd systemctl restart "$LOGIND_UNIT"
         if (( CMD_LAST_RC == 0 )); then
             log_info "🚀 ${LOGIND_UNIT} restarted successfully."
         else
@@ -3264,7 +3275,7 @@ EOF
 if $DRY_RUN; then
     log_info "[DRY-RUN] Would validate sudoers syntax: visudo -cf $BLOCK_FILE"
 else
-    run_cmd_logged visudo -cf "$BLOCK_FILE" >/dev/null 2>&1
+    run_cmd_logged visudo -cf "$BLOCK_FILE"
 fi
 
 log_info "🔒 ROOT_SHELLS alias applied"
@@ -3545,8 +3556,8 @@ rm -f "$VISUDO_LOG"
 if [[ $VISUDO_RC -eq 0 ]]; then
     # SUCCESS: Log the detailed output (including warnings and 'parsed OK' messages)
     if [[ -n "$VISUDO_OUTPUT" ]]; then
-        echo "$VISUDO_OUTPUT" | while IFS= read -r line; do
-            log_info "ℹ️ $line"
+        echo "$VISUDO_OUTPUT" | while IFS= read -r line || [[ -n "$line" ]]; do
+            [[ -n "$line" ]] && log_info "ℹ️ $line"
         done
     fi
     
@@ -3560,8 +3571,8 @@ else
     log_info "❌ visudo syntax check failed. Details:"
     
     # Log the detailed error from visudo
-    echo "$VISUDO_OUTPUT" | while IFS= read -r line; do
-        log_info "   visudo: $line"
+    echo "$VISUDO_OUTPUT" | while IFS= read -r line || [[ -n "$line" ]]; do
+        [[ -n "$line" ]] && log_info "   visudo: $line"
     done
     
     # Clean up temp file (always clean the temp file)
@@ -3596,12 +3607,12 @@ log_info "🗂️ Enumerating sudoers configuration files"
 
 FILES=("$SUDOERS_MAIN")
 
-while IFS= read -r f; do
+while IFS= read -r -d '' f; do
     [[ "$f" == "$BLOCK_FILE" ]] && continue
     [[ "$f" =~ README ]] && continue
     [[ "$f" =~ \.bak ]] && continue
     FILES+=("$f")
-done < <(find "$SUDOERS_DIR" -maxdepth 1 -type f)
+done < <(find "$SUDOERS_DIR" -maxdepth 1 -type f -print0)
 
 # -------------------------------------------------------------------------
 # Extract administrative groups from all sudoers files
@@ -3702,7 +3713,9 @@ else
 		if [[ $VISUDO_RC -ne 0 ]]; then
 			log_info "❌ Sudoers drop-in check failed for $f. Details:"
 			# Log the detailed error from visudo
-			echo "$VISUDO_OUTPUT" | while IFS= read -r line; do log_info "   visudo: $line"; done
+			echo "$VISUDO_OUTPUT" | while IFS= read -r line || [[ -n "$line" ]]; do
+                [[ -n "$line" ]] && log_info "   visudo: $line"
+            done
 
 			rm -f "$tmp"
 			# The 'continue' statement prevents committing the bad file, relying on the backup.
