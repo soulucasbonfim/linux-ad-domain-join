@@ -1,6 +1,13 @@
 #!/bin/bash
-# =================================================================================================
+# -------------------------------------------------------------------------------------------------
 # Script Name:        linux-ad-domain-join.sh
+# -------------------------------------------------------------------------------------------------
+# Author:      Lucas Bonfim de Oliveira Lima
+# LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
+# GitHub:      https://github.com/soulucasbonfim
+# Created:     2025-04-27
+# Version:     2.5
+# License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
 #   Automates the process of joining a Linux host to an Active Directory (AD) domain.
@@ -23,16 +30,18 @@
 #     7. SSSD configuration and validation (sssctl config-check)
 #     8. PAM, SSH, and sudoers integration with AD groups
 #     9. Dynamic DNS and chrony setup for secure updates
+#    10. Comprehensive logging and backup of modified files
 #
 # -------------------------------------------------------------------------------------------------
 # Usage:
-#   ./linux-ad-domain-join.sh [--dry-run] [--yes|-y] [--verbose|-v]
+#   sudo ./linux-ad-domain-join.sh [options]
 #
 # Options:
 #   --dry-run         Simulate all actions without applying changes
 #   --yes, -y         Non-interactive mode (requires DOMAIN, OU, DC_SERVER,
 #                     DOMAIN_USER, DOMAIN_PASS, GLOBAL_ADMIN_GROUPS as env vars)
 #   --verbose, -v     Enable full command output and debugging traces
+#   --validate-only   Validate configuration and prerequisites without making changes
 #
 # -------------------------------------------------------------------------------------------------
 # Requirements:
@@ -55,19 +64,18 @@
 #   Log symbols are normalized to ASCII (no Unicode dependencies).
 #
 # -------------------------------------------------------------------------------------------------
-# Compatibility Matrix:
-#   • Ubuntu 18.04 / 20.04 / 22.04 / 24.04 (APT)
-#   • Debian 10+ (APT)
-#   • Oracle Linux 7.x / 8.x / 9.x (YUM/DNF)
-#   • RHEL / Rocky / AlmaLinux 7.x–9.x (YUM/DNF)
-#   • SUSE Linux Enterprise 12 / 15 (Zypper)
+# Backup:
+#   Backups of modified configuration files are stored in:
+#       /var/backups/linux-ad-domain-join/<timestamp>_<hostname>_<pid>/
+#   Old backups are pruned automatically (keeping last 20 runs).
 #
 # -------------------------------------------------------------------------------------------------
-# Author:      Lucas Bonfim de Oliveira Lima
-# LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
-# Created:     2025-04-27
-# Version:     2.2
-# License:     MIT
+# Supported Linux distributions:
+#     - RHEL/CentOS/AlmaLinux/RockyLinux 7, 8, 9
+#     - Ubuntu 16.04, 18.04, 20.04, 22.04, 24.04
+#     - Debian 9, 10, 11, 12
+#     - SUSE Linux Enterprise Server (SLES) 12, 15
+#     - openSUSE Leap 15.x
 #
 # -------------------------------------------------------------------------------------------------
 # Exit Codes:
@@ -85,10 +93,22 @@
 #   14 - Unknown Kerberos failure
 #   15 - No active network interface or IP address detected
 #  100 - Missing packages and system offline (no installation possible)
+#  101 - Unsupported Linux distribution
+#  127 - Command not found
 #
 # -------------------------------------------------------------------------------------------------
-scriptVersion="2.2"
-set -euo pipefail
+
+# Define script version
+scriptVersion="$(grep -m1 "^# Version:" "${BASH_SOURCE[0]:-$0}" 2>/dev/null | awk '{print $NF}' || echo "unknown")"
+
+# Strict mode
+set -Eeuo pipefail
+
+# Require Bash 4+ (associative arrays, mapfile).
+if [[ -z "${BASH_VERSINFO[0]:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
+    echo "[$(date '+%F %T')] [ERROR] Bash 4+ required. Current: ${BASH_VERSION:-unknown}" >&2
+    exit 1
+fi
 
 # -------------------------------------------------------------------------
 # Choose a portable sed extended-regex flag (-E preferred, fallback to -r)
@@ -102,11 +122,24 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Logging functions (ASCII-safe for non-Unicode terminals)
+# Log message sanitizer - replaces emojis with ASCII equivalents
 # -------------------------------------------------------------------------
 sanitize_log_msg() {
+    # Prefer UTF-8 locale for emoji matching; fallback to C if unavailable.
+    local sed_locale="C"
+
+    if locale -a 2>/dev/null | grep -qiE '^(C\.UTF-8|en_US\.UTF-8|pt_BR\.UTF-8)$'; then
+        if locale -a 2>/dev/null | grep -qi '^C\.UTF-8$'; then
+            sed_locale="C.UTF-8"
+        elif locale -a 2>/dev/null | grep -qi '^en_US\.UTF-8$'; then
+            sed_locale="en_US.UTF-8"
+        else
+            sed_locale="pt_BR.UTF-8"
+        fi
+    fi
+
     # shellcheck disable=SC2086  # SED_EXT must be expanded as a flag (-E/-r)
-    LC_ALL=C sed $SED_EXT '
+    LC_ALL="$sed_locale" sed $SED_EXT '
         # Warnings / Alerts
         s/⚠|⚠️|❗|❕|🚨|📛|🧯|🔥|💣|🧨/[!]/g;
         # Informational / Neutral
@@ -126,6 +159,9 @@ sanitize_log_msg() {
     '
 }
 
+# -------------------------------------------------------------------------
+# Log info and error functions with sanitization
+# -------------------------------------------------------------------------
 log_info() {
     local msg="$1"
     msg="$(sanitize_log_msg <<< "$msg")"
@@ -155,9 +191,9 @@ read_sanitized() {
     read -rp "[$(date '+%F %T')] $sanitized" "$var_name"
 }
 
-# ==========================================================================================
+# -------------------------------------------------------------------------
 # Utility: Print a safe divider, resistant to SSH/tmux/resize mismatches.
-# ==========================================================================================
+# -------------------------------------------------------------------------
 print_divider() {
     local cols
 
@@ -210,17 +246,10 @@ if [[ ! "$HOSTNAME_SHORT" =~ ^[A-Za-z0-9-]+$ ]]; then
     log_error "Hostname '$HOSTNAME_SHORT' contains invalid characters for AD join. Use only letters, digits, and hyphen (-)." 1
 fi
 
-# -------------------------------------------------------------------------
-# Setup logging
-# -------------------------------------------------------------------------
-LOG_FILE="/var/log/linux-ad-domain-join.log"
-mkdir -p "$(dirname "$LOG_FILE")"
-: > "$LOG_FILE"
-exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
-
 DRY_RUN=false
 NONINTERACTIVE=false
 VERBOSE=false
+VALIDATE_ONLY=false
 
 # Parse flags
 while [[ $# -gt 0 ]]; do
@@ -228,6 +257,7 @@ while [[ $# -gt 0 ]]; do
         --dry-run)    DRY_RUN=true ;;
         --yes|-y)     NONINTERACTIVE=true ;;
         --verbose|-v) VERBOSE=true ;;
+        --validate-only) VALIDATE_ONLY=true ;;
         *)
             log_error "Unknown option: $1" 1
             ;;
@@ -243,6 +273,46 @@ FORCE="${FORCE:-false}"
 DRY_RUN="${DRY_RUN:-false}"
 NONINTERACTIVE="${NONINTERACTIVE:-false}"
 VERBOSE="${VERBOSE:-false}"
+VALIDATE_ONLY="${VALIDATE_ONLY:-false}"
+
+# -------------------------------------------------------------------------
+# Logging + Backup roots (after flags/defaults)
+# - avoids hard dependency on tee before deps are installed
+# - VALIDATE_ONLY uses /tmp to keep the run non-invasive
+# -------------------------------------------------------------------------
+if $VALIDATE_ONLY; then
+    LOG_FILE="${LOG_FILE:-/tmp/linux-ad-domain-join.validate.log}"
+    BACKUP_ROOT="${BACKUP_ROOT:-/tmp/linux-ad-domain-join-backups}"
+else
+    LOG_FILE="${LOG_FILE:-/var/log/linux-ad-domain-join.log}"
+    BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/linux-ad-domain-join}"
+fi
+
+# Ensure log directory exists (best-effort) + ensure log is writable
+mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+if ! : >>"$LOG_FILE" 2>/dev/null; then
+    # Fallback if /var/log is not writable for any reason (shouldn't happen as root, but safe)
+    LOG_FILE="/tmp/linux-ad-domain-join.log"
+    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    : >>"$LOG_FILE" 2>/dev/null || { echo "[$(date '+%F %T')] [ERROR] Cannot write LOG_FILE=$LOG_FILE" >&2; exit 1; }
+fi
+
+# Redirect stdout/stderr to log; mirror to console only if tee exists
+if command -v tee >/dev/null 2>&1; then
+    : >"$LOG_FILE" 2>/dev/null || true
+    exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
+else
+    : >"$LOG_FILE" 2>/dev/null || true
+    exec >>"$LOG_FILE" 2>&1
+fi
+
+log_info "💾 Log file: $LOG_FILE"
+
+# -------------------------------------------------------------------------
+# Backup root (centralized) - one directory per execution
+# -------------------------------------------------------------------------
+BACKUP_RUN_ID="$(date +%Y%m%d_%H%M%S)_$(hostname -s)_$$"
+BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_RUN_ID}"
 
 to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
 
@@ -255,9 +325,64 @@ trim_line() {
         -e '/[Cc]url error/ s/[[:space:]]\[[^]]*][[:space:]]*$//'
 }
 
-# ==========================================================================================
+init_backup_dir() {
+    if $VALIDATE_ONLY; then
+        log_info "[VALIDATE-ONLY] Backup directory creation suppressed: $BACKUP_DIR"
+        return 0
+    fi
+
+    if $DRY_RUN; then
+        log_info "[DRY-RUN] Would create backup directory: $BACKUP_DIR"
+        return 0
+    fi
+
+    mkdir -p -- "$BACKUP_DIR"
+    chmod 700 -- "$BACKUP_DIR" 2>/dev/null || true
+    log_info "💾 Backup directory: $BACKUP_DIR"
+}
+
+backup_prune_old_runs() {
+    # Prune old backup runs safely under set -eEuo pipefail.
+    # Uses find+sort, does not fail when directory is empty.
+    local keep="${1:-20}"
+
+    if $VALIDATE_ONLY; then
+        log_info "[VALIDATE-ONLY] Backup pruning suppressed"
+        return 0
+    fi
+
+    $DRY_RUN && { log_info "[DRY-RUN] Would prune backups in $BACKUP_ROOT (keep last $keep)"; return 0; }
+    [[ -d "$BACKUP_ROOT" ]] || return 0
+
+    local tmp_list
+    tmp_list="$(mktemp)" || return 0
+
+    # List subdirs by mtime (newest first). No failure if empty.
+    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
+      | sort -nr >"$tmp_list" || true
+
+    local total
+    total="$(wc -l <"$tmp_list" 2>/dev/null || echo 0)"
+    [[ "$total" =~ ^[0-9]+$ ]] || total=0
+
+    if (( total > keep )); then
+        tail -n +"$((keep+1))" "$tmp_list" | awk '{print $2}' | while IFS= read -r d || [[ -n "$d" ]]; do
+            [[ -n "$d" ]] && rm -rf -- "$d" || true
+        done
+    fi
+
+    rm -f "$tmp_list"
+}
+
+# initialize backup directory
+init_backup_dir
+
+# delete old backups, keep only last N runs
+backup_prune_old_runs 20
+
+# -------------------------------------------------------------------------
 # Session timeout inputs (SSH + Shell)
-# ==========================================================================================
+# -------------------------------------------------------------------------
 
 is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
@@ -286,14 +411,13 @@ disable_tmout_in_profile_d() {
         # detect common TMOUT patterns (assign/export/readonly)
         grep -qE '^[[:space:]]*(readonly[[:space:]]+)?TMOUT=|^[[:space:]]*export[[:space:]]+TMOUT\b|^[[:space:]]*readonly[[:space:]]+TMOUT\b' "$f" || continue
 
-        bk="${f}.bak.$(date +%s)"
+        # Backup before modifying
+        backup_file "$f" bk
 
         if $DRY_RUN; then
             log_info "[DRY-RUN] Would disable TMOUT lines in $f (backup: $bk)"
             continue
         fi
-
-        cp -p "$f" "$bk"
 
         # Comment only TMOUT-related lines (do not destroy file logic)
         sed -i $SED_EXT \
@@ -389,17 +513,63 @@ validate_sshd_config_or_die() {
     "$sshd_bin" -t -f "$file" || log_error "Invalid sshd_config after changes. Backup preserved; refusing to restart SSH." 1
 }
 
+detect_service_unit() {
+    # Returns the first unit that exists (systemd).
+    local u
+    command -v systemctl >/dev/null 2>&1 || { echo ""; return 1; }
+
+    for u in "$@"; do
+        if systemctl list-unit-files --no-legend --no-pager "$u" 2>/dev/null | awk '{print $1}' | grep -qx "$u"; then
+            echo "$u"; return 0
+        fi
+        if [[ -f "/etc/systemd/system/$u" || -f "/usr/lib/systemd/system/$u" || -f "/lib/systemd/system/$u" ]]; then
+            echo "$u"; return 0
+        fi
+    done
+
+    echo ""
+    return 1
+}
+
 # Extract the first real command (ignores env wrapper, flags, and VAR=VAL)
 first_bin_from_cmd() {
     local arg
+    local timeout_skip_next_nonflag=false
+
     for arg in "$@"; do
-        [[ "$arg" == "env" ]] && continue
+        # wrappers comuns (ignorar)
+        case "$arg" in
+            env|command|sudo|nohup|setsid|nice|ionice)
+                continue
+                ;;
+            timeout)
+                timeout_skip_next_nonflag=true
+                continue
+                ;;
+        esac
+
+        # timeout: pula opções (-k, --foreground, etc) e a duração (ex: 90, 90s, 0.5, 2m)
+        if $timeout_skip_next_nonflag; then
+            if [[ "$arg" == -* ]]; then
+                continue
+            fi
+            # provável duração
+            if [[ "$arg" =~ ^[0-9]+([.][0-9]+)?([smhd])?$ ]]; then
+                timeout_skip_next_nonflag=false
+                continue
+            fi
+            # se não parecia duração, então é o bin real
+            timeout_skip_next_nonflag=false
+        fi
+
         [[ "$arg" == -- ]] && continue
         [[ "$arg" == -* ]] && continue
         [[ "$arg" =~ ^[A-Za-z_][A-Za-z0-9_]*= ]] && continue
+
         echo "$arg"
         return 0
     done
+
     echo ""
     return 1
 }
@@ -419,7 +589,7 @@ parse_pkg_error() {
 
         # APT: “NO_PUBKEY <KEYID>”
         local pk_apt
-        pk_apt=$(grep -m1 -oE 'NO_PUBKEY[[:space:]]+[0-9A-F]+' "$log" | trim_line)
+        pk_apt=$(grep -m1 -oE 'NO_PUBKEY[[:space:]]+[0-9A-Fa-f]+' "$log" | trim_line)
         [[ -n "$pk_apt" ]] && log_info "🔑 Missing key: ${pk_apt#NO_PUBKEY }"
 
         # Common Zypper messages
@@ -518,6 +688,72 @@ _cmd_run_capture() {
     return $?
 }
 
+is_mutating_cmd() {
+    # Decide se um comando pode alterar o sistema. Se sim, em VALIDATE_ONLY ele será suprimido.
+    local first_bin="$1"; shift
+    local -a args=( "$@" )
+
+    # Bins tipicamente mutáveis
+    case "$first_bin" in
+        rm|mv|cp|install|chmod|chown|chgrp|ln|truncate|dd|tee|visudo|useradd|usermod|groupadd|groupmod|passwd)
+            return 0
+            ;;
+        systemctl|service|chkconfig|update-rc.d)
+            # start/stop/restart/enable/disable são mutáveis
+            for a in "${args[@]}"; do
+                case "$a" in
+                    start|stop|restart|reload|enable|disable|mask|unmask|daemon-reload|daemon-reexec)
+                        return 0
+                        ;;
+                esac
+            done
+            ;;
+        sed)
+            # sed -i é mutável
+            for a in "${args[@]}"; do
+                [[ "$a" == -i* ]] && return 0
+            done
+            ;;
+        hostnamectl)
+            return 0
+            ;;
+        hostname)
+            # Only mutating when setting hostname (rare here); reads are not mutating.
+            for a in "${args[@]}"; do
+                [[ "$a" == -* ]] && continue
+                # If a non-flag argument exists, treat as mutating (hostname NEWNAME).
+                return 0
+            done
+            return 1
+            ;;
+        realm)
+            for a in "${args[@]}"; do
+                case "$a" in
+                    join|leave) return 0 ;;
+                esac
+            done
+            ;;
+        adcli)
+            for a in "${args[@]}"; do
+                case "$a" in
+                    join) return 0 ;;
+                esac
+            done
+            ;;
+        authconfig|authselect|pam-auth-update|pam-config)
+            return 0
+            ;;
+        ldapmodify)
+            return 0
+            ;;
+        mkdir|rmdir|touch)
+            return 0
+            ;;
+    esac
+
+    return 1
+}
+
 cmd_run() {
     # Usage: cmd_run <cmd> [args...]
     # Non-fatal: returns command RC. Logs failures (classified for pkg managers).
@@ -529,6 +765,14 @@ cmd_run() {
     exec_bin="${cmd[0]}"
     first_bin="$(first_bin_from_cmd "${cmd[@]}")"
     [[ -z "$first_bin" ]] && first_bin="$exec_bin"
+
+    # VALIDATE_ONLY: suprimir comandos mutáveis (read-only mode)
+    if $VALIDATE_ONLY; then
+        if is_mutating_cmd "$first_bin" "${cmd[@]:1}"; then
+            log_info "[VALIDATE-ONLY] Suppressed mutating command: $(print_cmd_quoted "${cmd[@]}")"
+            return 0
+        fi
+    fi
 
     if $DRY_RUN; then
         echo -n "[DRY-RUN] "
@@ -554,7 +798,7 @@ cmd_run() {
         fi
     fi
 
-    tmp_out="$(mktemp)"
+    tmp_out="$(mktemp)" || { log_info "❗ mktemp failed (cannot capture command output)"; return 1; }
     if _cmd_run_capture "$tmp_out" "${cmd[@]}"; then
         rm -f "$tmp_out"
         return 0
@@ -622,6 +866,13 @@ cmd_run_in() {
     first_bin="$(first_bin_from_cmd "${cmd[@]}")"
     [[ -z "$first_bin" ]] && first_bin="$exec_bin"
 
+    if $VALIDATE_ONLY; then
+        if is_mutating_cmd "$first_bin" "${cmd[@]:1}"; then
+            log_info "[VALIDATE-ONLY] Suppressed mutating command: $(print_cmd_quoted "${cmd[@]}") < $stdin_file"
+            return 0
+        fi
+    fi
+
     if $DRY_RUN; then
         echo -n "[DRY-RUN] "
         print_cmd_quoted "${cmd[@]}"
@@ -645,7 +896,7 @@ cmd_run_in() {
         fi
     fi
 
-    tmp_out="$(mktemp)"
+    tmp_out="$(mktemp)" || { log_info "❗ mktemp failed (cannot capture command output)"; return 1; }
     if LC_ALL=C LANG=C "${cmd[@]}" <"$stdin_file" >"$tmp_out" 2>&1; then
         rm -f "$tmp_out"
         return 0
@@ -705,7 +956,8 @@ check_cmd() {
 # -------------------------------------------------------------------------
 safe_realm_list() {
     local timeout_s=5
-    local tmp_out; tmp_out="$(mktemp)"
+    local tmp_out
+    tmp_out="$(mktemp)" || { echo ""; log_info "❗ mktemp failed in safe_realm_list()"; return 0; }
 
     if ! command -v realm >/dev/null 2>&1; then
         # Older systems: emulate empty result
@@ -727,33 +979,104 @@ safe_realm_list() {
 }
 
 # -------------------------------------------------------------------------
-# Dry-run aware file operations
+# File manipulation helpers
 # -------------------------------------------------------------------------
 backup_file() {
-    # Usage: backup_file /path/file -> prints backup path to stdout
-    local path="$1"
-    local bak="${path}.bak.$(date +%s)"
+    # Usage:
+    #   backup_file /path/file            -> prints backup path to stdout (ONLY)
+    #   backup_file /path/file outvar     -> sets variable 'outvar' with backup path (no stdout)
+    #
+    # Behavior: idempotent per run (one backup per file path).
+    local path="${1:-}"
+    local __outvar="${2:-}"
 
-    if $DRY_RUN; then
-        log_info "[DRY-RUN] Would backup $path to $bak"
-        echo "$bak"
+    if [[ -z "$path" ]]; then
+        log_error "backup_file: missing path argument" 19
+    fi
+
+    # Validate outvar name if provided
+    if [[ -n "$__outvar" && ! "$__outvar" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
+        log_error "backup_file: invalid output variable name: '$__outvar'" 19
+    fi
+
+    local rel="${path#/}"  # remove leading /
+    local bak_dir="${BACKUP_DIR}/$(dirname "$rel")"
+    local bak="${BACKUP_DIR}/${rel}"
+
+    # Helper: return backup path via stdout or assign to var
+    # (inline to avoid creating global helper functions)
+    if $VALIDATE_ONLY; then
+        log_info "[VALIDATE-ONLY] 💾 Would backup '$path' -> '$bak' (suppressed)" >&2
+        if [[ -n "$__outvar" ]]; then
+            printf -v "$__outvar" '%s' "$bak"
+        else
+            printf '%s\n' "$bak"
+        fi
         return 0
     fi
 
-    [[ -f "$path" ]] || { echo "$bak"; return 0; }
-    cp -p -- "$path" "$bak"
-    echo "$bak"
+    if $DRY_RUN; then
+        log_info "[DRY-RUN] 💾 Would backup '$path' -> '$bak'" >&2
+        if [[ -n "$__outvar" ]]; then
+            printf -v "$__outvar" '%s' "$bak"
+        else
+            printf '%s\n' "$bak"
+        fi
+        return 0
+    fi
+
+    mkdir -p -- "$bak_dir" || log_error "Failed to create backup dir: $bak_dir" 20
+
+    # If we already backed up this file in this run, do not copy again
+    if [[ -f "$bak" ]]; then
+        log_info "ℹ Backup already exists for this run: $bak" >&2
+        if [[ -n "$__outvar" ]]; then
+            printf -v "$__outvar" '%s' "$bak"
+        else
+            printf '%s\n' "$bak"
+        fi
+        return 0
+    fi
+
+    # If file doesn't exist, still return planned backup path
+    if [[ ! -f "$path" ]]; then
+        log_info "ℹ Backup skipped (file not found): '$path' -> (planned) '$bak'" >&2
+        if [[ -n "$__outvar" ]]; then
+            printf -v "$__outvar" '%s' "$bak"
+        else
+            printf '%s\n' "$bak"
+        fi
+        return 0
+    fi
+
+    # log before performing the copy
+    log_info "💾 Backing up: '$path' -> '$bak'" >&2
+
+    cp -p -- "$path" "$bak" || log_error "Failed to backup '$path' to '$bak'" 21
+
+    log_info "💾 Backup saved: $bak" >&2
+
+    if [[ -n "$__outvar" ]]; then
+        printf -v "$__outvar" '%s' "$bak"
+    else
+        printf '%s\n' "$bak"
+    fi
 }
 
 write_file() {
     # Usage: write_file <mode> <path>  (content via stdin)
-    # Uses install for permissions and parent dir creation.
+    # Notes: VALIDATE_ONLY suppresses writes but still consumes stdin.
     local mode="$1"
     local path="$2"
 
+    if $VALIDATE_ONLY; then
+        log_info "[VALIDATE-ONLY] Would write $path (mode $mode) - suppressed"
+        cat >/dev/null
+        return 0
+    fi
+
     if $DRY_RUN; then
         log_info "[DRY-RUN] Would write $path (mode $mode)"
-        # Consume stdin to avoid blocking callers using heredoc
         cat >/dev/null
         return 0
     fi
@@ -765,6 +1088,11 @@ append_line() {
     # Usage: append_line <path> <line>
     local path="$1"
     local line="$2"
+
+    if $VALIDATE_ONLY; then
+        log_info "[VALIDATE-ONLY] Would append to $path: $line - suppressed"
+        return 0
+    fi
 
     if $DRY_RUN; then
         log_info "[DRY-RUN] Would append to $path: $line"
@@ -785,6 +1113,11 @@ append_line_unique() {
     local path="$1" line="$2"
     grep -Fxq -- "$line" "$path" 2>/dev/null && return 0
     append_line "$path" "$line"
+}
+
+# Milliseconds timestamp with fallback
+now_ms() {
+    date +%s%3N 2>/dev/null || echo "$(( $(date +%s) * 1000 ))"
 }
 
 # -------------------------------------------------------------------------
@@ -914,7 +1247,7 @@ case "$ID" in
     ubuntu|debian) OS_FAMILY=debian; PKG=apt; SSH_G=sudo ;;
     rhel|rocky|almalinux|centos) OS_FAMILY=rhel; ver="$(get_major_version_id)"; PKG=$([[ "$ver" -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
     oracle|ol) OS_FAMILY=rhel; ver="$(get_major_version_id)"; [[ "$ver" -eq 0 ]] && ver="$(grep -Eo '[0-9]+' /etc/oracle-release 2>/dev/null | head -n1 || echo 0)"; PKG=$([[ "$ver" -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
-    sles|suse) OS_FAMILY=suse; PKG=zypper; SSH_G=wheel ;;
+    sles|suse|opensuse-leap|opensuse|opensuse-tumbleweed) OS_FAMILY=suse; PKG=zypper; SSH_G=wheel ;;
     fedora) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
     amzn) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
     *) log_error "Unsupported distro: $ID. You may need to extend the detection logic." ;;
@@ -925,7 +1258,7 @@ OS_ARCH=$(uname -m)
 KERNEL_VER=$(uname -r)
 
 log_info "🧾 Starting linux-ad-domain-join.sh version $scriptVersion..."
-log_info "🌐 Hostname: $(hostname) / IP(s): $(hostname -I | awk '{print $1}')"
+log_info "🌐 Hostname: $(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 log_info "🧬 OS detected: $OS_NAME ($ID $OS_VERSION, kernel $KERNEL_VER, arch $OS_ARCH)"
 log_info "🧬 OS family: $OS_FAMILY, Package Manager: $PKG, SSH group: $SSH_G"
 
@@ -994,50 +1327,54 @@ done
 # [Self-Healing] Detect and repair RPM database corruption (RHEL-like only)
 # -------------------------------------------------------------------------
 if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release || -f /etc/rocky-release || -f /etc/almalinux-release ]]; then
-    log_info "🧩 Checking RPM database integrity"
-
-    release_file=""
-    for f in /etc/redhat-release /etc/centos-release /etc/oracle-release /etc/rocky-release /etc/almalinux-release; do
-        [[ -f "$f" ]] && { release_file="$f"; break; }
-    done
-
-    if [[ -z "$release_file" ]]; then
-        log_info "ℹ No release file found for rpm check, skipping RPM DB verification"
-    elif $DRY_RUN; then
-        log_info "[DRY-RUN] Would verify rpm ownership of $release_file and rebuild RPM DB if corrupted"
+    if $VALIDATE_ONLY; then
+        log_info "[VALIDATE-ONLY] Skipping RPM database integrity/repair block (non-invasive mode)"
     else
-        if ! rpm -qf "$release_file" &>/dev/null; then
-            log_info "⚙ RPM database appears corrupted - initiating recovery"
+        log_info "🧩 Checking RPM database integrity"
 
-            # Backup existing RPM database
-            if [[ -d /var/lib/rpm ]]; then
-                backup_path="/var/lib/rpm.bak.$(date +%F_%H-%M)"
-                cp -a /var/lib/rpm "$backup_path" 2>/dev/null || true
-                log_info "💾 Backup created at: $backup_path"
-            fi
+        release_file=""
+        for f in /etc/redhat-release /etc/centos-release /etc/oracle-release /etc/rocky-release /etc/almalinux-release; do
+            [[ -f "$f" ]] && { release_file="$f"; break; }
+        done
 
-            # Ensure no package manager process is running before touching rpmdb locks
-            if pgrep -x yum >/dev/null 2>&1 || pgrep -x dnf >/dev/null 2>&1 || pgrep -x rpm >/dev/null 2>&1 || pgrep -x packagekitd >/dev/null 2>&1; then
-                log_error "RPM database repair aborted: a package manager process is running (yum/dnf/rpm/packagekitd). Stop it and retry." 1
-            fi
-
-            # Remove potential stale locks (Berkeley DB and stale rpm lock file)
-            rm -f /var/lib/rpm/__db.* 2>/dev/null
-            rm -f /var/lib/rpm/.rpm.lock 2>/dev/null
-
-            # Attempt rebuild
-            if timeout 300 rpm --rebuilddb &>/dev/null; then
-                log_info "✅ RPM database rebuilt successfully"
-            else
-                log_error "Failed to rebuild RPM database. Please investigate manually at ${backup_path:-/var/lib/rpm.bak.*}" 8
-            fi
-
-            # Re-test after rebuild
-            if ! rpm -qf "$release_file" &>/dev/null; then
-                log_error "RPM database still corrupted after rebuild. Aborting execution." 9
-            fi
+        if [[ -z "$release_file" ]]; then
+            log_info "ℹ No release file found for rpm check, skipping RPM DB verification"
+        elif $DRY_RUN; then
+            log_info "[DRY-RUN] Would verify rpm ownership of $release_file and rebuild RPM DB if corrupted"
         else
-            log_info "✅ RPM database integrity verified"
+            if ! rpm -qf "$release_file" &>/dev/null; then
+                log_info "⚙ RPM database appears corrupted - initiating recovery"
+
+                # Backup existing RPM database
+                if [[ -d /var/lib/rpm ]]; then
+                    backup_path="/var/lib/rpm.bak.$(date +%F_%H-%M)"
+                    cp -a /var/lib/rpm "$backup_path" 2>/dev/null || true
+                    log_info "💾 Backup created at: $backup_path"
+                fi
+
+                # Ensure no package manager process is running before touching rpmdb locks
+                if pgrep -x yum >/dev/null 2>&1 || pgrep -x dnf >/dev/null 2>&1 || pgrep -x rpm >/dev/null 2>&1 || pgrep -x packagekitd >/dev/null 2>&1; then
+                    log_error "RPM database repair aborted: a package manager process is running (yum/dnf/rpm/packagekitd). Stop it and retry." 1
+                fi
+
+                # Remove potential stale locks (Berkeley DB and stale rpm lock file)
+                rm -f /var/lib/rpm/__db.* 2>/dev/null
+                rm -f /var/lib/rpm/.rpm.lock 2>/dev/null
+
+                # Attempt rebuild
+                if timeout 300 rpm --rebuilddb &>/dev/null; then
+                    log_info "✅ RPM database rebuilt successfully"
+                else
+                    log_error "Failed to rebuild RPM database. Please investigate manually at ${backup_path:-/var/lib/rpm.bak.*}" 8
+                fi
+
+                # Re-test after rebuild
+                if ! rpm -qf "$release_file" &>/dev/null; then
+                    log_error "RPM database still corrupted after rebuild. Aborting execution." 9
+                fi
+            else
+                log_info "✅ RPM database integrity verified"
+            fi
         fi
     fi
 fi
@@ -1049,10 +1386,17 @@ install_missing_deps() {
     # Define the list of packages to install from the function arguments first
     local -a to_install=( "$@" )
 
-    # Enforce connectivity check result before installation
-    if [[ "${HAS_INTERNET}" == "false" ]]; then
-        log_error "System is offline and missing required packages: ${to_install[*]}" 100
+    if $VALIDATE_ONLY; then
+        log_info "[VALIDATE-ONLY] Missing packages detected (not installing): ${to_install[*]}"
+        return 0
     fi
+
+    # Connectivity heuristics can fail in proxy/local-repo environments.
+    # Still attempt installation; fail only if the package manager errors out.
+    if [[ "${HAS_INTERNET}" == "false" ]]; then
+        log_info "⚠️ Internet heuristic failed; attempting package install anyway (may work via proxy/local repo)."
+    fi
+
 
     log_info "🔌 Installing missing packages: ${to_install[*]}"
     $VERBOSE && log_info "🧬 install_missing_deps() entered with args: $*"
@@ -1064,7 +1408,10 @@ install_missing_deps() {
             ;;
         yum|dnf)
             # Use flags as an array (no word-splitting issues)
-            local -a extra_flags=( --noplugins )
+            local -a extra_flags=()
+            if [[ "${DISABLE_PKG_PLUGINS:-false}" == "true" ]]; then
+                extra_flags+=( --noplugins )
+            fi
             if [[ "$PKG" == "dnf" ]]; then
                 extra_flags+=( -4 )
             fi
@@ -1082,7 +1429,7 @@ install_missing_deps() {
 # -------------------------------------------------------------------------
 # List required tools
 # -------------------------------------------------------------------------
-tools=( realm adcli kinit kdestroy timedatectl systemctl sed grep tput timeout hostname cp chmod tee ldapsearch ldapmodify chronyc nc host dig ip pgrep )
+tools=( realm adcli kinit kdestroy timedatectl systemctl sed grep tput timeout hostname cp chmod tee ldapsearch ldapmodify chronyc host dig ip pgrep install )
 
 # Add PAM config tool based on OS family
 case "$OS_FAMILY" in
@@ -1142,29 +1489,38 @@ case "$OS_FAMILY" in
 		fi
 		;;
     suse)
-		pkgs=( realmd sssd adcli oddjob oddjob-mkhomedir \
-			   krb5-client pam-config chrony iproute2 procps )
-		# DNS utils (host/dig)
+        pkgs=( realmd sssd adcli \
+            krb5-client pam-config chrony iproute2 procps )
+
+        # DNS utils (host/dig)
         if zypper se -x bind-utils >/dev/null 2>&1; then
             pkgs+=( bind-utils )
         fi
-		
-		# Prefer openldap2-client (SLES 12) or openldap-clients (Leap 15/SLES 15)
-		if zypper se -x openldap-clients >/dev/null 2>&1; then
-			pkgs+=( openldap-clients )
-		else
-			pkgs+=( openldap2-client )
-		fi
 
-		# Prefer netcat-openbsd or nmap-ncat if available
-		if zypper se -x netcat-openbsd >/dev/null 2>&1; then
-			pkgs+=( netcat-openbsd )
-		elif zypper se -x nmap-ncat >/dev/null 2>&1; then
-			pkgs+=( nmap-ncat )
-		else
-			pkgs+=( netcat )
-		fi
-		;;
+        # LDAP client naming differs across SUSE/SLES generations
+        if zypper se -x openldap-clients >/dev/null 2>&1; then
+            pkgs+=( openldap-clients )
+        else
+            pkgs+=( openldap2-client )
+        fi
+
+        # Netcat variants
+        if zypper se -x netcat-openbsd >/dev/null 2>&1; then
+            pkgs+=( netcat-openbsd )
+        elif zypper se -x nmap-ncat >/dev/null 2>&1; then
+            pkgs+=( nmap-ncat )
+        else
+            pkgs+=( netcat )
+        fi
+
+        # oddjob is not guaranteed on SUSE; add only if present
+        if zypper se -x oddjob >/dev/null 2>&1; then
+            pkgs+=( oddjob )
+        fi
+        if zypper se -x oddjob-mkhomedir >/dev/null 2>&1; then
+            pkgs+=( oddjob-mkhomedir )
+        fi
+        ;;
 esac
 
 # -------------------------------------------------------------------------
@@ -1248,9 +1604,9 @@ else
         [[ -n "$DOMAIN" ]] && break
         echo "[!] Domain is required."
     done
-    DOMAIN_UPPER=$(echo "$DOMAIN" | tr '[:lower:]' '[:upper:]')
     DOMAIN_LOWER="${DOMAIN,,}"
-    DOMAIN_SHORT=$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')
+    DOMAIN_UPPER="${DOMAIN^^}"
+    DOMAIN_SHORT="$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')"
 
     # OU (optional, default filled)
     DOMAIN_DN=$(awk -F'.' '{
@@ -1341,6 +1697,9 @@ if [ -n "$GLOBAL_ADMIN_GROUPS" ] && [ "$GLOBAL_ADMIN_GROUPS" != "(none)" ]; then
 fi
 
 # Prepare environment
+DOMAIN_LOWER="${DOMAIN,,}"
+DOMAIN_UPPER="${DOMAIN^^}"
+DOMAIN_SHORT="$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')"
 REALM=${DOMAIN^^}
 HOST_FQDN="$(hostname -s).$(to_lower "$DOMAIN")"
 DC_SERVER_INPUT="$DC_SERVER"
@@ -1358,18 +1717,35 @@ log_info "🔍 Validating hostname and FQDN consistency"
 
 HOSTS_FILE="/etc/hosts"
 
-# Detect primary IPv4 address (excluding loopback interfaces)
-# Method 1: hostname -I (Modern)
-PRIMARY_IP="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i!~/^127\./){print $i; exit}}' || true)"
+# Detect primary IPv4 address (route-aware; avoids Docker/VPN first-IP issues)
+PRIMARY_IP=""
+PRIMARY_IFACE=""
 
-# Method 2: ip route/addr (Modern/Standard)
-if [[ -z "$PRIMARY_IP" ]]; then
-    PRIMARY_IP="$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1 || true)"
+# 0) Prefer the source IP used to reach the DC (best signal; no Internet dependency)
+DC_V4="$(getent ahostsv4 "$DC_SERVER" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+if [[ -n "$DC_V4" ]]; then
+    PRIMARY_IP="$(ip -4 route get "$DC_V4" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
+    PRIMARY_IFACE="$(ip -4 route get "$DC_V4" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 fi
 
-# Method 3: ifconfig (Legacy / Minimal RHEL 5/6) - O Fallback Solicitado
+# 1) Fallback to default route interface (intranet-safe)
+if [[ -z "$PRIMARY_IP" ]]; then
+    PRIMARY_IFACE="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+    if [[ -n "$PRIMARY_IFACE" ]]; then
+        PRIMARY_IP="$(ip -4 addr show dev "$PRIMARY_IFACE" scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)"
+    fi
+fi
+
+# 2) Fallback: first global address excluding common container/vpn interfaces
+if [[ -z "$PRIMARY_IP" ]]; then
+    if ip -o -4 addr show scope global >/dev/null 2>&1; then
+        PRIMARY_IFACE="$(ip -o -4 addr show scope global 2>/dev/null | awk '!/(docker|br-|virbr|veth|cni|flannel|tun|tap|wg)/ {print $2; exit}')"
+        PRIMARY_IP="$(ip -o -4 addr show scope global 2>/dev/null | awk '!/(docker|br-|virbr|veth|cni|flannel|tun|tap|wg)/ {print $4; exit}' | cut -d/ -f1)"
+    fi
+fi
+
+# 3) Legacy fallback: ifconfig (old net-tools)
 if [[ -z "$PRIMARY_IP" ]] && command -v ifconfig >/dev/null 2>&1; then
-    # Busca o primeiro IP que não seja 127.0.0.1. Funciona em net-tools antigos.
     PRIMARY_IP="$(ifconfig 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | awk '{print $2}' | sed 's/addr://g' | head -n1 || true)"
 fi
 
@@ -1377,6 +1753,9 @@ fi
 
 # Escape PRIMARY_IP for regex-safe matching (dots must be literal)
 PRIMARY_IP_RE="${PRIMARY_IP//./\\.}"
+
+$VERBOSE && log_info "ℹ Primary IP selected: ${PRIMARY_IP} (iface: ${PRIMARY_IFACE:-unknown})"
+
 
 # Check for active web services (port 80 or 443)
 if command -v ss >/dev/null 2>&1; then
@@ -1426,8 +1805,7 @@ if ! grep -qE '^::1[[:space:]]+localhost' "$HOSTS_FILE"; then
 fi
 
 # Perform safe backup before modification
-BACKUP_FILE="$(backup_file "$HOSTS_FILE")"
-log_info "💾 Backup saved as $BACKUP_FILE"
+backup_file "$HOSTS_FILE"
 
 # -------------------------------------------------------------------------
 # Canonicalizes /etc/hosts for the primary IP while preserving aliases
@@ -1779,8 +2157,7 @@ REALM_UPPER="${REALM^^}"
 
 # Backup existing krb5.conf if present
 if [[ -f "$KRB_CONF" ]]; then
-    KRB_BAK="$(backup_file "$KRB_CONF")"
-    log_info "💾 Backup created: $KRB_BAK"
+    backup_file "$KRB_CONF"
 fi
 
 # If DC_SERVER is not set, attempt SRV autodiscovery
@@ -1854,7 +2231,7 @@ case $OS_FAMILY in
 		RHEL_MAJOR="$(get_major_version_id)"
 		if (( RHEL_MAJOR < 8 )); then
 			# RHEL/CentOS/OL 6–7 -> authconfig
-            run_cmd_logged env LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --update
+            run_cmd_logged env LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --updateall
 		else
 			# RHEL/OL 8+ -> authselect
 			run_cmd_logged authselect select sssd with-mkhomedir --force
@@ -1969,11 +2346,13 @@ EOF
         log_info "✅ oddjob mkhomedir D-Bus service operational"
     else
         log_info "⚠️ D-Bus Hello denied or unavailable - attempting full D-Bus restart"
-        DBUS_SERVICE="dbus.service"
-        systemctl status "$DBUS_SERVICE" &>/dev/null || DBUS_SERVICE="messagebus.service"
+        DBUS_SERVICE="$(detect_service_unit "dbus.service" "messagebus.service")"
+        [[ -z "$DBUS_SERVICE" ]] && DBUS_SERVICE="dbus.service"
 
         log_info "🔄 Restarting $DBUS_SERVICE silently (detached from current D-Bus session)"
-		if $DRY_RUN; then
+		if $VALIDATE_ONLY; then
+            log_info "[VALIDATE-ONLY] Suppressed restart of $DBUS_SERVICE (non-invasive mode)"
+        elif $DRY_RUN; then
             log_info "[DRY-RUN] Would restart $DBUS_SERVICE (detached) to heal oddjob D-Bus registration"
         else
             nohup setsid bash -c "systemctl restart '$DBUS_SERVICE' >/dev/null 2>&1 < /dev/null" >/dev/null 2>&1 &
@@ -2025,9 +2404,8 @@ for file in "${PAM_FILES[@]}"; do
 		continue
 	fi
 
-	PAM_BACKUP="${file}.bak.$(date +%Y%m%d%H%M%S)"
-	run_cmd cp -p -- "$file" "$PAM_BACKUP"
-    log_info "💾 Backup saved: $PAM_BACKUP"
+    # Backup before modification
+    backup_file "$file"
 
 	# Disable legacy PAM modules (safe-comment)
 	if grep -Eq 'pam_(ldap|winbind|nis)\.so' "$file"; then
@@ -2165,14 +2543,14 @@ fi
 # Normalize line endings (CRLF-safe) before backup
 if $DRY_RUN; then
     log_info "[DRY-RUN] Would normalize CRLF in $NSS_FILE"
+elif $VALIDATE_ONLY; then
+    log_info "[VALIDATE-ONLY] Skipping CRLF normalization in $NSS_FILE"
 else
-    sed -i 's/\r$//' "$NSS_FILE"
+    run_cmd_logged sed -i 's/\r$//' "$NSS_FILE"
 fi
 
 # Backup prior to modifications
-NSS_BACKUP="${NSS_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-run_cmd cp -p -- "$NSS_FILE" "$NSS_BACKUP"
-log_info "💾 Backup saved as $NSS_BACKUP"
+backup_file "$NSS_FILE"
 
 # -------------------------------------------------------------------------
 # NSS/SSSD line normalization (deduplicated, legacy-safe, idempotent)
@@ -2184,7 +2562,7 @@ NSS_EDIT_TMP=""
 if $DRY_RUN; then
     NSS_EDIT_TMP="$(mktemp "/tmp/nsswitch.conf.XXXXXX")"
     if [[ -f "$NSS_FILE" ]]; then
-        cp -p -- "$NSS_FILE" "$NSS_EDIT_TMP" 2>/dev/null || cat "$NSS_FILE" >"$NSS_EDIT_TMP"
+        backup_file "$NSS_EDIT_TMP"
     else
         : >"$NSS_EDIT_TMP"
     fi
@@ -2235,45 +2613,6 @@ for key in passwd shadow group services netgroup; do
     fi
 done
 
-# -------------------------------------------------------------------------
-# Add sudoers map for RHEL/SUSE (deduplicated, safe)
-# -------------------------------------------------------------------------
-if [[ "$OS_FAMILY" =~ ^(rhel|suse)$ ]]; then
-    key="sudoers"
-    pattern="^[[:space:]]*${key}:"
-
-    # Normalize and deduplicate
-    sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
-    if grep -Eq "${pattern}" "$NSS_EDIT"; then
-        awk -v key="${key}" '
-            BEGIN {found=0}
-            /^[[:space:]]*#/ {print; next}
-            tolower($0) ~ "^[[:space:]]*"key":" {
-                if (found==0) {found=1; print}
-                next
-            }
-            {print}
-        ' "$NSS_EDIT" > "${NSS_EDIT}.tmp" && mv "${NSS_EDIT}.tmp" "$NSS_EDIT"
-    fi
-
-    # Insert or patch as needed
-    if grep -Eq "${pattern}[^#]*[[:space:]]sss([[:space:]]|\$)" "$NSS_EDIT"; then
-        $VERBOSE && log_info "ℹ️ '${key}' already includes sss"
-    elif grep -qE "${pattern}[^#]*" "$NSS_EDIT"; then
-        log_info "🧩 Updating existing '${key}' entry to include sss"
-        # shellcheck disable=SC2086  # SED_EXT must expand to -E/-r
-        sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_EDIT"
-        sed -i \
-            -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
-            -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_EDIT"
-        sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_EDIT"
-        log_info "✅ '${key}' updated"
-    else
-        printf '%s\n' "${key}: files sss" >>"$NSS_EDIT"
-        log_info "➕ Created missing '${key}' entry"
-    fi
-fi
-
 # Final whitespace normalization (collapse multiple spaces, trim ends)
 awk '{$1=$1}1' "$NSS_EDIT" > "${NSS_EDIT}.tmp" && mv "${NSS_EDIT}.tmp" "$NSS_EDIT"
 
@@ -2292,13 +2631,13 @@ if $DRY_RUN; then
     # Read via process substitution to avoid pipefail abort when grep finds no matches
     while IFS= read -r l || [[ -n "$l" ]]; do
         [[ -n "$l" ]] && log_info "   $l"
-    done < <(grep -E '^(passwd|shadow|group|services|netgroup|sudoers):' "$NSS_EDIT" 2>/dev/null || true)
+    done < <(grep -E '^(passwd|shadow|group|services|netgroup):' "$NSS_EDIT" 2>/dev/null || true)
 else
     # NSS_EDIT may already be NSS_FILE in non-DRY-RUN mode; avoid cp same-file failure.
     if [[ "$NSS_EDIT" != "$NSS_FILE" ]]; then
-        cp -p -- "$NSS_EDIT" "$NSS_FILE"
+        backup_file "$NSS_FILE"
     fi
-    command -v restorecon >/dev/null 2>&1 && restorecon -F "$NSS_FILE" || true
+    command -v restorecon >/dev/null 2>&1 && run_cmd restorecon -F "$NSS_FILE" || true
 fi
 
 # Optional runtime sanity checks (non-blocking)
@@ -2354,10 +2693,8 @@ if [[ "$OS_FAMILY" == "rhel" ]]; then
 	for pamfile in /etc/pam.d/system-auth /etc/pam.d/password-auth; do
 		[[ -f "$pamfile" ]] || continue
 
-		# Backup PAM file
-		bk="${pamfile}.bak.$(date +%Y%m%d%H%M%S)"
-        run_cmd cp -p -- "$pamfile" "$bk"
-        $VERBOSE && log_info "💾 Backup saved: $bk"
+		# Backup PAM file before modification
+        backup_file "$pamfile"
 
 		# Detect presence of pam_ldap.so
 		if grep -q "pam_ldap.so" "$pamfile"; then
@@ -2373,16 +2710,38 @@ if [[ "$OS_FAMILY" == "rhel" ]]; then
 	done
 fi
 
-# configure NTP with $NTP_SERVER
-log_info "⏰ Configuring NTP to use ($NTP_SERVER)"
+# -------------------------------------------------------------------------
+# NTP (Chrony) - ROBUST (legacy + modern), non-destructive when possible
+# -------------------------------------------------------------------------
+log_info "⏰ Configuring NTP (Chrony) to use: ${NTP_SERVER}"
 
-# Detect chrony configuration file path
+# Basic validation of NTP_SERVER (hostname/IP, no spaces) ----
+if [[ -z "${NTP_SERVER:-}" ]]; then
+    log_error "NTP_SERVER is empty - cannot configure time sync" 1
+fi
+if [[ "$NTP_SERVER" =~ [[:space:]] ]]; then
+    log_error "NTP_SERVER contains whitespace: '$NTP_SERVER' (invalid)" 1
+fi
+if [[ ! "$NTP_SERVER" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    log_error "NTP_SERVER has invalid characters: '$NTP_SERVER' (allowed: A-Z a-z 0-9 . _ -)" 1
+fi
+
+# Optional preflight: reachability (UDP/123 is hard to probe without extra tools)
+# We at least validate DNS resolution when it's a hostname.
+if [[ ! "$NTP_SERVER" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+    if ! getent hosts "$NTP_SERVER" >/dev/null 2>&1; then
+        log_info "⚠️ NTP_SERVER hostname not resolvable right now: $NTP_SERVER (chrony may still work later)"
+    fi
+fi
+
+# Detect chrony config main path (distro differences) ----
+chrony_conf=""
 if [[ -f /etc/chrony.conf ]]; then
-    chrony_conf="/etc/chrony.conf"  # RHEL-like
+    chrony_conf="/etc/chrony.conf"              # RHEL-like
 elif [[ -f /etc/chrony/chrony.conf ]]; then
-    chrony_conf="/etc/chrony/chrony.conf"  # Debian-like
+    chrony_conf="/etc/chrony/chrony.conf"       # Debian-like
 else
-    # Default fallback path (based on existing directory)
+    # Fallback: pick a sane default based on existing directory
     if [[ -d /etc/chrony ]]; then
         chrony_conf="/etc/chrony/chrony.conf"
     else
@@ -2390,120 +2749,307 @@ else
     fi
 fi
 
-# Backup or initialize chrony.conf
+# Ensure parent dirs exist (legacy safe)
+run_cmd mkdir -p "$(dirname "$chrony_conf")" || true
+
+# Backup if exists
 if [[ -f "$chrony_conf" ]]; then
-    CHRONY_BAK="$(backup_file "$chrony_conf")"
-    log_info "💾 Backup of chrony.conf saved as $CHRONY_BAK"
+    backup_file "$chrony_conf"
 else
-    log_info "⚠️ File $chrony_conf not found. Creating a new one from scratch"
+    log_info "⚠️ Chrony main config not found at $chrony_conf - will create minimal base"
 fi
 
-# Write new configuration (universal minimal config)
-write_file 0644 "$chrony_conf" <<EOF
-server $NTP_SERVER iburst
-driftfile /var/lib/chrony/drift
+# Decide strategy: drop-in (preferred) vs managed block inside main ----
+# We prefer drop-in if main config has confdir/include pointing to a directory we can use.
+chrony_dropin_dir=""
+chrony_dropin_file=""
+use_dropin=false
+
+# Load existing content (if file exists) for detection (safe on empty)
+chrony_main_content=""
+if [[ -f "$chrony_conf" ]]; then
+    chrony_main_content="$(cat "$chrony_conf" 2>/dev/null || true)"
+fi
+
+# Detect common chrony include mechanisms:
+#   - RHEL:  confdir /etc/chrony.d
+#   - Debian: confdir /etc/chrony/conf.d
+#   - Debian: include /etc/chrony/conf.d/*.conf
+#   - Some:   include /etc/chrony.d/*.conf
+if echo "$chrony_main_content" | grep -qiE '^[[:space:]]*confdir[[:space:]]+/etc/chrony(\.d|/conf\.d)([[:space:]]|$)'; then
+    chrony_dropin_dir="$(echo "$chrony_main_content" | awk '
+        {
+          l = tolower($0)
+          if (l ~ /^[[:space:]]*confdir[[:space:]]+\/etc\/chrony(\.d|\/conf\.d)([[:space:]]|$)/) {
+            print $2; exit
+          }
+        }
+      '
+    )"
+elif echo "$chrony_main_content" | grep -qiE '^[[:space:]]*include[[:space:]]+/etc/chrony(\.d|/conf\.d)/.*\.conf([[:space:]]|$)'; then
+    chrony_dropin_dir="$(echo "$chrony_main_content" | awk '
+        {
+          l = tolower($0)
+          if (l ~ /^[[:space:]]*include[[:space:]]+\/etc\/chrony(\.d|\/conf\.d)\/.*\.conf([[:space:]]|$)/) {
+            path = $2
+            # strip glob/file -> keep dir
+            gsub(/\*.*$/, "", path)
+            sub(/\/[^\/]+\.conf$/, "/", path)
+            sub(/\/$/, "", path)
+            print path; exit
+          }
+        }
+      '
+    )"
+fi
+
+if [[ -n "$chrony_dropin_dir" ]]; then
+    use_dropin=true
+    run_cmd mkdir -p "$chrony_dropin_dir" || true
+    chrony_dropin_file="${chrony_dropin_dir}/99-linux-ad-domain-join.conf"
+fi
+
+# Render Chrony configuration payload (portable + conservative) ----
+# Notes:
+# - We purposely avoid distro-specific directives unless harmless.
+# - We set makestep to fix initial skew for Kerberos quickly.
+# - driftfile path differs; we pick a safe default but also ensure dir exists.
+# - logdir is optional; some minimal images don’t have it; harmless if absent.
+chrony_drift_dir="/var/lib/chrony"
+chrony_drift_file="/var/lib/chrony/drift"
+if [[ -d /var/lib/chrony ]]; then
+    :
+elif [[ -d /var/lib/chrony/ ]]; then
+    :
+elif [[ -d /var/lib/chrony-drift ]]; then
+    chrony_drift_dir="/var/lib/chrony-drift"
+    chrony_drift_file="/var/lib/chrony-drift/drift"
+fi
+run_cmd mkdir -p "$chrony_drift_dir" || true
+run_cmd mkdir -p /var/log/chrony 2>/dev/null || true
+
+chrony_payload="$(cat <<EOF
+# ======================================================================
+# Managed by linux-ad-domain-join.sh
+# Purpose: enforce domain NTP source for Kerberos stability
+# DO NOT EDIT: changes may be overwritten
+# Generated: $(date '+%F %T')
+# ======================================================================
+
+# Preferred domain NTP source
+server ${NTP_SERVER} iburst
+
+# Clock discipline basics
+driftfile ${chrony_drift_file}
 makestep 1.0 3
 rtcsync
+
+# Optional logging (best-effort)
 logdir /var/log/chrony
 EOF
+)"
 
-# -------------------------------------------------------------------------
-# Detect chrony service name safely (OL7 / RHEL7 compatible)
-# -------------------------------------------------------------------------
-chrony_service=""
+# Apply configuration (drop-in preferred; else managed block in main) ----
+if $use_dropin; then
+    log_info "🧩 Chrony include detected -> using drop-in: ${chrony_dropin_file}"
+    write_file 0644 "$chrony_dropin_file" <<<"$chrony_payload"
+else
+    # Ensure base config exists; if missing, create minimal that is acceptable everywhere.
+    if [[ ! -f "$chrony_conf" ]]; then
+        log_info "🧩 Creating minimal Chrony base config at $chrony_conf"
+        write_file 0644 "$chrony_conf" <<'EOF'
+# Minimal chrony configuration created by linux-ad-domain-join.sh
+# (No confdir/include detected; settings will be embedded below)
+EOF
+    fi
 
-# Prefer modern detection
-if systemctl list-unit-files 2>/dev/null | grep -q '^chrony\.service'; then
-    chrony_service="chrony"
-elif systemctl list-unit-files 2>/dev/null | grep -q '^chronyd\.service'; then
-    chrony_service="chronyd"
-# Fallback for very old systemd (no list-unit-files)
-elif [[ -f /usr/lib/systemd/system/chronyd.service ]]; then
-    chrony_service="chronyd"
-elif [[ -f /usr/lib/systemd/system/chrony.service ]]; then
-    chrony_service="chrony"
-fi
+    # Replace an existing managed block, or append a new one.
+    log_info "🧩 No include/confdir detected -> embedding managed block into $chrony_conf"
 
-# Validation
-if [[ -z "$chrony_service" ]]; then
-    log_error "Unable to detect chrony service name - please ensure it is installed." 1
-fi
+    tmp_chrony="$(mktemp)"
+    : >"$tmp_chrony"
 
-# If detected unit is an alias, normalize to chrony.service
-if [[ "$chrony_service" == "chronyd" && "$(readlink -f /etc/systemd/system/chronyd.service 2>/dev/null)" == *"chrony.service" ]]; then
-    log_info "  Detected alias 'chronyd.service' -> using real unit 'chrony.service'"
-    chrony_service="chrony"
-fi
+    in_managed=0
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Strip CR safely
+        line="${line%$'\r'}"
 
-# Disable conflicting NTP services (systemd-timesyncd)
-if systemctl list-unit-files 2>/dev/null | grep -q 'systemd-timesyncd.service'; then
-    if systemctl is-active --quiet systemd-timesyncd; then
-        log_info "🛑 Stopping systemd-timesyncd to allow Chrony to take over"
-        run_cmd systemctl stop systemd-timesyncd
-        run_cmd systemctl disable systemd-timesyncd
+        if [[ "$line" == "# BEGIN linux-ad-domain-join chrony" ]]; then
+            in_managed=1
+            continue
+        fi
+        if [[ "$line" == "# END linux-ad-domain-join chrony" ]]; then
+            in_managed=0
+            continue
+        fi
+
+        # Preserve everything outside our managed block
+        if (( in_managed == 0 )); then
+            echo "$line" >>"$tmp_chrony"
+        fi
+    done <"$chrony_conf"
+
+    {
+        echo ""
+        echo "# BEGIN linux-ad-domain-join chrony"
+        echo "$chrony_payload"
+        echo "# END linux-ad-domain-join chrony"
+        echo ""
+    } >>"$tmp_chrony"
+
+    if $DRY_RUN; then
+        log_info "[DRY-RUN] Would update $chrony_conf with embedded managed block (preview suppressed)"
+        rm -f "$tmp_chrony"
+    else
+        # Keep ownership/perms sane
+        chown root:root "$tmp_chrony" 2>/dev/null || true
+        chmod 644 "$tmp_chrony" 2>/dev/null || true
+        mv -f "$tmp_chrony" "$chrony_conf"
     fi
 fi
 
-# Enable and restart safely
-log_info "🔧 Enabling and Restarting Chrony"
+# Detect chrony service name across systemd + sysvinit ----
+chrony_service=""
+chrony_unit=""
 
 if command -v systemctl >/dev/null 2>&1; then
-    # SYSTEMD (Moderno: RHEL 7+, Ubuntu 16+, Debian 8+)
-    # 1. Habilita no boot
-    run_cmd_logged systemctl enable "$chrony_service"
-    # 2. Força restart para ler o novo arquivo de conf e iniciar
-    run_cmd systemctl restart "$chrony_service"
-
-elif command -v chkconfig >/dev/null 2>&1; then
-    # SYSVINIT (Legado: RHEL 6, CentOS 6, Oracle Linux 6)
-    # 1. Habilita no boot
-    run_cmd_logged chkconfig "$chrony_service" on
-    # 2. Restart via comando service
-    run_cmd service "$chrony_service" restart
-
-elif command -v update-rc.d >/dev/null 2>&1; then
-    # DEBIAN LEGACY (SysVinit antigo)
-    # 1. Habilita no boot
-    run_cmd_logged update-rc.d "$chrony_service" defaults
-    # 2. Restart
-    run_cmd service "$chrony_service" restart
-else
-    log_info "⚠️ Could not detect init system to enable Chrony. Please start manually."
+    chrony_unit="$(detect_service_unit "chrony.service" "chronyd.service")"
+    if [[ -n "$chrony_unit" ]]; then
+        chrony_service="${chrony_unit%.service}"
+    fi
 fi
 
-# -------------------------------------------------------------------------
-# Wait for NTP synchronization (Chrony only, Debian/RHEL compatible)
-# -------------------------------------------------------------------------
-synced=false
-start_time=$(date +%s)
+# SysV fallback detection if systemd unit not found (or no systemd at all)
+if [[ -z "$chrony_service" ]]; then
+    if [[ -x /etc/init.d/chronyd ]]; then
+        chrony_service="chronyd"
+    elif [[ -x /etc/init.d/chrony ]]; then
+        chrony_service="chrony"
+    else
+        # Last resort: common binary name; service wrapper may still work
+        chrony_service="chronyd"
+    fi
+fi
 
-for i in {1..30}; do
-    if systemctl is-active "$chrony_service" &>/dev/null && \
-       chronyc sources | grep -q '^\^\*' && \
-       [[ "$(chronyc tracking | awk -F': *' '/Leap status/ {print $2}')" == "Normal" ]]; then
-        synced_server="$(chronyc tracking 2>/dev/null | awk -F '[()]' '/Reference ID/ { print $2 }' || true)"
-        # clear previous line before printing success
-        printf "\r\033[K" >&2
-        log_info "✅ NTP synchronized successfully with: ${synced_server:-chrony}"
-        synced=true
-        break
+# Disable conflicting time services (best-effort, non-fatal) ----
+# systemd-timesyncd
+if command -v systemctl >/dev/null 2>&1; then
+    if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
+        if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
+            log_info "🛑 Stopping systemd-timesyncd (conflicts with chrony)"
+            run_cmd systemctl stop systemd-timesyncd || true
+            run_cmd systemctl disable systemd-timesyncd || true
+        fi
+    fi
+fi
+
+# ntpd/ntp (very common in legacy)
+if command -v systemctl >/dev/null 2>&1; then
+    for u in ntpd.service ntp.service; do
+        if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "$u"; then
+            if systemctl is-active --quiet "${u%.service}" 2>/dev/null; then
+                log_info "🛑 Stopping ${u%.service} (conflicts with chrony)"
+                run_cmd systemctl stop "${u%.service}" || true
+                run_cmd systemctl disable "${u%.service}" || true
+            fi
+        fi
+    done
+else
+    # SysV best-effort
+    if command -v service >/dev/null 2>&1; then
+        service ntpd stop >/dev/null 2>&1 || true
+        service ntp stop  >/dev/null 2>&1 || true
+    fi
+fi
+
+# Enable + restart chrony (systemd/sysvinit) ----
+log_info "🔧 Enabling and restarting Chrony service (${chrony_service})"
+
+if $VALIDATE_ONLY; then
+    log_info "[VALIDATE-ONLY] Suppressing service enable/restart for chrony"
+else
+    if command -v systemctl >/dev/null 2>&1; then
+        run_cmd systemctl enable "$chrony_service" || true
+        run_cmd systemctl restart "$chrony_service" || run_cmd systemctl start "$chrony_service" || true
+    elif command -v chkconfig >/dev/null 2>&1; then
+        run_cmd chkconfig "$chrony_service" on || true
+        run_cmd service "$chrony_service" restart || run_cmd service "$chrony_service" start || true
+    elif command -v update-rc.d >/dev/null 2>&1; then
+        run_cmd update-rc.d "$chrony_service" defaults || true
+        run_cmd service "$chrony_service" restart || run_cmd service "$chrony_service" start || true
+    elif command -v service >/dev/null 2>&1; then
+        run_cmd service "$chrony_service" restart || run_cmd service "$chrony_service" start || true
+    else
+        log_info "⚠️ No service manager found to restart chrony; skipping restart"
+    fi
+fi
+
+# Wait for synchronization (chronyc compatibility aware) ----
+# We do NOT hard-require systemctl, and we don’t hard-require "Leap status".
+# Success criteria (portable):
+#   - chronyc sources shows a selected source (*), OR
+#   - chronyc tracking shows Reference ID != 00000000 and Stratum is a number.
+log_info "🕒 Waiting for NTP synchronization (up to 45s)"
+
+synced=false
+start_time="$(date +%s)"
+
+# If chronyc has 'waitsync', prefer it (cleaner on newer chrony).
+has_waitsync=false
+if chronyc -h 2>/dev/null | grep -qi 'waitsync'; then
+    has_waitsync=true
+elif chronyc help 2>/dev/null | grep -qi 'waitsync'; then
+    has_waitsync=true
+fi
+
+if $VALIDATE_ONLY; then
+    log_info "[VALIDATE-ONLY] Skipping active sync wait"
+else
+    if $has_waitsync; then
+        # Best-effort: if waitsync fails, we fall back to manual polling.
+        run_cmd timeout 45 chronyc -a waitsync 45 0.5 >/dev/null 2>&1 || true
     fi
 
-    # real-time progress line
-    printf "\r[%s] ℹ Waiting for NTP synchronization... (elapsed: %2ds / max: 30s)" \
-		"$(date '+%F %T')" "$i" | sanitize_log_msg >&2
-    sleep 1
-done
+    # Manual polling (works everywhere)
+    for i in $(seq 1 45); do
+        # 1) sources selected marker (*)
+        if chronyc sources -n 2>/dev/null | grep -qE '^[\^\=\#\?][[:space:]]*\*'; then
+            synced=true
+        fi
 
-# final line cleanup to prevent log breaking
-printf "\r\033[K" >&2
+        # 2) tracking fallback check
+        if [[ "$synced" != true ]]; then
+            refid="$(chronyc tracking 2>/dev/null | awk -F': *' 'tolower($1)=="reference id" {print $2; exit}' | awk '{print $1}' || true)"
+            stratum="$(chronyc tracking 2>/dev/null | awk -F': *' 'tolower($1)=="stratum" {print $2; exit}' | awk '{print $1}' || true)"
+            if [[ -n "$refid" && "$refid" != "00000000" && "$refid" != "0.0.0.0" && "$stratum" =~ ^[0-9]+$ ]]; then
+                synced=true
+            fi
+        fi
+
+        if [[ "$synced" == true ]]; then
+            # Try to print what we are synced to (varies)
+            synced_server="$(chronyc tracking 2>/dev/null | awk -F': *' 'tolower($1)=="reference id" {print $2; exit}' | trim_line || true)"
+            log_info "✅ NTP synchronized (Reference: ${synced_server:-unknown})"
+            break
+        fi
+
+        # Progress line (stderr, sanitized)
+        printf "\r[%s] ℹ Waiting for NTP sync... (%2ds/%2ds)" "$(date '+%F %T')" "$i" "45" | sanitize_log_msg >&2
+        sleep 1
+    done
+    printf "\r\033[K" >&2
+fi
 
 if [[ "$synced" != true ]]; then
-    log_info "⚠️ NTP is not yet synchronized with $NTP_SERVER after 30s; please verify chronyd logs"
+    log_info "⚠️ NTP not synchronized yet after 45s (server: $NTP_SERVER)."
+    log_info "ℹ Debug hints:"
+    log_info "   - Check: chronyc sources -v"
+    log_info "   - Check: chronyc tracking"
+    log_info "   - Check logs: journalctl -u ${chrony_service} (systemd) OR /var/log/chrony/*"
 else
-    end_time=$(date +%s)
+    end_time="$(date +%s)"
     elapsed=$(( end_time - start_time ))
-    log_info "ℹ Time synchronization confirmed in ${elapsed}s - proceeding with Kerberos setup"
+    log_info "ℹ Time sync confirmed in ${elapsed}s - proceeding with Kerberos operations"
 fi
 
 # -------------------------------------------------------------------------
@@ -2564,7 +3110,7 @@ if [[ -n "$CURRENT_DN" ]]; then
 
         # Prepare LDIF for move operation
         TMP_LDIF=$(mktemp)
-        write_file 0644 "$TMP_LDIF" <<EOF
+        write_file 0600 "$TMP_LDIF" <<EOF
 dn: $CURRENT_DN
 changetype: modrdn
 newrdn: CN=${HOST_SHORT_U}
@@ -2572,9 +3118,9 @@ deleteoldrdn: 1
 newsuperior: $OU
 EOF
 
-        # =====================================================================
+        # -------------------------------------------------------------------------
         # SAFETY ZONE: OU Move Operation (Handle Permission Denied Gracefully)
-        # =====================================================================
+        # -------------------------------------------------------------------------
         # Temporarily disable global error trap to prevent script abort on LDAP error
         trap - ERR
         set +e
@@ -2589,8 +3135,8 @@ EOF
 
         # Restore global error trap immediately
         set -e
-        trap 'log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?' ERR
-        # =====================================================================
+        trap "$ERROR_TRAP_CMD" ERR
+        # -------------------------------------------------------------------------
 
         rm -f "$TMP_LDIF"
 
@@ -2613,6 +3159,12 @@ EOF
     fi
 else
     log_info "📛 Computer object not found in AD. Proceeding with domain join."
+fi
+
+# Validation-only mode: exit here
+if $VALIDATE_ONLY; then
+    log_info "✅ VALIDATE-ONLY: pre-checks completed successfully. Skipping domain join and all configuration writes."
+    exit 0
 fi
 
 # -------------------------------------------------------------------------
@@ -2686,7 +3238,7 @@ rm -f "$JOIN_LOG"
 # -------------------------------------------------------------------------
 # Update AD Description with IP after successful join
 # -------------------------------------------------------------------------
-HOST_IP=$(hostname -I 2>/dev/null | awk '{print $1}')
+HOST_IP="${PRIMARY_IP:-}"
 if [[ -n "$HOST_IP" ]]; then
     log_info "🧩 Updating AD description with IP: $HOST_IP"
     kinit "${DOMAIN_USER}@${REALM}" <"$PASS_FILE" >/dev/null 2>&1 || \
@@ -2694,7 +3246,7 @@ if [[ -n "$HOST_IP" ]]; then
 
     TMP_LDIF=$(mktemp)
 	timestamp=$(date '+%Y-%m-%dT%H:%M:%S%z')
-    write_file 0644 "$TMP_LDIF" <<EOF
+    write_file 0600 "$TMP_LDIF" <<EOF
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: description
@@ -2726,7 +3278,7 @@ if [[ $LDAP_RC -ne 0 || -z "$MSDS_KVNO" ]]; then
     log_info "⚠️ Unable to read msDS-KeyVersionNumber from AD (replication or Kerberos cache delay)"
     MSDS_KVNO="Unknown"
 else
-    log_info "ℹ️ msDS-KeyVersionNumber in AD: $MSDS_KVNO (Kerberos secret synchronized)"
+    log_info "ℹ️ msDS-KeyVersionNumber in AD: ${MSDS_KVNO}"
 fi
 
 # Clean up temporary Kerberos ticket
@@ -2756,11 +3308,11 @@ REALM_UPPER="${REALM^^}"
 DOMAIN_LOWER="${DOMAIN,,}"
 PRINCIPAL="$(hostname -s | tr '[:lower:]' '[:upper:]')\$@${REALM_UPPER}"
 KRB_LOG=$(mktemp)
-START_MS=$(date +%s%3N)
+START_MS="$(now_ms)"
 
 KRB5_TRACE=$KRB_LOG kinit -kt /etc/krb5.keytab "$PRINCIPAL" >/dev/null 2>&1
 EXIT_CODE=$?
-END_MS=$(date +%s%3N)
+END_MS="$(now_ms)"
 ELAPSED=$((END_MS - START_MS))
 
 # Resolve DC name dynamically
@@ -2877,16 +3429,21 @@ kinit -kt /etc/krb5.keytab "${HOST_SHORT_U}\$@${REALM}" >/dev/null 2>&1 \
 # -------------------------------------------------------------------------
 SSSD_CONF=/etc/sssd/sssd.conf
 if [[ -f $SSSD_CONF ]]; then
-    bak=${SSSD_CONF}.bak.$(date +%s)
-    log_info "💾 Backing up $SSSD_CONF to $bak"
-    bak="$(backup_file "$SSSD_CONF")"
+    backup_file "$SSSD_CONF"
 fi
 
-# Set debug level
+# Write SSSD configuration (auto-discovery mode for DNS updates)
+log_info "🛠️ Writing SSSD configuration (auto-discovery mode for DNS updates)"
+
+# Determine debug level
 SSSD_DEBUG_LEVEL=0
 $VERBOSE && SSSD_DEBUG_LEVEL=9
 
-log_info "🛠️ Writing SSSD configuration (auto-discovery mode for DNS updates)"
+# Determine dyndns_iface if PRIMARY_IFACE is set
+DYNDNS_IFACE_LINE=""
+[[ -n "${PRIMARY_IFACE:-}" ]] && DYNDNS_IFACE_LINE="dyndns_iface = ${PRIMARY_IFACE}"
+
+# Render SSSD configuration
 write_file 0600 "$SSSD_CONF" <<EOF
 # ============================================================================
 # File:        /etc/sssd/sssd.conf
@@ -2912,7 +3469,7 @@ domains = $REALM
 [domain/$REALM]
 id_provider = ad
 auth_provider = ad
-access_provider = permit
+access_provider = simple
 chpass_provider = ad
 
 
@@ -2947,6 +3504,7 @@ use_fully_qualified_names = False
 # -------------------------------------------------------------------------
 # Dynamic DNS update (Secure Update)
 # -------------------------------------------------------------------------
+$DYNDNS_IFACE_LINE
 dyndns_update = True
 dyndns_refresh_interval = 43200
 dyndns_ttl = 3600
@@ -2954,8 +3512,8 @@ dyndns_update_ptr = True
 EOF
 
 # Ownership is enforced by write_file (install -o/-g), but keep a safety check
-run_cmd chown root:root "$SSSD_CONF"
-run_cmd chmod 600 "$SSSD_CONF"
+run_cmd chown root:root "$SSSD_CONF" || true
+run_cmd chmod 600 "$SSSD_CONF" || true
 
 # -------------------------------------------------------------------------
 # Optional: flush old caches before restart
@@ -2993,9 +3551,7 @@ log_info "🔐 Validating /etc/pam.d/su for SSSD integration (non-destructive)"
 if [[ -f "$PAM_SU_FILE" ]]; then
     
     # Backup existing PAM su file
-    su_backup="${PAM_SU_FILE}.bak.$(date +%Y%m%d%H%M%S)"
-    run_cmd cp -p -- "$PAM_SU_FILE" "$su_backup"
-    [[ $VERBOSE == true ]] && log_info "💾 Backup saved: $su_backup"
+    backup_file "$PAM_SU_FILE" su_backup
 
     # If pam_sss is already referenced in auth stack, do not touch the file
 	if grep -Eq '^[[:space:]]*auth[[:space:]]+(required|requisite|sufficient|include)[[:space:]].*pam_sss\.so' "$PAM_SU_FILE"; then
@@ -3024,10 +3580,10 @@ if [[ -f "$PAM_SU_FILE" ]]; then
             log_info "[DRY-RUN] Would update $PAM_SU_FILE to include pam_sss.so (non-destructive)"
             rm -f "$tmp_su"
         else
-            mv -f "$tmp_su" "$PAM_SU_FILE"
-            chmod 644 "$PAM_SU_FILE"
+            run_cmd_logged mv -f "$tmp_su" "$PAM_SU_FILE"
+            run_cmd_logged chmod 644 "$PAM_SU_FILE"
         fi
-        log_info "✅ pam_sss binding injected into $PAM_SU_FILE (original preserved in $su_backup)"
+        log_info "✅ pam_sss binding injected into $PAM_SU_FILE (original preserved in ${su_backup:-unknown})"
     fi
 else
     log_info "⚠ $PAM_SU_FILE not found - creating minimal SSSD-aware su configuration"
@@ -3154,7 +3710,14 @@ apply_tmout_profile "$SESSION_TIMEOUT_SECONDS"
 # Configure SSH AllowGroups
 # -------------------------------------------------------------------------
 log_info "🔒 Configuring SSH"
-cfg=/etc/ssh/sshd_config
+SSH_CFG="/etc/ssh/sshd_config"
+
+# Backup before changes
+if $DRY_RUN; then
+    log_info "[DRY-RUN] Would backup $SSH_CFG"
+else
+    backup_file "$SSH_CFG"
+fi
 
 # Build AllowGroups safely (skip empty or '(none)')
 ALLOW_GROUPS="$SSH $SSH_ALL $SSH_G root"
@@ -3166,28 +3729,20 @@ fi
 ALLOW_GROUPS="$(echo "$ALLOW_GROUPS" | xargs)"
 
 # Apply AllowGroups directive
-sshd_set_directive_dedup "AllowGroups" "$ALLOW_GROUPS" "$cfg"
+sshd_set_directive_dedup "AllowGroups" "$ALLOW_GROUPS" "$SSH_CFG"
 log_info "🧩 AllowGroups updated -> AllowGroups $ALLOW_GROUPS"
 
 # Configure SSH PasswordAuthentication
-sshd_set_directive_dedup "PasswordAuthentication" "$PASSWORD_AUTHENTICATION" "$cfg"
+sshd_set_directive_dedup "PasswordAuthentication" "$PASSWORD_AUTHENTICATION" "$SSH_CFG"
 
 # -------------------------------------------------------------------------
 # SSH session keepalive timeout (simple: user enters seconds; CountMax fixed)
 # -------------------------------------------------------------------------
 log_info "🧩 Configuring SSH keepalive timeout"
-SSH_CFG="/etc/ssh/sshd_config"
 
 # Normalize PermitRootLogin value again (safety)
 PERMIT_ROOT_LOGIN="$(normalize_yes_no "$PERMIT_ROOT_LOGIN")"
 [[ -n "$PERMIT_ROOT_LOGIN" ]] || log_error "PermitRootLogin invalid (expected yes/no)" 1
-
-# Backup before changes
-if $DRY_RUN; then
-    log_info "[DRY-RUN] Would backup $SSH_CFG"
-else
-    cp -p "$SSH_CFG" "${SSH_CFG}.bak.$(date +%s)"
-fi
 
 # Deduplicated directives
 sshd_set_directive_dedup "ClientAliveInterval" "$SESSION_TIMEOUT_SECONDS" "$SSH_CFG"
@@ -3198,12 +3753,11 @@ sshd_set_directive_dedup "PermitRootLogin" "$PERMIT_ROOT_LOGIN" "$SSH_CFG"
 validate_sshd_config_or_die "$SSH_CFG"
 
 # Restart SSH safely (service name differs by distro)
-if systemctl status ssh.service &>/dev/null; then
-    run_cmd systemctl restart ssh.service
-elif systemctl status sshd.service &>/dev/null; then
-    run_cmd systemctl restart sshd.service
+ssh_unit="$(detect_service_unit "ssh.service" "sshd.service")"
+if [[ -n "$ssh_unit" ]]; then
+    run_cmd systemctl restart "$ssh_unit" || true
 else
-    log_info "⚠️ SSH is active, but no known systemd unit found. Skipping restart."
+    log_info "⚠️ SSH service unit not found (ssh/sshd). Skipping restart."
 fi
 
 # -------------------------------------------------------------------------
@@ -3216,7 +3770,7 @@ BLOCK_FILE="${SUDOERS_DIR}/00-block-root-shell"
 
 # Ensure target directory exists
 log_info "🛡️ Configuring sudoers directory: $SUDOERS_DIR"
-mkdir -p "$SUDOERS_DIR"
+run_cmd mkdir -p "$SUDOERS_DIR"
 
 # -------------------------------------------------------------------------
 # Create ROOT_SHELLS command alias (centralized restriction control)
@@ -3260,8 +3814,13 @@ Cmnd_Alias ROOT_SHELLS = \
     /usr/bin/env -i bash, \
     /usr/bin/env bash -c *, \
     /usr/bin/env -i bash -c *, \
-    /usr/bin/env *sh*, \
-    /usr/bin/env -i *
+    /usr/bin/env sh, \
+    /usr/bin/env -i sh, \
+    /usr/bin/env -i bash -i, \
+    /usr/bin/env dash, \
+    /usr/bin/env -i dash, \
+    /usr/bin/env zsh, \
+    /usr/bin/env -i zsh
 
 # ------------------------------------------------------------------------
 # Optional Alias (not active by default)
@@ -3502,9 +4061,7 @@ EOF
 log_info "🔧 Normalizing sudoers includes in $SUDOERS_MAIN"
 
 # Backup main sudoers file before changes
-SUDO_BAK="${SUDOERS_MAIN}.bak.$(date +%Y%m%d%H%M%S)"
-run_cmd cp -p -- "$SUDOERS_MAIN" "$SUDO_BAK"
-[[ $VERBOSE == true ]] && log_info "💾 Backup saved: $SUDO_BAK"
+backup_file "$SUDOERS_MAIN" SUDO_BAK
 
 tmp_sudo="$(mktemp)"
 includedir_present=false
@@ -3541,17 +4098,10 @@ chmod 440 "$tmp_sudo"
 log_info "🔍 Validating temporary sudoers configuration..."
 
 # Execute visudo using a temp file for log capture
-VISUDO_LOG=$(mktemp)
-
-# Temporarily disable 'set -e' so a visudo warning/error doesn't crash the script immediately
 set +e
-visudo -cf "$tmp_sudo" >"$VISUDO_LOG" 2>&1
+VISUDO_OUTPUT="$(visudo -cf "$tmp_sudo" 2>&1)"
 VISUDO_RC=$?
 set -e
-
-# Read the content of the log file into the variable
-VISUDO_OUTPUT=$(< "$VISUDO_LOG")
-rm -f "$VISUDO_LOG"
 
 if [[ $VISUDO_RC -eq 0 ]]; then
     # SUCCESS: Log the detailed output (including warnings and 'parsed OK' messages)
@@ -3565,7 +4115,6 @@ if [[ $VISUDO_RC -eq 0 ]]; then
     mv -f "$tmp_sudo" "$SUDOERS_MAIN"
     chmod 440 "$SUDOERS_MAIN"
     log_info "✅ Sudoers includes normalized successfully"
-    rm -f "$SUDO_BAK"
 else
     # FAILURE: Syntax Error Detected
     log_info "❌ visudo syntax check failed. Details:"
@@ -3581,7 +4130,7 @@ else
     # Decision to continue based on mode
     if $NONINTERACTIVE; then
         # NON-INTERACTIVE MODE: Must rollback and abort
-        mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
+        cp -p -- "$SUDO_BAK" "$SUDOERS_MAIN"
         log_info "💾 Restored backup: $SUDO_BAK"
         log_error "visudo syntax check failed during normalization (restored $SUDO_BAK)" 1
     else
@@ -3590,10 +4139,9 @@ else
         
         if [[ "$REPLY" =~ ^[Yy]$ ]]; then
             log_info "ℹ️ Ignoring visudo error (manual correction required). Proceeding with original $SUDOERS_MAIN."
-            rm -f "$SUDO_BAK" # Cleanup backup if user chooses to proceed without rollback
         else
             # User chooses to abort: Must rollback and abort
-            mv -f "$SUDO_BAK" "$SUDOERS_MAIN"
+            cp -p -- "$SUDO_BAK" "$SUDOERS_MAIN"
             log_info "💾 Restored backup: $SUDO_BAK"
             log_error "visudo syntax check failed during normalization (abort requested)" 1
         fi
