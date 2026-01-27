@@ -1613,8 +1613,7 @@ else
 		for (i = 1; i <= NF; i++) printf "%sDC=%s", (i>1?",":""), toupper($i)
 	}' <<< "$DOMAIN")
 
-	#default_OU="OU=Servers,OU=DC_ORACLE,OU=SITES,OU=OPERATIONS,OU=${DOMAIN_SHORT},OU=COMPANIES,${DOMAIN_DN}"
-    default_OU="OU=Servers,OU=DC_ORACLE,OU=SITES...${DOMAIN_DN}"
+    default_OU="CN=Computers,${DOMAIN_DN}"
     read -rp "[?] OU [default: ${default_OU}]: " OU
     OU="$(echo "${OU:-}" | xargs)"
     OU="${OU:-$default_OU}"
