@@ -1258,7 +1258,7 @@ OS_ARCH=$(uname -m)
 KERNEL_VER=$(uname -r)
 
 log_info "🧾 Starting linux-ad-domain-join.sh version $scriptVersion..."
-log_info "🌐 Hostname: $(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+log_info "🌐 Hostname: $(hostname -f 2>/dev/null || hostname 2>/dev/null || true) | IP: $(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 log_info "🧬 OS detected: $OS_NAME ($ID $OS_VERSION, kernel $KERNEL_VER, arch $OS_ARCH)"
 log_info "🧬 OS family: $OS_FAMILY, Package Manager: $PKG, SSH group: $SSH_G"
 
