@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.8
+# Version:     2.8.1
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -104,7 +104,7 @@
 # -------------------------------------------------------------------------------------------------
 
 # Define script version
-scriptVersion="$(grep -m1 "^# Version:" "${BASH_SOURCE[0]:-$0}" 2>/dev/null | awk '{print $NF}' || echo "unknown")"
+scriptVersion="$(grep -m1 "^# Version:" "${BASH_SOURCE[0]:-$0}" 2>/dev/null | cut -d: -f2 | tr -d ' ' || echo "unknown")"
 
 # Strict mode
 set -Eeuo pipefail
@@ -1062,8 +1062,6 @@ backup_file() {
         log_info "[DRY-RUN] 💾 Would backup '$path' -> '$bak'" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
-        else
-            printf '%s\n' "$bak"
         fi
         return 0
     fi
@@ -1075,8 +1073,6 @@ backup_file() {
         log_info "ℹ Backup already exists for this run: $bak" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
-        else
-            printf '%s\n' "$bak"
         fi
         return 0
     fi
@@ -1086,8 +1082,6 @@ backup_file() {
         log_info "ℹ Backup skipped (file not found): '$path' -> (planned) '$bak'" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
-        else
-            printf '%s\n' "$bak"
         fi
         return 0
     fi
@@ -1100,8 +1094,6 @@ backup_file() {
 
     if [[ -n "$__outvar" ]]; then
         printf -v "$__outvar" '%s' "$bak"
-    else
-        printf '%s\n' "$bak"
     fi
 }
 
@@ -1758,6 +1750,9 @@ MACHINE_PRINCIPAL="${HOST_SHORT_U}\$@${REALM}"
 log_info "🔍 Validating hostname and FQDN consistency"
 HOSTS_FILE="/etc/hosts"
 
+# Perform safe backup before modification
+backup_file "$HOSTS_FILE"
+
 # Skip Docker/Podman networks early
 SKIP_IFACES="docker|br-|virbr|veth|cni|flannel|tun|tap|wg|vboxnet|vmnet"
 
@@ -1847,9 +1842,6 @@ fi
 if ! grep -qE '^::1[[:space:]]+localhost' "$HOSTS_FILE"; then
     append_line_unique "$HOSTS_FILE" "::1   localhost"
 fi
-
-# Perform safe backup before modification
-backup_file "$HOSTS_FILE"
 
 # -------------------------------------------------------------------------
 # Canonicalizes /etc/hosts for the primary IP while preserving aliases
