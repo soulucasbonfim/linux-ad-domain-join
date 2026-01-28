@@ -92,6 +92,11 @@
 #   13 - Time synchronization failure
 #   14 - Unknown Kerberos failure
 #   15 - No active network interface or IP address detected
+#   16 - Another instance is already running
+#   21 - AD account locked/disabled
+#   22 - AD password expired
+#   23 - AD principal not found
+#   19-21 - Internal script errors (backup, file operations, etc)
 #  100 - Missing packages and system offline (no installation possible)
 #  101 - Unsupported Linux distribution
 #  127 - Command not found
@@ -242,7 +247,7 @@ if (( HOSTNAME_LEN > 15 )); then
     log_error "Hostname '$HOSTNAME_SHORT' has ${HOSTNAME_LEN} characters and cannot be used for domain join."
 fi
 
-if [[ ! "$HOSTNAME_SHORT" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
+if [[ ! "$HOSTNAME_SHORT" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,13}[A-Za-z0-9])?$ ]]; then
     log_error "Hostname '$HOSTNAME_SHORT' contains invalid characters for AD join. Use only letters, digits, and hyphen (-)." 1
 fi
 
@@ -687,14 +692,6 @@ parse_pkg_error() {
     return 1
 }
 
-# -------------------------------------------------------------------------
-# Unified command execution (legacy+modern safe, no eval)
-# - cmd_run:      returns RC (non-fatal), respects DRY_RUN/VERBOSE, captures output on failure
-# - cmd_must:     fatal wrapper (calls log_error on non-zero RC)
-# - cmd_run_in:   same as cmd_run, but reads stdin from a file
-# - cmd_must_in:  fatal wrapper for stdin-file mode
-# -------------------------------------------------------------------------
-
 print_cmd_quoted() {
     # Shell-escaped single-line representation (no trailing space)
     local a out=()
@@ -866,33 +863,35 @@ cmd_run() {
 CMD_LAST_RC=0
 
 cmd_try() {
-    # Usage: cmd_try <cmd> [args...]
-    # Does NOT abort the script while running the command under set -e.
-    # Stores RC in CMD_LAST_RC and RETURNS the real RC (so ||/&& fallbacks work).
+    # Assumption: this script uses only ERROR_TRAP_CMD as ERR trap.
+    # If a different ERR trap is set by the caller, cmd_try will NOT restore it.
+
     local rc=0
     local had_errexit=false
-    local old_err_trap=""
+    local restore_trap=false
 
     [[ $- == *e* ]] && had_errexit=true
-    old_err_trap="$(trap -p ERR || true)"
+
+    if [[ -n "$(trap -p ERR)" ]]; then
+        restore_trap=true
+    fi
 
     trap - ERR
     set +e
+
     cmd_run "$@"
     rc=$?
-    $had_errexit && set -e || set +e
 
-    # Restore previous ERR trap exactly as it was
-    if [[ -n "$old_err_trap" ]]; then
-        eval "$old_err_trap"
-    else
-        trap - ERR
+    $had_errexit && set -e
+
+    if $restore_trap; then
+        : "${ERROR_TRAP_CMD:?ERROR_TRAP_CMD not set}"
+        trap "$ERROR_TRAP_CMD" ERR
     fi
 
     CMD_LAST_RC=$rc
     return "$rc"
 }
-
 
 cmd_must() {
     # Usage: cmd_must <cmd> [args...]
@@ -1004,7 +1003,7 @@ safe_realm_list() {
         log_info "ℹ realmd not installed; skipping realm enumeration" >&2
     else
         # Execute with timeout; suppress DBus activation logs
-        timeout "$timeout_s" realm list >"$tmp_out" 2>/dev/null
+        timeout "$timeout_s" bash -c 'realm list 2>/dev/null' >"$tmp_out" 2>/dev/null || true
         local code=$?
         if (( code != 0 )); then
             log_info "ℹ realm list timed out or failed (code $code)" >&2
@@ -1031,6 +1030,11 @@ backup_file() {
 
     if [[ -z "$path" ]]; then
         log_error "backup_file: missing path argument" 19
+    fi
+
+    # Prevent path traversal attacks
+    if [[ "$path" == *".."* ]]; then
+        log_error "backup_file: path traversal detected in '$path'" 19
     fi
 
     # Validate outvar name if provided
@@ -1753,8 +1757,10 @@ MACHINE_PRINCIPAL="${HOST_SHORT_U}\$@${REALM}"
 # Hostname and FQDN Consistency Validation (/etc/hostname, /etc/hosts)
 # -------------------------------------------------------------------------
 log_info "🔍 Validating hostname and FQDN consistency"
-
 HOSTS_FILE="/etc/hosts"
+
+# Skip Docker/Podman networks early
+SKIP_IFACES="docker|br-|virbr|veth|cni|flannel|tun|tap|wg|vboxnet|vmnet"
 
 # Detect primary IPv4 address (route-aware; avoids Docker/VPN first-IP issues)
 PRIMARY_IP=""
@@ -1778,8 +1784,8 @@ fi
 # 2) Fallback: first global address excluding common container/vpn interfaces
 if [[ -z "$PRIMARY_IP" ]]; then
     if ip -o -4 addr show scope global >/dev/null 2>&1; then
-        PRIMARY_IFACE="$(ip -o -4 addr show scope global 2>/dev/null | awk '!/(docker|br-|virbr|veth|cni|flannel|tun|tap|wg)/ {print $2; exit}')"
-        PRIMARY_IP="$(ip -o -4 addr show scope global 2>/dev/null | awk '!/(docker|br-|virbr|veth|cni|flannel|tun|tap|wg)/ {print $4; exit}' | cut -d/ -f1)"
+        PRIMARY_IFACE="$(ip -o -4 addr show scope global 2>/dev/null | awk '!/(docker|br-|virbr|veth|cni|flannel|tun|tap|wg|vboxnet|vmnet)/ {print $2; exit}')"
+        PRIMARY_IP="$(ip -o -4 addr show scope global 2>/dev/null | awk -v skip="$SKIP_IFACES" '$2 !~ skip {print $4; exit}' | cut -d/ -f1)"
     fi
 fi
 
@@ -1950,9 +1956,9 @@ else
     log_error "Cannot reach Kerberos port 88 on $DC_SERVER (network/firewall issue)" 11
 fi
 
-# Test LDAP (TCP/389)
-if tcp_port_open "$DC_SERVER" 389 3; then
-    :
+# Test LDAP (TCP/389 or TCP/636 for LDAPS)
+if tcp_port_open "$DC_SERVER" 389 3 || tcp_port_open "$DC_SERVER" 636 3; then
+    log_info "✅ LDAP connectivity verified (TCP/389 or TCP/636)"
 else
     log_error "Cannot reach LDAP port 389 on $DC_SERVER (network/firewall issue)" 12
 fi
@@ -1984,8 +1990,8 @@ create_secret_passfile() {
 
     # Store password as a single line (no trailing newline).
     # OpenLDAP -y reads the entire file as password; newline/CR would be treated as part of the secret.
-    if [[ "${DOMAIN_PASS:-}" == *$'\n'* || "${DOMAIN_PASS:-}" == *$'\r'* ]]; then
-        log_error "DOMAIN_PASS contains newline/CR characters; refusing because ldapsearch -y would treat them as part of the password." 1
+    if [[ "${DOMAIN_PASS:-}" == *$'\n'* || "${DOMAIN_PASS:-}" == *$'\r'* || "${DOMAIN_PASS:-}" == *$'\0'* ]]; then
+        log_error "DOMAIN_PASS contains invalid characters (newline/CR/NULL); refusing for security." 1
     fi
 
     printf '%s' "$DOMAIN_PASS" > "$PASS_FILE" || log_error "Failed to write PASS_FILE" 1
@@ -2007,7 +2013,9 @@ cleanup_secrets() {
     # Best-effort secure delete
     if [[ -n "${PASS_FILE:-}" && -f "${PASS_FILE:-}" ]]; then
         if command -v shred >/dev/null 2>&1; then
-            shred -u -z -n 1 "$PASS_FILE" 2>/dev/null || rm -f "$PASS_FILE"
+            shred -u -z -n 3 "$PASS_FILE" 2>/dev/null || rm -f "$PASS_FILE"
+        elif command -v srm >/dev/null 2>&1; then
+            srm -f "$PASS_FILE" 2>/dev/null || rm -f "$PASS_FILE"
         else
             rm -f "$PASS_FILE"
         fi
@@ -2686,8 +2694,12 @@ else
 fi
 
 # Optional runtime sanity checks (non-blocking)
-getent passwd root >/dev/null || log_info "⚠ NSS runtime check (passwd) inconclusive - verify SSSD/NSCD"
-getent group root  >/dev/null || log_info "⚠ NSS runtime check (group) inconclusive - verify SSSD/NSCD"
+if ! timeout 5 getent passwd root >/dev/null 2>&1; then
+    log_info "⚠ NSS passwd lookup failed or timed out - verify SSSD/NSCD/network"
+fi
+if ! timeout 5 getent group root >/dev/null 2>&1; then
+    log_info "⚠ NSS group lookup failed or timed out - verify SSSD/NSCD/network"
+fi
 
 # -------------------------------------------------------------------------
 # Cache refresh (skip entirely in DRY-RUN)
@@ -3271,6 +3283,14 @@ elif timeout 90s adcli join \
             log_info "⚠️ adcli testjoin failed (non-fatal). Keytab trust check will be authoritative."
         fi
     fi
+
+    # Ensure keytab has correct permissions (security hardening)
+    if [[ -f /etc/krb5.keytab ]]; then
+        cmd_must chmod 600 /etc/krb5.keytab
+        cmd_must chown root:root /etc/krb5.keytab
+        log_info "🔒 Keytab permissions hardened (600, root:root)"
+    fi
+
 else
     log_info "❌ Domain join failed. Last output lines:"
     tail -n 5 "$JOIN_LOG" | sed -E 's/^[[:space:]]+//'
@@ -3564,7 +3584,7 @@ cmd_try chmod 600 "$SSSD_CONF" || true
 # Optional: flush old caches before restart
 # -------------------------------------------------------------------------
 if command -v sss_cache >/dev/null 2>&1; then
-    if [[ "$NONINTERACTIVE" == "true" ]]; then
+    if [[ "${NONINTERACTIVE:-false}" == "true" ]]; then
         log_info "ℹ️ NONINTERACTIVE mode detected - skipping SSSD cache flush to preserve UID mapping"
     else
         log_info "🔁 Flushing old SSSD caches"
