@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.8.3
+# Version:     2.8.4
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -127,10 +127,43 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Log message sanitizer - replaces emojis with ASCII equivalents
+# Terminal Colors (AUTO, TTY-safe, NO_COLOR aware)
+# -------------------------------------------------------------------------
+ENABLE_COLORS=0
+
+if [[ "${NO_COLOR:-}" != "1" ]]; then
+  if [[ -t 1 && -n "${TERM:-}" && "${TERM:-}" != "dumb" ]]; then
+    if command -v tput >/dev/null 2>&1; then
+      _tput_colors="$(tput colors 2>/dev/null || echo 0)"
+      if [[ "${_tput_colors}" =~ ^[0-9]+$ ]] && (( _tput_colors >= 8 )); then
+        ENABLE_COLORS=1
+      fi
+    else
+      ENABLE_COLORS=1
+    fi
+  fi
+fi
+
+if (( ENABLE_COLORS )); then
+  C_RESET=$'\033[0m'
+  C_DIM=$'\033[2m'
+  C_BOLD=$'\033[1m'
+
+  C_RED=$'\033[31m'
+  C_GREEN=$'\033[32m'
+  C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'
+  C_CYAN=$'\033[36m'
+  C_MAGENTA=$'\033[35m'
+else
+  C_RESET=""; C_DIM=""; C_BOLD=""
+  C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_MAGENTA=""
+fi
+
+# -------------------------------------------------------------------------
+# Log message sanitizer - replaces emojis with ASCII equivalents + colorization
 # -------------------------------------------------------------------------
 sanitize_log_msg() {
-    # Prefer UTF-8 locale for emoji matching; fallback to C if unavailable.
     local sed_locale="C"
 
     if locale -a 2>/dev/null | grep -qiE '^(C\.UTF-8|en_US\.UTF-8|pt_BR\.UTF-8)$'; then
@@ -143,7 +176,7 @@ sanitize_log_msg() {
         fi
     fi
 
-    # shellcheck disable=SC2086  # SED_EXT must be expanded as a flag (-E/-r)
+    # shellcheck disable=SC2086
     LC_ALL="$sed_locale" sed $SED_EXT '
         # Warnings / Alerts
         s/⚠|⚠️|❗|❕|🚨|📛|🧯|🔥|💣|🧨/[!]/g;
@@ -165,22 +198,56 @@ sanitize_log_msg() {
 }
 
 # -------------------------------------------------------------------------
-# Log info and error functions with sanitization
+# Colorize log tags based on content
+# -------------------------------------------------------------------------
+colorize_tag() {
+    local msg="$1"
+    
+    if (( ENABLE_COLORS == 0 )); then
+        echo "$msg"
+        return
+    fi
+    
+    # Colorize tags based on type
+    msg="${msg//\[x\]/${C_RED}[x]${C_RESET}}"      # Errors
+    msg="${msg//\[!\]/${C_YELLOW}[!]${C_RESET}}"   # Warnings
+    msg="${msg//\[+\]/${C_GREEN}[+]${C_RESET}}"    # Success
+    msg="${msg//\[i\]/${C_BLUE}[i]${C_RESET}}"     # Info
+    msg="${msg//\[>\]/${C_CYAN}[>]${C_RESET}}"     # Operations
+    msg="${msg//\[\*\]/${C_MAGENTA}[*]${C_RESET}}" # Tests/Lookup
+    
+    echo "$msg"
+}
+
+# -------------------------------------------------------------------------
+# Log info and error functions with sanitization and colors
 # -------------------------------------------------------------------------
 log_info() {
     local msg="$1"
+    local ts="${C_DIM}[$(date '+%F %T')]${C_RESET}"
+    
     msg="$(sanitize_log_msg <<< "$msg")"
-    echo "[$(date '+%F %T')] $msg"
+    msg="$(colorize_tag "$msg")"
+    
+    echo "${ts} ${msg}"
 }
 
 log_error() {
-    local msg="$1"; local code="${2:-1}"
-    local ts="[$(date '+%F %T')]"
+    local msg="$1"
+    local code="${2:-1}"
+    local ts="${C_DIM}[$(date '+%F %T')]${C_RESET}"
+    
     trap - ERR
-    local line1="$ts ❌ [ERROR] $msg"
-    local line2="$ts ℹ Exiting with code $code"
-    echo "$(sanitize_log_msg <<< "$line1")" >&2
-    echo "$(sanitize_log_msg <<< "$line2")" >&2
+    
+    local line1="${ts} ${C_RED}[x]${C_RESET} ${C_BOLD}[ERROR]${C_RESET} $msg"
+    local line2="${ts} ${C_BLUE}[i]${C_RESET} Exiting with code $code"
+    
+    line1="$(sanitize_log_msg <<< "$line1")"
+    line2="$(sanitize_log_msg <<< "$line2")"
+    
+    echo "$line1" >&2
+    echo "$line2" >&2
+    
     sync; sleep 0.05
     exit "$code"
 }
@@ -192,8 +259,10 @@ read_sanitized() {
     local prompt sanitized var_name
     prompt="$1"
     var_name="$2"
+    local ts="${C_DIM}[$(date '+%F %T')]${C_RESET}"
     sanitized="$(sanitize_log_msg <<< "$prompt")"
-    read -rp "[$(date '+%F %T')] $sanitized" "$var_name"
+    sanitized="$(colorize_tag "$sanitized")"
+    read -rp "${ts} ${sanitized}" "$var_name"
 }
 
 # -------------------------------------------------------------------------
@@ -210,10 +279,12 @@ print_divider() {
     # Safety threshold
     [[ -z "$cols" || "$cols" -lt 20 ]] && cols=80
 
-    # Divider generation + sync
+    # Divider generation + sync (com cor dim)
     sync
     sleep 0.05
+    printf '%s' "$C_DIM"
     printf '%*s\n' "$cols" '' | tr ' ' '-' >&2
+    printf '%s' "$C_RESET"
 }
 
 # -------------------------------------------------------------------------
@@ -364,12 +435,12 @@ trim_line() {
 
 init_backup_dir() {
     if $VALIDATE_ONLY; then
-        log_info "[VALIDATE-ONLY] Backup directory creation suppressed: $BACKUP_DIR"
+        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Backup directory creation suppressed: $BACKUP_DIR"
         return 0
     fi
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would create backup directory: $BACKUP_DIR"
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would create backup directory: $BACKUP_DIR"
         return 0
     fi
 
@@ -384,11 +455,11 @@ backup_prune_old_runs() {
     local keep="${1:-20}"
 
     if $VALIDATE_ONLY; then
-        log_info "[VALIDATE-ONLY] Backup pruning suppressed"
+        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Backup pruning suppressed"
         return 0
     fi
 
-    $DRY_RUN && { log_info "[DRY-RUN] Would prune backups in $BACKUP_ROOT (keep last $keep)"; return 0; }
+    $DRY_RUN && { log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would prune backups in $BACKUP_ROOT (keep last $keep)"; return 0; }
     [[ -d "$BACKUP_ROOT" ]] || return 0
 
     local tmp_list
@@ -444,7 +515,7 @@ disable_tmout_in_profile_d() {
     local f bk
 
     if $VALIDATE_ONLY; then
-        log_info "[VALIDATE-ONLY] Suppressed TMOUT cleanup in /etc/profile.d (non-invasive mode)"
+        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Suppressed TMOUT cleanup in /etc/profile.d (non-invasive mode)"
         return 0
     fi
 
@@ -458,7 +529,7 @@ disable_tmout_in_profile_d() {
         backup_file "$f" bk
 
         if $DRY_RUN; then
-            log_info "[DRY-RUN] Would disable TMOUT lines in $f"
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would disable TMOUT lines in $f"
             continue
         fi
 
@@ -481,7 +552,7 @@ apply_tmout_profile() {
     local target="/etc/profile.d/99-session-timeout.sh"
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would write $target enforcing TMOUT=$timeout"
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would write $target enforcing TMOUT=$timeout"
         return 0
     fi
 
@@ -510,7 +581,7 @@ sshd_set_directive_dedup() {
     local tmp
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would set global '$key $value' in $file (deduplicated, preserving Match blocks)"
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would set global '$key $value' in $file (deduplicated, preserving Match blocks)"
         return 0
     fi
 
@@ -543,7 +614,7 @@ validate_sshd_config_or_die() {
     local file="$1"
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would validate sshd config: sshd -t -f $file"
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would validate sshd config: sshd -t -f $file"
         return 0
     fi
 
@@ -804,7 +875,7 @@ cmd_run() {
     # VALIDATE_ONLY: suprimir comandos mutáveis (read-only mode)
     if $VALIDATE_ONLY; then
         if is_mutating_cmd "$first_bin" "${cmd[@]:1}"; then
-            log_info "[VALIDATE-ONLY] Suppressed mutating command: $(print_cmd_quoted "${cmd[@]}")"
+            log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Suppressed mutating command: $(print_cmd_quoted "${cmd[@]}")"
             return 0
         fi
     fi
@@ -918,7 +989,7 @@ cmd_run_in() {
 
     if $VALIDATE_ONLY; then
         if is_mutating_cmd "$first_bin" "${cmd[@]:1}"; then
-            log_info "[VALIDATE-ONLY] Suppressed mutating command: $(print_cmd_quoted "${cmd[@]}") < $stdin_file"
+            log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Suppressed mutating command: $(print_cmd_quoted "${cmd[@]}") < $stdin_file"
             return 0
         fi
     fi
@@ -1049,7 +1120,7 @@ backup_file() {
     # Helper: return backup path via stdout or assign to var
     # (inline to avoid creating global helper functions)
     if $VALIDATE_ONLY; then
-        log_info "[VALIDATE-ONLY] 💾 Would backup '$path' -> '$bak' (suppressed)" >&2
+        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} 💾 Would backup '$path' -> '$bak' (suppressed)" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
         else
@@ -1059,7 +1130,7 @@ backup_file() {
     fi
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] 💾 Would backup '$path' -> '$bak'" >&2
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} 💾 Would backup '$path' -> '$bak'" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
         fi
@@ -1104,13 +1175,13 @@ write_file() {
     local path="$2"
 
     if $VALIDATE_ONLY; then
-        log_info "[VALIDATE-ONLY] Would write $path (mode $mode) - suppressed"
+        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would write $path (mode $mode) - suppressed"
         cat >/dev/null
         return 0
     fi
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would write $path (mode $mode)"
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would write $path (mode $mode)"
         cat >/dev/null
         return 0
     fi
@@ -1124,12 +1195,12 @@ append_line() {
     local line="$2"
 
     if $VALIDATE_ONLY; then
-        log_info "[VALIDATE-ONLY] Would append to $path: $line - suppressed"
+        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would append to $path: $line - suppressed"
         return 0
     fi
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would append to $path: $line"
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would append to $path: $line"
         return 0
     fi
 
@@ -1354,7 +1425,10 @@ fi
 # Logging connectivity summary
 log_info "📡 Connectivity diagnostic summary:"
 for line in "${CONNECT_DETAILS[@]}"; do
-    log_info "   $line"
+    # Sanitize first, then colorize
+    line_sanitized="$(sanitize_log_msg <<< "$line")"
+    line_colored="$(colorize_tag "$line_sanitized")"
+    echo "   ${line_colored}"
 done
 
 # -------------------------------------------------------------------------
@@ -1362,7 +1436,7 @@ done
 # -------------------------------------------------------------------------
 if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release || -f /etc/rocky-release || -f /etc/almalinux-release ]]; then
     if $VALIDATE_ONLY; then
-        log_info "[VALIDATE-ONLY] Skipping RPM database integrity/repair block (non-invasive mode)"
+        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Skipping RPM database integrity/repair block (non-invasive mode)"
     else
         log_info "🧩 Checking RPM database integrity"
 
@@ -1374,7 +1448,7 @@ if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release
         if [[ -z "$release_file" ]]; then
             log_info "ℹ No release file found for rpm check, skipping RPM DB verification"
         elif $DRY_RUN; then
-            log_info "[DRY-RUN] Would verify rpm ownership of $release_file and rebuild RPM DB if corrupted"
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would verify rpm ownership of $release_file and rebuild RPM DB if corrupted"
         else
             if ! rpm -qf "$release_file" &>/dev/null; then
                 log_info "⚙ RPM database appears corrupted - initiating recovery"
@@ -1421,7 +1495,7 @@ install_missing_deps() {
     local -a to_install=( "$@" )
 
     if $VALIDATE_ONLY; then
-        log_info "[VALIDATE-ONLY] Missing packages detected (not installing): ${to_install[*]}"
+        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Missing packages detected (not installing): ${to_install[*]}"
         return 0
     fi
 
@@ -1633,10 +1707,11 @@ else
 
     # Require DOMAIN
     while true; do
-        read -rp "[?] Domain (e.g., acme.net): " DOMAIN
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Domain (e.g., acme.net): " "$(date '+%F %T')"
+        read -r DOMAIN
         DOMAIN=$(echo "$DOMAIN" | xargs)
         [[ -n "$DOMAIN" ]] && break
-        echo "[!] Domain is required."
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Domain is required.\n" "$(date '+%F %T')"
     done
     DOMAIN_LOWER="${DOMAIN,,}"
     DOMAIN_UPPER="${DOMAIN^^}"
@@ -1648,43 +1723,46 @@ else
 	}' <<< "$DOMAIN")
 
     default_OU="CN=Computers,${DOMAIN_DN}"
-    read -rp "[?] OU [default: ${default_OU}]: " OU
+    printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} OU ${C_DIM}[default: ${default_OU}]${C_RESET}: " "$(date '+%F %T')"
+    read -r OU
     OU="$(echo "${OU:-}" | xargs)"
     OU="${OU:-$default_OU}"
 
     # DC Server (optional, default filled)
     default_DC_SERVER="${DOMAIN_SHORT,,}-sp-ad01.${DOMAIN,,}"
-    read -rp "[?] DC server [default: ${default_DC_SERVER}]: " DC_SERVER
+    printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} DC server ${C_DIM}[default: ${default_DC_SERVER}]${C_RESET}: " "$(date '+%F %T')"
+    read -r DC_SERVER
     DC_SERVER="$(echo "${DC_SERVER:-}" | xargs)"
     DC_SERVER="${DC_SERVER:-$default_DC_SERVER}"
 
 	# NTP Server (optional, default filled)
     default_NTP_SERVER="ntp.${DOMAIN,,}"
-    read -rp "[?] NTP server [default: ${default_NTP_SERVER}]: " NTP_SERVER
+    printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} NTP server ${C_DIM}[default: ${default_NTP_SERVER}]${C_RESET}: " "$(date '+%F %T')"
+    read -r NTP_SERVER
     NTP_SERVER="$(echo "${NTP_SERVER:-}" | xargs)"
     NTP_SERVER="${NTP_SERVER:-$default_NTP_SERVER}"
 
     # Require Join User
     while true; do
-        read -rp "[?] Join user (e.g., administrator): " DOMAIN_USER
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Join user (e.g., administrator): " "$(date '+%F %T')"
+        read -r DOMAIN_USER
         DOMAIN_USER=$(echo "$DOMAIN_USER" | xargs)
         [[ -n "$DOMAIN_USER" ]] && break
-        echo "[!] Join user is required."
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Join user is required.\n" "$(date '+%F %T')"
     done
 
     # Require Password
     while true; do
-        read -rsp "[?] Password for $DOMAIN_USER: " DOMAIN_PASS
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Password for ${C_BOLD}${DOMAIN_USER}${C_RESET}: " "$(date '+%F %T')"
+        read -rs DOMAIN_PASS
         echo
         [[ -n "$DOMAIN_PASS" ]] && break
-        echo "[!] Password cannot be empty."
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Password cannot be empty.\n" "$(date '+%F %T')"
     done
 
 	# Set Global Admin group(s) for SSH AllowGroups
-    printf "[?] Define the global admin group(s) allowed SSH access (space-separated):\n" >&2
-
-    # prompt shown via stderr (unbuffered, ordered)
-    printf "[?] Global admin group(s): " >&2
+    printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Define the global admin group(s) allowed SSH access (space-separated):\n" "$(date '+%F %T')" >&2
+    printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Global admin group(s): " "$(date '+%F %T')" >&2
     read -r GLOBAL_ADMIN_GROUPS
     GLOBAL_ADMIN_GROUPS="$(echo "$GLOBAL_ADMIN_GROUPS" | xargs)"  # trim spaces
 
@@ -1695,33 +1773,35 @@ else
     # Session timeout (SSH + Shell) in seconds
     default_SESSION_TIMEOUT_SECONDS=900
     while true; do
-        read -rp "[?] Session timeout in seconds (SSH + shell) [default: ${default_SESSION_TIMEOUT_SECONDS}]: " SESSION_TIMEOUT_SECONDS
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Session timeout in seconds (SSH + shell) ${C_DIM}[default: ${default_SESSION_TIMEOUT_SECONDS}]${C_RESET}: " "$(date '+%F %T')"
+        read -r SESSION_TIMEOUT_SECONDS
         SESSION_TIMEOUT_SECONDS="$(echo "${SESSION_TIMEOUT_SECONDS:-$default_SESSION_TIMEOUT_SECONDS}" | xargs)"
 
         if is_uint "$SESSION_TIMEOUT_SECONDS" && (( SESSION_TIMEOUT_SECONDS >= 30 && SESSION_TIMEOUT_SECONDS <= 86400 )); then
             break
         fi
-        echo "[!] Invalid value. Use an integer between 30 and 86400."
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid value. Use an integer between 30 and 86400.\n" "$(date '+%F %T')"
     done
 
     # PermitRootLogin
     while true; do
-        read -rp "[?] PermitRootLogin over SSH? (yes/no) [default: no]: " _prl
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} PermitRootLogin over SSH? (yes/no) ${C_DIM}[default: no]${C_RESET}: " "$(date '+%F %T')"
+        read -r _prl
         _prl="${_prl:-no}"
         PERMIT_ROOT_LOGIN="$(normalize_yes_no "$_prl")"
         [[ -n "$PERMIT_ROOT_LOGIN" ]] && break
-        echo "[!] Invalid value. Type 'yes' or 'no'."
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid value. Type 'yes' or 'no'.\n" "$(date '+%F %T')"
     done
 
     # Ask whether SSH password auth should be enabled.
     while true; do
-    read -rp "[?] Allow SSH PasswordAuthentication? (yes/no) [default: yes]: " _pa
-    _pa="${_pa:-yes}"
-    PASSWORD_AUTHENTICATION="$(normalize_yes_no "$_pa")"
-    [[ -n "$PASSWORD_AUTHENTICATION" ]] && break
-    echo "[!] Invalid input. Use yes or no."
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Allow SSH PasswordAuthentication? (yes/no) ${C_DIM}[default: yes]${C_RESET}: " "$(date '+%F %T')"
+        read -r _pa
+        _pa="${_pa:-yes}"
+        PASSWORD_AUTHENTICATION="$(normalize_yes_no "$_pa")"
+        [[ -n "$PASSWORD_AUTHENTICATION" ]] && break
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid input. Use yes or no.\n" "$(date '+%F %T')"
     done
-
 fi
 print_divider
 
@@ -1916,7 +1996,7 @@ cmd_must chmod 644 "$HOSTS_FILE"
 
 # Final validation
 if $DRY_RUN; then
-    log_info "[DRY-RUN] Skipping /etc/hosts validation because no changes were applied."
+    log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Skipping /etc/hosts validation because no changes were applied."
 elif ! grep -qE "^[[:space:]]*${PRIMARY_IP_RE}[[:space:]]+${HOST_FQDN}" "$HOSTS_FILE"; then
     log_error "Host mapping not applied correctly in /etc/hosts"
 else
@@ -2395,9 +2475,9 @@ EOF
 
         log_info "🔄 Restarting $DBUS_SERVICE silently (detached from current D-Bus session)"
 		if $VALIDATE_ONLY; then
-            log_info "[VALIDATE-ONLY] Suppressed restart of $DBUS_SERVICE (non-invasive mode)"
+            log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Suppressed restart of $DBUS_SERVICE (non-invasive mode)"
         elif $DRY_RUN; then
-            log_info "[DRY-RUN] Would restart $DBUS_SERVICE (detached) to heal oddjob D-Bus registration"
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would restart $DBUS_SERVICE (detached) to heal oddjob D-Bus registration"
         else
             nohup setsid bash -c "systemctl restart '$DBUS_SERVICE' >/dev/null 2>&1 < /dev/null" >/dev/null 2>&1 &
             disown || true
@@ -2586,9 +2666,9 @@ fi
 
 # Normalize line endings (CRLF-safe) before backup
 if $DRY_RUN; then
-    log_info "[DRY-RUN] Would normalize CRLF in $NSS_FILE"
+    log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would normalize CRLF in $NSS_FILE"
 elif $VALIDATE_ONLY; then
-    log_info "[VALIDATE-ONLY] Skipping CRLF normalization in $NSS_FILE"
+    log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Skipping CRLF normalization in $NSS_FILE"
 else
     cmd_must sed -i 's/\r$//' "$NSS_FILE"
 fi
@@ -2671,7 +2751,7 @@ fi
 # Commit (only when not DRY-RUN)
 # -------------------------------------------------------------------------
 if $DRY_RUN; then
-    log_info "[DRY-RUN] Would update $NSS_FILE with NSS/SSSD mappings (preview):"
+    log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would update $NSS_FILE with NSS/SSSD mappings (preview):"
     # Read via process substitution to avoid pipefail abort when grep finds no matches
     while IFS= read -r l || [[ -n "$l" ]]; do
         [[ -n "$l" ]] && log_info "   $l"
@@ -2696,7 +2776,7 @@ fi
 # Cache refresh (skip entirely in DRY-RUN)
 # -------------------------------------------------------------------------
 if $DRY_RUN; then
-    log_info "[DRY-RUN] Would stop nslcd (if present), restart sssd/nscd, and flush sss_cache"
+    log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would stop nslcd (if present), restart sssd/nscd, and flush sss_cache"
 else
     # If legacy nslcd is present, stop it to avoid conflicts with SSSD
     if command -v systemctl &>/dev/null; then
@@ -2946,7 +3026,7 @@ EOF
     } >>"$tmp_chrony"
 
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would update $chrony_conf with embedded managed block (preview suppressed)"
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would update $chrony_conf with embedded managed block (preview suppressed)"
         rm -f "$tmp_chrony"
     else
         # Keep ownership/perms sane
@@ -3014,7 +3094,7 @@ fi
 log_info "🔧 Enabling and restarting Chrony service (${chrony_service})"
 
 if $VALIDATE_ONLY; then
-    log_info "[VALIDATE-ONLY] Suppressing service enable/restart for chrony"
+    log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Suppressing service enable/restart for chrony"
 else
     if command -v systemctl >/dev/null 2>&1; then
         cmd_try systemctl enable "$chrony_service" || true
@@ -3051,7 +3131,7 @@ elif chronyc help 2>/dev/null | grep -qi 'waitsync'; then
 fi
 
 if $VALIDATE_ONLY; then
-    log_info "[VALIDATE-ONLY] Skipping active sync wait"
+    log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Skipping active sync wait"
 else
     if $has_waitsync; then
         # Best-effort: if waitsync fails, we fall back to manual polling.
@@ -3082,7 +3162,7 @@ else
         fi
 
         # Progress line (stderr, sanitized)
-        printf "\r[%s] ℹ Waiting for NTP sync... (%2ds/%2ds)" "$(date '+%F %T')" "$i" "45" | sanitize_log_msg >&2
+        printf "\r${C_DIM}[%s]${C_RESET} ${C_BLUE}[i]${C_RESET} Waiting for NTP sync... ${C_CYAN}(%2ds/%2ds)${C_RESET}" "$(date '+%F %T')" "$i" "45" >&2
         sleep 1
     done
     printf "\r\033[K" >&2
@@ -3242,7 +3322,7 @@ JOIN_LOG=$(mktemp)
 
 # Execute adcli join deterministically
 if $DRY_RUN; then
-    log_info "[DRY-RUN] Would join domain via adcli (execution suppressed)."
+    log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would join domain via adcli (execution suppressed)."
     true
 elif timeout 90s adcli join \
     --verbose \
@@ -3309,7 +3389,7 @@ replace: description
 description: [${HOST_IP}] - Joined with adcli by ${DOMAIN_USER} on ${timestamp}
 EOF
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would update AD description via ldapmodify (execution suppressed)."
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would update AD description via ldapmodify (execution suppressed)."
         true
     elif ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1; then
         log_info "✅ Description updated successfully in AD"
@@ -3454,7 +3534,7 @@ else
             $VERBOSE && LDAP_OUT="/dev/stderr"
 
             if $DRY_RUN; then
-                log_info "[DRY-RUN] Would re-enable computer object via ldapmodify (execution suppressed)."
+                log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would re-enable computer object via ldapmodify (execution suppressed)."
             else
 
                 ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" >"$LDAP_OUT" 2>&1 <<EOF
@@ -3633,7 +3713,7 @@ if [[ -f "$PAM_SU_FILE" ]]; then
         ' "$PAM_SU_FILE" >"$tmp_su"
 
         if $DRY_RUN; then
-            log_info "[DRY-RUN] Would update $PAM_SU_FILE to include pam_sss.so (non-destructive)"
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would update $PAM_SU_FILE to include pam_sss.so (non-destructive)"
             rm -f "$tmp_su"
         else
             cmd_must mv -f "$tmp_su" "$PAM_SU_FILE"
@@ -3770,7 +3850,7 @@ SSH_CFG="/etc/ssh/sshd_config"
 
 # Backup before changes
 if $DRY_RUN; then
-    log_info "[DRY-RUN] Would backup $SSH_CFG"
+    log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would backup $SSH_CFG"
 else
     backup_file "$SSH_CFG"
 fi
@@ -3888,7 +3968,7 @@ Cmnd_Alias ROOT_SHELLS = \
 EOF
 
 if $DRY_RUN; then
-    log_info "[DRY-RUN] Would validate sudoers syntax: visudo -cf $BLOCK_FILE"
+    log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would validate sudoers syntax: visudo -cf $BLOCK_FILE"
 else
     cmd_must visudo -cf "$BLOCK_FILE"
 fi
@@ -4169,7 +4249,7 @@ if [[ $VISUDO_RC -eq 0 ]]; then
     
     # Commit the changes
     if $DRY_RUN; then
-        log_info "[DRY-RUN] Would replace $SUDOERS_MAIN with validated sudoers content"
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would replace $SUDOERS_MAIN with validated sudoers content"
         rm -f "$tmp_sudo"
     else
         cmd_must mv -f "$tmp_sudo" "$SUDOERS_MAIN"
@@ -4192,7 +4272,7 @@ else
     if $NONINTERACTIVE; then
         # NON-INTERACTIVE MODE: Must rollback and abort
         if $DRY_RUN; then
-            log_info "[DRY-RUN] Would restore sudoers backup: $SUDO_BAK -> $SUDOERS_MAIN"
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would restore sudoers backup: $SUDO_BAK -> $SUDOERS_MAIN"
         else
             cmd_must cp -p -- "$SUDO_BAK" "$SUDOERS_MAIN"
         fi
@@ -4207,7 +4287,7 @@ else
         else
             # User chooses to abort: Must rollback and abort
             if $DRY_RUN; then
-                log_info "[DRY-RUN] Would restore sudoers backup: $SUDO_BAK -> $SUDOERS_MAIN"
+                log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would restore sudoers backup: $SUDO_BAK -> $SUDOERS_MAIN"
             else
                 cmd_must cp -p -- "$SUDO_BAK" "$SUDOERS_MAIN"
             fi
@@ -4345,7 +4425,7 @@ else
 		fi
 
 		if $DRY_RUN; then
-            log_info "[DRY-RUN] Would replace $f with patched version (validated)"
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would replace $f with patched version (validated)"
             rm -f "$tmp"
         else
             cmd_must mv -f "$tmp" "$f"
@@ -4409,17 +4489,31 @@ fi
 print_divider
 log_info "🌟 DOMAIN JOIN VALIDATION SUMMARY"
 print_divider
-printf "%-25s %s\n" "Realm:"              "$REALM_JOINED"
-printf "%-25s %s\n" "DC Server (input):"  "$DC_SERVER_INPUT"
-printf "%-25s %s\n" "KDC used (trust):"   "${DC_TRUST_SERVER:-n/a}"
-printf "%-25s %s\n" "Computer Name:"      "$HOST_SHORT_U"
-printf "%-25s %s\n" "Kerberos Principal:" "${KLIST_PRINCIPAL:-⚠️ None active}"
-printf "%-25s %s\n" "Key Version (KVNO):" "$MSDS_KVNO"
-printf "%-25s %s\n" "Domain Trust:"       "$TRUST_STATUS"
-printf "%-25s %s\n" "Handshake (ms):"     "${TRUST_ELAPSED:-n/a}"
-printf "%-25s %s\n" "Network RTT:"        "${TRUST_RTT:-n/a}"
-printf "%-25s %s\n" "SSSD Service:"       "${SSSD_STATUS,,}"
-printf "%-25s %s\n" "SSH Service:"        "${SSH_STATUS,,}"
+
+# Colorize status values
+REALM_COLOR="${C_GREEN}"
+[[ "$REALM_JOINED" == "⚠️ Not detected" ]] && REALM_COLOR="${C_YELLOW}"
+
+TRUST_COLOR="${C_GREEN}"
+[[ "$TRUST_STATUS" =~ "failed" ]] && TRUST_COLOR="${C_RED}"
+
+SSSD_COLOR="${C_GREEN}"
+[[ "$SSSD_STATUS" == "inactive" ]] && SSSD_COLOR="${C_RED}"
+
+SSH_COLOR="${C_GREEN}"
+[[ "$SSH_STATUS" == "inactive" ]] && SSH_COLOR="${C_RED}"
+
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "Realm:" "${REALM_COLOR}${REALM_JOINED}${C_RESET}"
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "DC Server (input):" "${C_DIM}${DC_SERVER_INPUT}${C_RESET}"
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "KDC used (trust):" "${C_DIM}${DC_TRUST_SERVER:-n/a}${C_RESET}"
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "Computer Name:" "${C_BOLD}${HOST_SHORT_U}${C_RESET}"
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "Kerberos Principal:" "${C_DIM}${KLIST_PRINCIPAL:-⚠️ None active}${C_RESET}"
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "Key Version (KVNO):" "${C_DIM}${MSDS_KVNO}${C_RESET}"
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "Domain Trust:" "${TRUST_COLOR}${TRUST_STATUS}${C_RESET}"
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "Handshake (ms):" "${C_DIM}${TRUST_ELAPSED:-n/a}${C_RESET}"
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "Network RTT:" "${C_DIM}${TRUST_RTT:-n/a}${C_RESET}"
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "SSSD Service:" "${SSSD_COLOR}${SSSD_STATUS}${C_RESET}"
+printf "${C_CYAN}%-25s${C_RESET} %s\n" "SSH Service:" "${SSH_COLOR}${SSH_STATUS}${C_RESET}"
 print_divider
 
 # Insert short pause and newline without spawning a subshell
