@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.7
+# Version:     2.7.1
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -1095,9 +1095,8 @@ backup_file() {
     # log before performing the copy
     log_info "💾 Backing up: '$path' -> '$bak'" >&2
 
+    # Perform the backup copy, preserving attributes
     cp -p -- "$path" "$bak" || log_error "Failed to backup '$path' to '$bak'" 21
-
-    log_info "💾 Backup saved: $bak" >&2
 
     if [[ -n "$__outvar" ]]; then
         printf -v "$__outvar" '%s' "$bak"
