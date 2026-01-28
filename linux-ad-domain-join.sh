@@ -242,7 +242,7 @@ if (( HOSTNAME_LEN > 15 )); then
     log_error "Hostname '$HOSTNAME_SHORT' has ${HOSTNAME_LEN} characters and cannot be used for domain join."
 fi
 
-if [[ ! "$HOSTNAME_SHORT" =~ ^[A-Za-z0-9-]+$ ]]; then
+if [[ ! "$HOSTNAME_SHORT" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?$ ]]; then
     log_error "Hostname '$HOSTNAME_SHORT' contains invalid characters for AD join. Use only letters, digits, and hyphen (-)." 1
 fi
 
@@ -280,7 +280,7 @@ VALIDATE_ONLY="${VALIDATE_ONLY:-false}"
 # - avoids hard dependency on tee before deps are installed
 # - VALIDATE_ONLY uses /tmp to keep the run non-invasive
 # -------------------------------------------------------------------------
-if $VALIDATE_ONLY; then
+if $VALIDATE_ONLY || $DRY_RUN; then
     LOG_FILE="${LOG_FILE:-/tmp/linux-ad-domain-join.validate.log}"
     BACKUP_ROOT="${BACKUP_ROOT:-/tmp/linux-ad-domain-join-backups}"
 else
@@ -295,6 +295,38 @@ if ! : >>"$LOG_FILE" 2>/dev/null; then
     LOG_FILE="/tmp/linux-ad-domain-join.log"
     mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
     : >>"$LOG_FILE" 2>/dev/null || { echo "[$(date '+%F %T')] [ERROR] Cannot write LOG_FILE=$LOG_FILE" >&2; exit 1; }
+fi
+
+# -------------------------------------------------------------------------
+# Single-instance lock (prevents concurrent executions)
+# - Must run before log truncation to avoid clobbering an active run log.
+# -------------------------------------------------------------------------
+LOCK_BASE="/run/lock"
+[[ -d "$LOCK_BASE" ]] || LOCK_BASE="/var/lock"
+mkdir -p "$LOCK_BASE" 2>/dev/null || true
+
+LOCK_FILE="${LOCK_BASE}/linux-ad-domain-join.lock"
+LOCK_DIR_FALLBACK="${LOCK_FILE}.d"
+LOCK_MODE=""
+
+if command -v flock >/dev/null 2>&1; then
+    # Use an fd-based lock (auto-released on process exit).
+    exec 200>"$LOCK_FILE"
+    if ! flock -n 200; then
+        echo "[$(date '+%F %T')] [ERROR] Another instance is already running (lock: $LOCK_FILE)" >&2
+        exit 16
+    fi
+    # Store PID for troubleshooting (best-effort).
+    printf '%s\n' "$$" 1>&200 2>/dev/null || true
+    LOCK_MODE="flock"
+else
+    # Portable fallback: atomic mkdir lock. Requires explicit cleanup.
+    if ! mkdir "$LOCK_DIR_FALLBACK" 2>/dev/null; then
+        echo "[$(date '+%F %T')] [ERROR] Another instance is already running (lock: $LOCK_DIR_FALLBACK)" >&2
+        exit 16
+    fi
+    printf '%s\n' "$$" >"${LOCK_DIR_FALLBACK}/pid" 2>/dev/null || true
+    LOCK_MODE="mkdir"
 fi
 
 # Redirect stdout/stderr to log; mirror to console only if tee exists
@@ -405,6 +437,12 @@ normalize_yes_no() {
 # Remove/disable TMOUT duplicates inside /etc/profile.d to avoid conflicts
 disable_tmout_in_profile_d() {
     local f bk
+
+    if $VALIDATE_ONLY; then
+        log_info "[VALIDATE-ONLY] Suppressed TMOUT cleanup in /etc/profile.d (non-invasive mode)"
+        return 0
+    fi
+
     shopt -s nullglob
 
     for f in /etc/profile.d/*.sh; do
@@ -420,7 +458,7 @@ disable_tmout_in_profile_d() {
         fi
 
         # Comment only TMOUT-related lines (do not destroy file logic)
-        sed -i $SED_EXT \
+        cmd_must sed -i $SED_EXT \
             -e 's/\r$//' \
             -e '/^[[:space:]]*(readonly[[:space:]]+)?TMOUT=/{s/^/# disabled-by-linux-ad-domain-join: /;}' \
             -e '/^[[:space:]]*export[[:space:]]+TMOUT\b/{s/^/# disabled-by-linux-ad-domain-join: /;}' \
@@ -829,19 +867,32 @@ CMD_LAST_RC=0
 
 cmd_try() {
     # Usage: cmd_try <cmd> [args...]
-    # Never aborts the script under set -e; stores RC in CMD_LAST_RC.
+    # Does NOT abort the script while running the command under set -e.
+    # Stores RC in CMD_LAST_RC and RETURNS the real RC (so ||/&& fallbacks work).
     local rc=0
+    local had_errexit=false
+    local old_err_trap=""
+
+    [[ $- == *e* ]] && had_errexit=true
+    old_err_trap="$(trap -p ERR || true)"
 
     trap - ERR
     set +e
     cmd_run "$@"
     rc=$?
-    set -e
-    trap "$ERROR_TRAP_CMD" ERR
+    $had_errexit && set -e || set +e
+
+    # Restore previous ERR trap exactly as it was
+    if [[ -n "$old_err_trap" ]]; then
+        eval "$old_err_trap"
+    else
+        trap - ERR
+    fi
 
     CMD_LAST_RC=$rc
-    return 0
+    return "$rc"
 }
+
 
 cmd_must() {
     # Usage: cmd_must <cmd> [args...]
@@ -934,18 +985,6 @@ cmd_must_in() {
     (( CMD_LAST_RC == 0 )) || log_error "Command failed: $(print_cmd_quoted "${@:2}") < ${1} (exit $CMD_LAST_RC)" "$CMD_LAST_RC"
     return 0
 }
-
-# -------------------------------------------------------------------------
-# Backward-compatible shims (do not remove until all call sites are migrated)
-# Semantics:
-#   run_cmd        -> non-fatal (never aborts; RC stored in CMD_LAST_RC)
-#   run_cmd_logged -> fatal on non-zero RC
-#   *_in variants  -> same behavior with stdin file
-# -------------------------------------------------------------------------
-run_cmd()             { cmd_try "$@"; }
-run_cmd_logged()      { cmd_must "$@"; }
-run_cmd_in()          { cmd_try_in "$@"; }
-run_cmd_logged_in()   { cmd_must_in "$@"; }
 
 check_cmd() {
     command -v "$1" >/dev/null 2>&1 || log_error "Required command '$1' not found" 1
@@ -1403,8 +1442,8 @@ install_missing_deps() {
 
     case "$PKG" in
         apt)
-            run_cmd_logged env DEBIAN_FRONTEND=noninteractive apt-get update -qq
-            run_cmd_logged env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "${to_install[@]}"
+            cmd_must env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+            cmd_must env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq --no-install-recommends "${to_install[@]}"
             ;;
         yum|dnf)
             # Use flags as an array (no word-splitting issues)
@@ -1415,10 +1454,10 @@ install_missing_deps() {
             if [[ "$PKG" == "dnf" ]]; then
                 extra_flags+=( -4 )
             fi
-            run_cmd_logged "$PKG" install "${extra_flags[@]}" -y "${to_install[@]}"
+            cmd_must "$PKG" install "${extra_flags[@]}" -y "${to_install[@]}"
             ;;
         zypper)
-            run_cmd_logged "$PKG" install -n "${to_install[@]}"
+            cmd_must "$PKG" install -n "${to_install[@]}"
             ;;
         *)
             log_error "Unsupported package manager: $PKG" 101
@@ -1855,7 +1894,7 @@ if [[ ${#MATCHING_LINES[@]} -gt 0 ]]; then
     [[ -n "$CLOUD_ALIASES" ]] && CANONICAL_LINE+=" ${CLOUD_ALIASES}"
 
     # Remove any previous entries for this IP (avoid duplicates/drift)
-    run_cmd_logged sed -i "/^[[:space:]]*${PRIMARY_IP_RE}[[:space:]]\{1,\}/d" "$HOSTS_FILE"
+    cmd_must sed -i "/^[[:space:]]*${PRIMARY_IP_RE}[[:space:]]\{1,\}/d" "$HOSTS_FILE"
 
     # Append canonical entry (spaces only, no TAB)
     append_line "$HOSTS_FILE" "$CANONICAL_LINE"
@@ -1872,11 +1911,11 @@ fi
 # -------------------------------------------------------------------------
 if grep -qE '^[[:space:]]*127\.0\.1\.1[[:space:]]+' "$HOSTS_FILE"; then
     log_info "⚙️ Removing obsolete 127.0.1.1 hostname entries (Ubuntu/Debian compatibility fix)"
-    run_cmd_logged sed -i '/^[[:space:]]*127\.0\.1\.1[[:space:]]\{1,\}/d' "$HOSTS_FILE"
+    cmd_must sed -i '/^[[:space:]]*127\.0\.1\.1[[:space:]]\{1,\}/d' "$HOSTS_FILE"
 fi
 
 # Adjust default permissions
-run_cmd_logged chmod 644 "$HOSTS_FILE"
+cmd_must chmod 644 "$HOSTS_FILE"
 
 # Final validation
 if $DRY_RUN; then
@@ -1890,7 +1929,7 @@ fi
 # Ensure that the runtime hostname resolves correctly (hostname -f)
 CURRENT_FQDN=$(hostname -f 2>/dev/null || echo "")
 if [[ "$CURRENT_FQDN" != "$HOST_FQDN" ]]; then
-    run_cmd hostnamectl set-hostname "$HOST_SHORT" 2>/dev/null || run_cmd hostname "$HOST_SHORT"
+    cmd_try hostnamectl set-hostname "$HOST_SHORT" 2>/dev/null || cmd_try hostname "$HOST_SHORT"
     log_info "⚙️ Adjusted runtime hostname for FQDN resolution"
 fi
 
@@ -1973,6 +2012,12 @@ cleanup_secrets() {
             rm -f "$PASS_FILE"
         fi
     fi
+
+    # Release mkdir-based lock (if flock is unavailable).
+    if [[ "${LOCK_MODE:-}" == "mkdir" && -n "${LOCK_DIR_FALLBACK:-}" ]]; then
+        rm -rf "${LOCK_DIR_FALLBACK}" 2>/dev/null || true
+    fi
+
     unset PASS_FILE
 
     # Just in case someone reintroduced it
@@ -2046,7 +2091,7 @@ DOMAIN_DN=$(awk -F'.' '{
 
 BASE_DN="$DOMAIN_DN"
 
-if [[ "$OU" != *"DC="* ]]; then
+if [[ ! "$OU" =~ [Dd][Cc]= ]]; then
     log_info "⚠ OU missing DC= - using default Computers container"
     OU="CN=Computers,${DOMAIN_DN}"
 fi
@@ -2123,7 +2168,7 @@ if [[ -n "$REALM_JOINED" ]]; then
             REALM_LEAVE_CMD=( realm leave --unattended )
         fi
 
-        run_cmd "${REALM_LEAVE_CMD[@]}"
+        cmd_try "${REALM_LEAVE_CMD[@]}"
         REALMLEAVE_RC=$CMD_LAST_RC
 	
         if [ -z "${REALMLEAVE_RC+x}" ]; then
@@ -2140,7 +2185,7 @@ if [[ -n "$REALM_JOINED" ]]; then
     fi
 
     # Always perform residual cleanup
-    run_cmd rm -f /etc/krb5.keytab /etc/sssd/sssd.conf /etc/realmd.conf
+    cmd_try rm -f /etc/krb5.keytab /etc/sssd/sssd.conf /etc/realmd.conf
     log_info "🧹 Residual realm configuration cleaned."
 
 else
@@ -2215,7 +2260,7 @@ EOF
 fi
 
 # Apply standard permissions
-run_cmd_logged chmod 644 "$KRB_CONF"
+cmd_must chmod 644 "$KRB_CONF"
 log_info "✅ /etc/krb5.conf regenerated for realm $REALM_UPPER"
 
 # -------------------------------------------------------------------------
@@ -2225,21 +2270,21 @@ log_info "🔑 Configuring PAM for SSSD login and mkhomedir"
 
 case $OS_FAMILY in
 	debian)
-		run_cmd_logged pam-auth-update --enable sss mkhomedir --force
+		cmd_must pam-auth-update --enable sss mkhomedir --force
 	;;
 	rhel)
 		RHEL_MAJOR="$(get_major_version_id)"
 		if (( RHEL_MAJOR < 8 )); then
 			# RHEL/CentOS/OL 6–7 -> authconfig
-            run_cmd_logged env LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --updateall
+            cmd_must env LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --updateall
 		else
 			# RHEL/OL 8+ -> authselect
-			run_cmd_logged authselect select sssd with-mkhomedir --force
-			run_cmd_logged systemctl enable --now oddjobd
+			cmd_must authselect select sssd with-mkhomedir --force
+			cmd_must systemctl enable --now oddjobd
 		fi
 	;;
 	suse)
-		run_cmd_logged pam-config -a --sss --mkhomedir
+		cmd_must pam-config -a --sss --mkhomedir
 	;;
 	*)
 		log_info "⚠ Unsupported OS_FAMILY for PAM automation: $OS_FAMILY"
@@ -2260,7 +2305,7 @@ if [[ "$OS_FAMILY" =~ ^(rhel)$ ]]; then
     ODDJOB_SERVICE="oddjobd.service"
     ODDJOB_CHANGED=0
 
-    run_cmd mkdir -p "$(dirname "$DBUS_SVC")" "$(dirname "$ODDJOB_XML")"
+    cmd_try mkdir -p "$(dirname "$DBUS_SVC")" "$(dirname "$ODDJOB_XML")"
 
     # Create or repair the D-Bus service activation file
     if [[ ! -f "$DBUS_SVC" ]]; then
@@ -2304,15 +2349,15 @@ EOF
         fi
 
         log_info "🔄 Updating system management daemons (systemd and D-Bus)"
-        run_cmd systemctl daemon-reexec || true
-        run_cmd systemctl daemon-reload || true
+        cmd_try systemctl daemon-reexec || true
+        cmd_try systemctl daemon-reload || true
 
         # Attempt to notify D-Bus to reload configuration
         if systemctl is-active --quiet dbus.service 2>/dev/null || systemctl is-active --quiet messagebus.service 2>/dev/null; then
             if command -v busctl >/dev/null 2>&1; then
-                busctl call org.freedesktop.DBus / org.freedesktop.DBus ReloadConfig 2>/dev/null || true
+                cmd_try busctl call org.freedesktop.DBus / org.freedesktop.DBus ReloadConfig 2>/dev/null || true
             else
-                dbus-send --system --type=method_call --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 || true
+                cmd_try dbus-send --system --type=method_call --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 || true
             fi
             log_info "✅ D-Bus configuration reloaded successfully"
         else
@@ -2323,7 +2368,7 @@ EOF
     # Ensure oddjobd service is enabled and active (RHEL/OL 6–9)
     if ! systemctl is-enabled --quiet "$ODDJOB_SERVICE" 2>/dev/null; then
         log_info "🔧 Enabling $ODDJOB_SERVICE"
-        run_cmd systemctl enable "$ODDJOB_SERVICE" || true
+        cmd_try systemctl enable "$ODDJOB_SERVICE" || true
     fi
 
     # Retry start sequence for legacy systemd versions (slow registration)
@@ -2336,7 +2381,7 @@ EOF
         fi
         current_try=$((retry_count + 1))
         log_info "🔁 Starting $ODDJOB_SERVICE (attempt ${current_try}/${max_retries})"
-        run_cmd systemctl start  "$ODDJOB_SERVICE" || true
+        cmd_try systemctl start  "$ODDJOB_SERVICE" || true
         sleep 2
         retry_count=$((retry_count + 1))
     done
@@ -2409,9 +2454,9 @@ for file in "${PAM_FILES[@]}"; do
 
 	# Disable legacy PAM modules (safe-comment)
 	if grep -Eq 'pam_(ldap|winbind|nis)\.so' "$file"; then
-        run_cmd_logged sed -i '/pam_ldap\.so/s/^/# disabled legacy -> /' "$file"
-        run_cmd_logged sed -i '/pam_winbind\.so/s/^/# disabled legacy -> /' "$file"
-        run_cmd_logged sed -i '/pam_nis\.so/s/^/# disabled legacy -> /' "$file"
+        cmd_must sed -i '/pam_ldap\.so/s/^/# disabled legacy -> /' "$file"
+        cmd_must sed -i '/pam_winbind\.so/s/^/# disabled legacy -> /' "$file"
+        cmd_must sed -i '/pam_nis\.so/s/^/# disabled legacy -> /' "$file"
 	fi
 
 	# Guarantee pam_sss.so presence per section (DRY-RUN aware)
@@ -2439,7 +2484,7 @@ done
 # Re-run consistency for RHEL-like systems
 if [[ "$OS_FAMILY" =~ ^(rhel)$ ]]; then
 	if command -v authconfig >/dev/null 2>&1; then
-		run_cmd_logged env LANG=C LC_ALL=C authconfig --update
+		cmd_must env LANG=C LC_ALL=C authconfig --update
 	fi
 fi
 
@@ -2546,7 +2591,7 @@ if $DRY_RUN; then
 elif $VALIDATE_ONLY; then
     log_info "[VALIDATE-ONLY] Skipping CRLF normalization in $NSS_FILE"
 else
-    run_cmd_logged sed -i 's/\r$//' "$NSS_FILE"
+    cmd_must sed -i 's/\r$//' "$NSS_FILE"
 fi
 
 # Backup prior to modifications
@@ -2637,7 +2682,7 @@ else
     if [[ "$NSS_EDIT" != "$NSS_FILE" ]]; then
         backup_file "$NSS_FILE"
     fi
-    command -v restorecon >/dev/null 2>&1 && run_cmd restorecon -F "$NSS_FILE" || true
+    command -v restorecon >/dev/null 2>&1 && cmd_try restorecon -F "$NSS_FILE" || true
 fi
 
 # Optional runtime sanity checks (non-blocking)
@@ -2652,7 +2697,7 @@ if $DRY_RUN; then
 else
     # If legacy nslcd is present, stop it to avoid conflicts with SSSD
     if command -v systemctl &>/dev/null; then
-        systemctl list-units --type=service 2>/dev/null | grep -q '^nslcd\.service' && run_cmd systemctl stop nslcd || true
+        systemctl list-units --type=service 2>/dev/null | grep -q '^nslcd\.service' && cmd_try systemctl stop nslcd || true
     fi
 
     # Restart order: SSSD first (reads nsswitch/sssd.conf), then NSCD to clear caches
@@ -2660,12 +2705,12 @@ else
         # 1. SSSD
         if systemctl list-unit-files 2>/dev/null | grep -q '^sssd' || systemctl is-active sssd &>/dev/null; then
             log_info "🔄 Restarting SSSD"
-            run_cmd systemctl restart sssd || true
+            cmd_try systemctl restart sssd || true
         fi
         # 2. NSCD
         if systemctl list-unit-files 2>/dev/null | grep -q '^nscd' || systemctl is-active nscd &>/dev/null; then
             log_info "🔄 Restarting NSCD"
-            run_cmd systemctl restart nscd || true
+            cmd_try systemctl restart nscd || true
         fi
     else
         # Non-systemd fallback
@@ -2698,7 +2743,7 @@ if [[ "$OS_FAMILY" == "rhel" ]]; then
 
 		# Detect presence of pam_ldap.so
 		if grep -q "pam_ldap.so" "$pamfile"; then
-			run_cmd_logged sed -i \
+			cmd_must sed -i \
             -e 's/^[[:space:]]*auth.*pam_ldap\.so/# &/' \
             -e 's/^[[:space:]]*account.*pam_ldap\.so/# &/' \
             -e 's/^[[:space:]]*password.*pam_ldap\.so/# &/' \
@@ -2750,7 +2795,7 @@ else
 fi
 
 # Ensure parent dirs exist (legacy safe)
-run_cmd mkdir -p "$(dirname "$chrony_conf")" || true
+cmd_try mkdir -p "$(dirname "$chrony_conf")" || true
 
 # Backup if exists
 if [[ -f "$chrony_conf" ]]; then
@@ -2805,7 +2850,7 @@ fi
 
 if [[ -n "$chrony_dropin_dir" ]]; then
     use_dropin=true
-    run_cmd mkdir -p "$chrony_dropin_dir" || true
+    cmd_try mkdir -p "$chrony_dropin_dir" || true
     chrony_dropin_file="${chrony_dropin_dir}/99-linux-ad-domain-join.conf"
 fi
 
@@ -2825,8 +2870,8 @@ elif [[ -d /var/lib/chrony-drift ]]; then
     chrony_drift_dir="/var/lib/chrony-drift"
     chrony_drift_file="/var/lib/chrony-drift/drift"
 fi
-run_cmd mkdir -p "$chrony_drift_dir" || true
-run_cmd mkdir -p /var/log/chrony 2>/dev/null || true
+cmd_try mkdir -p "$chrony_drift_dir" || true
+cmd_try mkdir -p /var/log/chrony 2>/dev/null || true
 
 chrony_payload="$(cat <<EOF
 # ======================================================================
@@ -2937,8 +2982,8 @@ if command -v systemctl >/dev/null 2>&1; then
     if systemctl list-unit-files 2>/dev/null | grep -q '^systemd-timesyncd\.service'; then
         if systemctl is-active --quiet systemd-timesyncd 2>/dev/null; then
             log_info "🛑 Stopping systemd-timesyncd (conflicts with chrony)"
-            run_cmd systemctl stop systemd-timesyncd || true
-            run_cmd systemctl disable systemd-timesyncd || true
+            cmd_try systemctl stop systemd-timesyncd || true
+            cmd_try systemctl disable systemd-timesyncd || true
         fi
     fi
 fi
@@ -2949,8 +2994,8 @@ if command -v systemctl >/dev/null 2>&1; then
         if systemctl list-unit-files 2>/dev/null | awk '{print $1}' | grep -qx "$u"; then
             if systemctl is-active --quiet "${u%.service}" 2>/dev/null; then
                 log_info "🛑 Stopping ${u%.service} (conflicts with chrony)"
-                run_cmd systemctl stop "${u%.service}" || true
-                run_cmd systemctl disable "${u%.service}" || true
+                cmd_try systemctl stop "${u%.service}" || true
+                cmd_try systemctl disable "${u%.service}" || true
             fi
         fi
     done
@@ -2969,16 +3014,16 @@ if $VALIDATE_ONLY; then
     log_info "[VALIDATE-ONLY] Suppressing service enable/restart for chrony"
 else
     if command -v systemctl >/dev/null 2>&1; then
-        run_cmd systemctl enable "$chrony_service" || true
-        run_cmd systemctl restart "$chrony_service" || run_cmd systemctl start "$chrony_service" || true
+        cmd_try systemctl enable "$chrony_service" || true
+        cmd_try systemctl restart "$chrony_service" || cmd_try systemctl start "$chrony_service" || true
     elif command -v chkconfig >/dev/null 2>&1; then
-        run_cmd chkconfig "$chrony_service" on || true
-        run_cmd service "$chrony_service" restart || run_cmd service "$chrony_service" start || true
+        cmd_try chkconfig "$chrony_service" on || true
+        cmd_try service "$chrony_service" restart || cmd_try service "$chrony_service" start || true
     elif command -v update-rc.d >/dev/null 2>&1; then
-        run_cmd update-rc.d "$chrony_service" defaults || true
-        run_cmd service "$chrony_service" restart || run_cmd service "$chrony_service" start || true
+        cmd_try update-rc.d "$chrony_service" defaults || true
+        cmd_try service "$chrony_service" restart || cmd_try service "$chrony_service" start || true
     elif command -v service >/dev/null 2>&1; then
-        run_cmd service "$chrony_service" restart || run_cmd service "$chrony_service" start || true
+        cmd_try service "$chrony_service" restart || cmd_try service "$chrony_service" start || true
     else
         log_info "⚠️ No service manager found to restart chrony; skipping restart"
     fi
@@ -3007,7 +3052,7 @@ if $VALIDATE_ONLY; then
 else
     if $has_waitsync; then
         # Best-effort: if waitsync fails, we fall back to manual polling.
-        run_cmd timeout 45 chronyc -a waitsync 45 0.5 >/dev/null 2>&1 || true
+        cmd_try timeout 45 chronyc -a waitsync 45 0.5 >/dev/null 2>&1 || true
     fi
 
     # Manual polling (works everywhere)
@@ -3512,8 +3557,8 @@ dyndns_update_ptr = True
 EOF
 
 # Ownership is enforced by write_file (install -o/-g), but keep a safety check
-run_cmd chown root:root "$SSSD_CONF" || true
-run_cmd chmod 600 "$SSSD_CONF" || true
+cmd_try chown root:root "$SSSD_CONF" || true
+cmd_try chmod 600 "$SSSD_CONF" || true
 
 # -------------------------------------------------------------------------
 # Optional: flush old caches before restart
@@ -3580,8 +3625,8 @@ if [[ -f "$PAM_SU_FILE" ]]; then
             log_info "[DRY-RUN] Would update $PAM_SU_FILE to include pam_sss.so (non-destructive)"
             rm -f "$tmp_su"
         else
-            run_cmd_logged mv -f "$tmp_su" "$PAM_SU_FILE"
-            run_cmd_logged chmod 644 "$PAM_SU_FILE"
+            cmd_must mv -f "$tmp_su" "$PAM_SU_FILE"
+            cmd_must chmod 644 "$PAM_SU_FILE"
         fi
         log_info "✅ pam_sss binding injected into $PAM_SU_FILE (original preserved in ${su_backup:-unknown})"
     fi
@@ -3626,15 +3671,15 @@ EOF
         ;;
     esac
 
-    run_cmd_logged chmod 644 "$PAM_SU_FILE"
+    cmd_must chmod 644 "$PAM_SU_FILE"
     log_info "✅ PAM su file created with SSSD integration for OS family '$OS_FAMILY'"
 fi
 
 log_info "🔧 Enabling SSSD"
-run_cmd_logged systemctl enable sssd
+cmd_must systemctl enable sssd
 
 log_info "🔄 Restarting SSSD"
-run_cmd_logged systemctl restart sssd
+cmd_must systemctl restart sssd
 
 # -------------------------------------------------------------------------
 # Restarts systemd-logind to refresh PAM and D-Bus session handling
@@ -3651,12 +3696,12 @@ if command -v systemctl &>/dev/null; then
         
         log_info "✅ Systemd detected. Attempting restart of ${LOGIND_UNIT} to refresh PAM/D-Bus"
 
-        run_cmd systemctl restart "$LOGIND_UNIT"
+        cmd_try systemctl restart "$LOGIND_UNIT"
         if (( CMD_LAST_RC == 0 )); then
             log_info "🚀 ${LOGIND_UNIT} restarted successfully."
         else
             log_info "⚠️ Failed to restart ${LOGIND_UNIT}. Attempting safe reload instead."
-            run_cmd systemctl reload "$LOGIND_UNIT" >/dev/null 2>&1
+            cmd_try systemctl reload "$LOGIND_UNIT" >/dev/null 2>&1
             if (( CMD_LAST_RC == 0 )); then
                 log_info "🚀 ${LOGIND_UNIT} reloaded successfully."
             else
@@ -3755,7 +3800,7 @@ validate_sshd_config_or_die "$SSH_CFG"
 # Restart SSH safely (service name differs by distro)
 ssh_unit="$(detect_service_unit "ssh.service" "sshd.service")"
 if [[ -n "$ssh_unit" ]]; then
-    run_cmd systemctl restart "$ssh_unit" || true
+    cmd_try systemctl restart "$ssh_unit" || true
 else
     log_info "⚠️ SSH service unit not found (ssh/sshd). Skipping restart."
 fi
@@ -3770,7 +3815,7 @@ BLOCK_FILE="${SUDOERS_DIR}/00-block-root-shell"
 
 # Ensure target directory exists
 log_info "🛡️ Configuring sudoers directory: $SUDOERS_DIR"
-run_cmd mkdir -p "$SUDOERS_DIR"
+cmd_try mkdir -p "$SUDOERS_DIR"
 
 # -------------------------------------------------------------------------
 # Create ROOT_SHELLS command alias (centralized restriction control)
@@ -3834,7 +3879,7 @@ EOF
 if $DRY_RUN; then
     log_info "[DRY-RUN] Would validate sudoers syntax: visudo -cf $BLOCK_FILE"
 else
-    run_cmd_logged visudo -cf "$BLOCK_FILE"
+    cmd_must visudo -cf "$BLOCK_FILE"
 fi
 
 log_info "🔒 ROOT_SHELLS alias applied"
@@ -4112,8 +4157,13 @@ if [[ $VISUDO_RC -eq 0 ]]; then
     fi
     
     # Commit the changes
-    mv -f "$tmp_sudo" "$SUDOERS_MAIN"
-    chmod 440 "$SUDOERS_MAIN"
+    if $DRY_RUN; then
+        log_info "[DRY-RUN] Would replace $SUDOERS_MAIN with validated sudoers content"
+        rm -f "$tmp_sudo"
+    else
+        cmd_must mv -f "$tmp_sudo" "$SUDOERS_MAIN"
+        cmd_must chmod 440 "$SUDOERS_MAIN"
+    fi
     log_info "✅ Sudoers includes normalized successfully"
 else
     # FAILURE: Syntax Error Detected
@@ -4130,7 +4180,11 @@ else
     # Decision to continue based on mode
     if $NONINTERACTIVE; then
         # NON-INTERACTIVE MODE: Must rollback and abort
-        cp -p -- "$SUDO_BAK" "$SUDOERS_MAIN"
+        if $DRY_RUN; then
+            log_info "[DRY-RUN] Would restore sudoers backup: $SUDO_BAK -> $SUDOERS_MAIN"
+        else
+            cmd_must cp -p -- "$SUDO_BAK" "$SUDOERS_MAIN"
+        fi
         log_info "💾 Restored backup: $SUDO_BAK"
         log_error "visudo syntax check failed during normalization (restored $SUDO_BAK)" 1
     else
@@ -4141,7 +4195,11 @@ else
             log_info "ℹ️ Ignoring visudo error (manual correction required). Proceeding with original $SUDOERS_MAIN."
         else
             # User chooses to abort: Must rollback and abort
-            cp -p -- "$SUDO_BAK" "$SUDOERS_MAIN"
+            if $DRY_RUN; then
+                log_info "[DRY-RUN] Would restore sudoers backup: $SUDO_BAK -> $SUDOERS_MAIN"
+            else
+                cmd_must cp -p -- "$SUDO_BAK" "$SUDOERS_MAIN"
+            fi
             log_info "💾 Restored backup: $SUDO_BAK"
             log_error "visudo syntax check failed during normalization (abort requested)" 1
         fi
@@ -4275,8 +4333,8 @@ else
             log_info "[DRY-RUN] Would replace $f with patched version (validated)"
             rm -f "$tmp"
         else
-            run_cmd_logged mv -f "$tmp" "$f"
-            run_cmd_logged chmod 440 "$f"
+            cmd_must mv -f "$tmp" "$f"
+            cmd_must chmod 440 "$f"
         fi
 
 		# Standardized log output format
