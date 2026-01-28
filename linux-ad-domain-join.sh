@@ -1990,8 +1990,8 @@ create_secret_passfile() {
 
     # Store password as a single line (no trailing newline).
     # OpenLDAP -y reads the entire file as password; newline/CR would be treated as part of the secret.
-    if [[ "${DOMAIN_PASS:-}" == *$'\n'* || "${DOMAIN_PASS:-}" == *$'\r'* || "${DOMAIN_PASS:-}" == *$'\0'* ]]; then
-        log_error "DOMAIN_PASS contains invalid characters (newline/CR/NULL); refusing for security." 1
+    if [[ "${DOMAIN_PASS:-}" == *$'\n'* || "${DOMAIN_PASS:-}" == *$'\r'* ]]; then
+        log_error "DOMAIN_PASS contains newline/CR characters; refusing because ldapsearch -y would treat them as part of the password." 1
     fi
 
     printf '%s' "$DOMAIN_PASS" > "$PASS_FILE" || log_error "Failed to write PASS_FILE" 1
