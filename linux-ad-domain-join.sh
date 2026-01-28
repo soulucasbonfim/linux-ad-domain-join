@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.8.2
+# Version:     2.8.3
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -4261,7 +4261,10 @@ else
 	# Patch sudo rules to enforce !ROOT_SHELLS restriction
 	# -------------------------------------------------------------------------
     log_info "📌 Sudo groups detected (${#TARGET_GROUPS[@]} total):"
-    printf '   • %s\n' "${TARGET_GROUPS[@]}"
+    for grp in "${TARGET_GROUPS[@]}"; do
+        log_info "   • $grp"
+    done
+
 	log_info "⚙️ Updating rules"
 
 	for f in "${FILES[@]}"; do
