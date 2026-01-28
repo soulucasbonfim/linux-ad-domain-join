@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.7.1
+# Version:     2.7.2
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -458,7 +458,7 @@ disable_tmout_in_profile_d() {
         backup_file "$f" bk
 
         if $DRY_RUN; then
-            log_info "[DRY-RUN] Would disable TMOUT lines in $f (backup: $bk)"
+            log_info "[DRY-RUN] Would disable TMOUT lines in $f"
             continue
         fi
 
@@ -470,7 +470,7 @@ disable_tmout_in_profile_d() {
             -e '/^[[:space:]]*readonly[[:space:]]+TMOUT\b/{s/^/# disabled-by-linux-ad-domain-join: /;}' \
             "$f"
 
-        log_info "🧹 Disabled existing TMOUT lines in $f (backup: $bk)"
+        log_info "🧹 Disabled existing TMOUT lines in $f"
     done
 
     shopt -u nullglob
