@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.8.4
+# Version:     2.8.5
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -1428,7 +1428,7 @@ for line in "${CONNECT_DETAILS[@]}"; do
     # Sanitize first, then colorize
     line_sanitized="$(sanitize_log_msg <<< "$line")"
     line_colored="$(colorize_tag "$line_sanitized")"
-    echo "   ${line_colored}"
+    log_info "   ${line_colored}"
 done
 
 # -------------------------------------------------------------------------
@@ -2700,7 +2700,7 @@ for key in passwd shadow group services netgroup; do
     [ -f "$NSS_EDIT" ] || : >"$NSS_EDIT"
 
     # 2. Normalize whitespace early (work file)
-    sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
+    cmd_must sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
 
     # 3. Remove duplicate entries (preserve first non-commented)
     if grep -Eq "${pattern}" "$NSS_EDIT"; then
@@ -2725,11 +2725,11 @@ for key in passwd shadow group services netgroup; do
     if grep -qE "${pattern}[^#]*" "$NSS_EDIT"; then
         log_info "🧩 Updating existing '${key}' entry to include sss"
         # shellcheck disable=SC2086  # SED_EXT must expand to -E/-r
-        sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_EDIT"
-        sed -i \
+        cmd_must sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_EDIT"
+        cmd_must sed -i \
             -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
             -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_EDIT"
-        sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_EDIT"
+        cmd_must sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_EDIT"
         log_info "✅ '${key}' updated"
     else
         printf '%s\n' "${key}: files sss" >>"$NSS_EDIT"
