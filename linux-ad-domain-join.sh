@@ -1692,6 +1692,17 @@ if $NONINTERACTIVE; then
     : "${SESSION_TIMEOUT_SECONDS:?SESSION_TIMEOUT_SECONDS required (seconds)}"
     : "${PERMIT_ROOT_LOGIN:?PERMIT_ROOT_LOGIN required (yes|no)}"
 
+    # Administrative groups (optional with smart defaults)
+    HOST_L=$(to_lower "$(hostname -s)")
+    ADM="${ADM_GROUP:-grp-adm-$HOST_L}"
+    ADM_ALL="${ADM_GROUP_ALL:-grp-adm-all-linux-servers}"
+    SSH="${SSH_GROUP:-grp-ssh-$HOST_L}"
+    SSH_ALL="${SSH_GROUP_ALL:-grp-ssh-all-linux-servers}"
+    SEC="${SEC_GROUP:-grp-sec-$HOST_L}"
+    SEC_ALL="${SEC_GROUP_ALL:-grp-sec-all-linux-servers}"
+    SUPER="${SUPER_GROUP:-grp-super-$HOST_L}"
+    SUPER_ALL="${SUPER_GROUP_ALL:-grp-super-all-linux-servers}"
+
     # Normalize and validate inputs
     validate_allowgroups_tokens "$GLOBAL_ADMIN_GROUPS"
     require_uint_range "SESSION_TIMEOUT_SECONDS" "$SESSION_TIMEOUT_SECONDS" 30 86400
@@ -1701,6 +1712,25 @@ if $NONINTERACTIVE; then
     PASSWORD_AUTHENTICATION="${PASSWORD_AUTHENTICATION:-yes}"
     PASSWORD_AUTHENTICATION="$(normalize_yes_no "${PASSWORD_AUTHENTICATION:-yes}")"
     [[ -n "$PASSWORD_AUTHENTICATION" ]] || log_error "PASSWORD_AUTHENTICATION must be yes or no" 1
+
+    # Validate group names
+    for grp_var in ADM ADM_ALL SSH SSH_ALL SEC SEC_ALL SUPER SUPER_ALL; do
+        grp_val="${!grp_var}"
+        if ! validate_ad_group_name "$grp_val" "$grp_var"; then
+            log_error "Invalid AD group name for $grp_var: $grp_val" 1
+        fi
+    done
+
+    # Log configured groups (non-interactive mode)
+    log_info "📋 Administrative groups configured:"
+    log_info "   ADM (operational):     $ADM"
+    log_info "   ADM_ALL (global):      $ADM_ALL"
+    log_info "   SSH (access):          $SSH"
+    log_info "   SSH_ALL (global):      $SSH_ALL"
+    log_info "   SEC (security):        $SEC"
+    log_info "   SEC_ALL (global):      $SEC_ALL"
+    log_info "   SUPER (full):          $SUPER"
+    log_info "   SUPER_ALL (global):    $SUPER_ALL"
 else
     log_info "🧪 Collecting inputs"
     print_divider
@@ -1802,6 +1832,134 @@ else
         [[ -n "$PASSWORD_AUTHENTICATION" ]] && break
         printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid input. Use yes or no.\n" "$(date '+%F %T')"
     done
+    # -------------------------------------------------------------------------
+    # Administrative Groups Configuration (Interactive)
+    # -------------------------------------------------------------------------
+    log_info "📋 Configuring Administrative Groups"
+    echo ""
+    log_info "ℹ️  AD groups control sudo privileges and SSH access on this host."
+    log_info "ℹ️  Two scopes are supported:"
+    log_info "    • Host-specific groups (e.g., grp-adm-hostname)"
+    log_info "    • Global groups (e.g., grp-adm-all-linux-servers)"
+    echo ""
+
+    HOST_L=$(to_lower "$(hostname -s)")
+
+    # ADM - Operational Administrators (host-specific)
+    while true; do
+        default_ADM="grp-adm-$HOST_L"
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} ADM group (operational, host-specific) ${C_DIM}[default: ${default_ADM}]${C_RESET}: " "$(date '+%F %T')"
+        read -r ADM
+        ADM="${ADM:-$default_ADM}"
+        ADM="$(echo "$ADM" | xargs)"
+        if validate_ad_group_name "$ADM" "ADM"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
+    done
+
+    # ADM_ALL - Operational Administrators (global)
+    while true; do
+        default_ADM_ALL="grp-adm-all-linux-servers"
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} ADM_ALL group (operational, global) ${C_DIM}[default: ${default_ADM_ALL}]${C_RESET}: " "$(date '+%F %T')"
+        read -r ADM_ALL
+        ADM_ALL="${ADM_ALL:-$default_ADM_ALL}"
+        ADM_ALL="$(echo "$ADM_ALL" | xargs)"
+        if validate_ad_group_name "$ADM_ALL" "ADM_ALL"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
+    done
+
+    # SSH - SSH Access (host-specific)
+    while true; do
+        default_SSH="grp-ssh-$HOST_L"
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SSH group (access, host-specific) ${C_DIM}[default: ${default_SSH}]${C_RESET}: " "$(date '+%F %T')"
+        read -r SSH
+        SSH="${SSH:-$default_SSH}"
+        SSH="$(echo "$SSH" | xargs)"
+        if validate_ad_group_name "$SSH" "SSH"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
+    done
+
+    # SSH_ALL - SSH Access (global)
+    while true; do
+        default_SSH_ALL="grp-ssh-all-linux-servers"
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SSH_ALL group (access, global) ${C_DIM}[default: ${default_SSH_ALL}]${C_RESET}: " "$(date '+%F %T')"
+        read -r SSH_ALL
+        SSH_ALL="${SSH_ALL:-$default_SSH_ALL}"
+        SSH_ALL="$(echo "$SSH_ALL" | xargs)"
+        if validate_ad_group_name "$SSH_ALL" "SSH_ALL"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
+    done
+
+    # SEC - Security Administrators (host-specific)
+    while true; do
+        default_SEC="grp-sec-$HOST_L"
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SEC group (security, host-specific) ${C_DIM}[default: ${default_SEC}]${C_RESET}: " "$(date '+%F %T')"
+        read -r SEC
+        SEC="${SEC:-$default_SEC}"
+        SEC="$(echo "$SEC" | xargs)"
+        if validate_ad_group_name "$SEC" "SEC"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
+    done
+
+    # SEC_ALL - Security Administrators (global)
+    while true; do
+        default_SEC_ALL="grp-sec-all-linux-servers"
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SEC_ALL group (security, global) ${C_DIM}[default: ${default_SEC_ALL}]${C_RESET}: " "$(date '+%F %T')"
+        read -r SEC_ALL
+        SEC_ALL="${SEC_ALL:-$default_SEC_ALL}"
+        SEC_ALL="$(echo "$SEC_ALL" | xargs)"
+        if validate_ad_group_name "$SEC_ALL" "SEC_ALL"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
+    done
+
+    # SUPER - Full Administrators (host-specific)
+    while true; do
+        default_SUPER="grp-super-$HOST_L"
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SUPER group (full admin, host-specific) ${C_DIM}[default: ${default_SUPER}]${C_RESET}: " "$(date '+%F %T')"
+        read -r SUPER
+        SUPER="${SUPER:-$default_SUPER}"
+        SUPER="$(echo "$SUPER" | xargs)"
+        if validate_ad_group_name "$SUPER" "SUPER"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
+    done
+
+    # SUPER_ALL - Full Administrators (global)
+    while true; do
+        default_SUPER_ALL="grp-super-all-linux-servers"
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SUPER_ALL group (full admin, global) ${C_DIM}[default: ${default_SUPER_ALL}]${C_RESET}: " "$(date '+%F %T')"
+        read -r SUPER_ALL
+        SUPER_ALL="${SUPER_ALL:-$default_SUPER_ALL}"
+        SUPER_ALL="$(echo "$SUPER_ALL" | xargs)"
+        if validate_ad_group_name "$SUPER_ALL" "SUPER_ALL"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
+    done
+
+    # Summary
+    echo ""
+    log_info "✅ Administrative groups configured:"
+    log_info "   ADM (operational):     $ADM"
+    log_info "   ADM_ALL (global):      $ADM_ALL"
+    log_info "   SSH (access):          $SSH"
+    log_info "   SSH_ALL (global):      $SSH_ALL"
+    log_info "   SEC (security):        $SEC"
+    log_info "   SEC_ALL (global):      $SEC_ALL"
+    log_info "   SUPER (full):          $SUPER"
+    log_info "   SUPER_ALL (global):    $SUPER_ALL"
 fi
 print_divider
 
@@ -3816,19 +3974,6 @@ else
 fi
 
 unset DOMAIN_PASS
-
-# -------------------------------------------------------------------------
-# Declare administration groups
-# -------------------------------------------------------------------------
-HOST_L=$(to_lower "$(hostname -s)")
-ADM="grp-adm-$HOST_L"
-ADM_ALL="grp-adm-all-linux-servers"
-SSH="grp-ssh-$HOST_L"
-SSH_ALL="grp-ssh-all-linux-servers"
-SEC="grp-sec-$HOST_L"
-SEC_ALL="grp-sec-all-linux-servers"
-SUPER="grp-super-$HOST_L"
-SUPER_ALL="grp-super-all-linux-servers"
 
 # -------------------------------------------------------------------------
 # Session timeout hardening (SSH keepalive + shell TMOUT)
