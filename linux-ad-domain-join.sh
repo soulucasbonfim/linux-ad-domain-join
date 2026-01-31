@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.8.5
+# Version:     2.8.6
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -183,7 +183,7 @@ sanitize_log_msg() {
         # Informational / Neutral
         s/ℹ|ℹ️|✔|🧵|🕒|📌|📡|🌐|💡|🧬|🧭|⏰|🧾|🪪|🧠|🪶|🔢|💬|📘|🔋|🧮|🟡/[i]/g;
         # Operational / Progress / Configuration
-        s/🖥️|🖥|🔁|🔧|🛠|📄|🛠️|🧩|🏷|💾|♻|🚚|⚙️|⚙|🏷️|🧹|🔗|🔌|🔄|↪|🛡️|🧱|🗂|🗂️|🧰|🛡|📦|📎|🪄/[>]/g;
+        s/📋|🖥️|🖥|🔁|🔧|🛠|📄|🛠️|🧩|🏷|💾|♻|🚚|⚙️|⚙|🏷️|🧹|🔗|🔌|🔄|↪|🛡️|🧱|🗂|🗂️|🧰|🛡|📦|📎|🪄/[>]/g;
         # Errors / Failures
         s/🛑|🚫|❌|🪫/[x]/g;
         # Success / Completion
@@ -285,6 +285,45 @@ print_divider() {
     printf '%s' "$C_DIM"
     printf '%*s\n' "$cols" '' | tr ' ' '-' >&2
     printf '%s' "$C_RESET"
+}
+
+# -------------------------------------------------------------------------
+# Validate AD group name (sAMAccountName compatible)
+# -------------------------------------------------------------------------
+validate_ad_group_name() {
+    local name="$1"
+    local context="${2:-group}"
+
+    # Empty is valid (will use default)
+    [[ -z "$name" ]] && return 0
+
+    # Check length (sAMAccountName max 256, but practical limit is 64)
+    if [[ ${#name} -gt 64 ]]; then
+        log_info "⚠️ ${context} name too long (max 64 chars): $name"
+        return 1
+    fi
+
+    # Check valid characters (AD sAMAccountName allows: A-Z a-z 0-9 . _ - @ $ #)
+    # We restrict to: A-Z a-z 0-9 . _ - (safer subset)
+    if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+        log_info "⚠️ ${context} contains invalid characters: $name"
+        log_info "   Allowed: letters, digits, dot (.), underscore (_), hyphen (-)"
+        return 1
+    fi
+
+    # Reserved prefixes check (optional warning)
+    if [[ "$name" =~ ^(CN|OU|DC)= ]]; then
+        log_info "⚠️ ${context} starts with LDAP DN prefix: $name"
+        return 1
+    fi
+
+    # Cannot start or end with hyphen or dot (AD restriction)
+    if [[ "$name" =~ ^[-.]|[-.]$ ]]; then
+        log_info "⚠️ ${context} cannot start/end with hyphen or dot: $name"
+        return 1
+    fi
+
+    return 0
 }
 
 # -------------------------------------------------------------------------
