@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.8.7
+# Version:     2.8.8
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -1878,17 +1878,15 @@ else
         [[ -n "$PASSWORD_AUTHENTICATION" ]] && break
         printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid input. Use yes or no.\n" "$(date '+%F %T')"
     done
-    # -------------------------------------------------------------------------
+
     # Administrative Groups Configuration (Interactive)
-    # -------------------------------------------------------------------------
+    print_divider
     log_info "📋 Configuring Administrative Groups"
-    echo ""
     log_info "ℹ️  AD groups control sudo privileges and SSH access on this host."
     log_info "ℹ️  Two scopes are supported:"
     log_info "    • Host-specific groups (e.g., grp-adm-hostname)"
     log_info "    • Global groups (e.g., grp-adm-all-linux-servers)"
-    echo ""
-
+    print_divider
     HOST_L=$(to_lower "$(hostname -s)")
 
     # ADM - Operational Administrators (host-specific)
@@ -1994,18 +1992,6 @@ else
         fi
         printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
     done
-
-    # Summary
-    echo ""
-    log_info "✅ Administrative groups configured:"
-    log_info "   ADM (operational):     $ADM"
-    log_info "   ADM_ALL (global):      $ADM_ALL"
-    log_info "   SSH (access):          $SSH"
-    log_info "   SSH_ALL (global):      $SSH_ALL"
-    log_info "   SEC (security):        $SEC"
-    log_info "   SEC_ALL (global):      $SEC_ALL"
-    log_info "   SUPER (full):          $SUPER"
-    log_info "   SUPER_ALL (global):    $SUPER_ALL"
 fi
 print_divider
 
