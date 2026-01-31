@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.8.8
+# Version:     2.8.9
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -454,6 +454,13 @@ else
 fi
 
 log_info "💾 Log file: $LOG_FILE"
+
+# -------------------------------------------------------------------------
+# Clear screen for clean output (interactive sessions only)
+# -------------------------------------------------------------------------
+if [[ -t 1 ]]; then
+    clear
+fi
 
 # -------------------------------------------------------------------------
 # Backup root (centralized) - one directory per execution
@@ -1401,13 +1408,6 @@ OS_VERSION=${VERSION_ID:-$(uname -r)}
 OS_ARCH=$(uname -m)
 KERNEL_VER=$(uname -r)
 
-# -------------------------------------------------------------------------
-# Clear screen for clean output (interactive sessions only)
-# -------------------------------------------------------------------------
-if [[ -t 1 ]]; then
-    clear
-fi
-
 log_info "🧾 Starting linux-ad-domain-join.sh version $scriptVersion..."
 log_info "🌐 Hostname: $(hostname -f 2>/dev/null || hostname 2>/dev/null || true) | IP: $(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 log_info "🧬 OS detected: $OS_NAME ($ID $OS_VERSION, kernel $KERNEL_VER, arch $OS_ARCH)"
@@ -1886,7 +1886,8 @@ else
     log_info "ℹ️  Two scopes are supported:"
     log_info "    • Host-specific groups (e.g., grp-adm-hostname)"
     log_info "    • Global groups (e.g., grp-adm-all-linux-servers)"
-    print_divider
+    echo ""
+
     HOST_L=$(to_lower "$(hostname -s)")
 
     # ADM - Operational Administrators (host-specific)
