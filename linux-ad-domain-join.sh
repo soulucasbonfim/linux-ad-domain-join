@@ -859,7 +859,6 @@ validate_sshd_config_or_die() {
     fi
 
     local sshd_bin=""
-    # Check multiple possible locations for sshd binary
     if command -v sshd >/dev/null 2>&1; then
         sshd_bin="$(command -v sshd)"
     elif [[ -x /usr/sbin/sshd ]]; then
@@ -870,11 +869,27 @@ validate_sshd_config_or_die() {
 
     [[ -z "$sshd_bin" ]] && log_error "sshd binary not found; cannot validate $file safely" 1
 
-    # Validate sshd config; on failure, restore backup and exit
-    if ! "$sshd_bin" -t -f "$file" 2>&1; then
-        log_error "sshd config validation failed for: $file"
+    # Capture stderr/stdout from sshd -t for debugging without tripping `set -e`
+    local had_errexit=false
+    [[ $- == *e* ]] && had_errexit=true
 
-        # Find and restore latest backup
+    local sshd_check_output=""
+    local sshd_rc=0
+
+    set +e
+    sshd_check_output="$("$sshd_bin" -t -f "$file" 2>&1)"
+    sshd_rc=$?
+    $had_errexit && set -e
+
+    if (( sshd_rc != 0 )); then
+        log_info "❌ sshd config validation failed for: $file"
+        if [[ -n "$sshd_check_output" ]]; then
+            while IFS= read -r _sshd_line; do
+                [[ -n "$_sshd_line" ]] && log_info "   sshd -t: $_sshd_line"
+            done <<< "$sshd_check_output"
+        fi
+
+        # Restore latest backup and refuse to proceed
         local rel="${file#/}"
         local backup_path="${BACKUP_DIR}/${rel}"
 
@@ -1233,9 +1248,14 @@ cmd_try() {
 }
 
 cmd_must() {
-    # Usage: cmd_must <cmd> [args...]
-    cmd_try "$@"
-    (( CMD_LAST_RC == 0 )) || log_error "Command failed: $(print_cmd_quoted "$@") (exit $CMD_LAST_RC)" "$CMD_LAST_RC"
+    # Must not leak non-zero from cmd_try under `set -e`, otherwise ERR trap fires
+    # before we can emit a descriptive message.
+    cmd_try "$@" || true
+
+    local rc="$CMD_LAST_RC"
+    if (( rc != 0 )); then
+        log_error "Command failed (rc=$rc): $(print_cmd_quoted "$@")" 1
+    fi
     return 0
 }
 
@@ -1702,14 +1722,16 @@ get_major_version_id() {
 # -------------------------------------------------------------------------
 load_os_release
 case "$ID" in
-    ubuntu|debian) OS_FAMILY=debian; PKG=apt; SSH_G=sudo ;;
-    rhel|rocky|almalinux|centos) OS_FAMILY=rhel; ver="$(get_major_version_id)"; PKG=$([[ "$ver" -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
-    oracle|ol) OS_FAMILY=rhel; ver="$(get_major_version_id)"; [[ "$ver" -eq 0 ]] && ver="$(grep -Eo '[0-9]+' /etc/oracle-release 2>/dev/null | head -n1 || echo 0)"; PKG=$([[ "$ver" -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
+    ubuntu|debian) OS_FAMILY=debian; PKG=apt; SSH_G=sudo; [[ "$ID" == "ubuntu" ]] && UBUNTU_MAJOR="$(get_major_version_id)" ;;
+    rhel|rocky|almalinux|centos) OS_FAMILY=rhel; ver="$(get_major_version_id)"; RHEL_MAJOR="$ver"; PKG=$([[ "$ver" -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
+    oracle|ol) OS_FAMILY=rhel; ver="$(get_major_version_id)"; RHEL_MAJOR="$ver"; [[ "$ver" -eq 0 ]] && ver="$(grep -Eo '[0-9]+' /etc/oracle-release 2>/dev/null | head -n1 || echo 0)"; PKG=$([[ "$ver" -lt 8 ]] && echo yum || echo dnf); SSH_G=wheel ;;
     sles|suse|opensuse-leap|opensuse|opensuse-tumbleweed) OS_FAMILY=suse; PKG=zypper; SSH_G=wheel ;;
     fedora) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
     amzn) OS_FAMILY=rhel; PKG=dnf; SSH_G=wheel ;;
     *) log_error "Unsupported distro: $ID. You may need to extend the detection logic." ;;
 esac
+: "${UBUNTU_MAJOR:=0}"
+: "${RHEL_MAJOR:=0}"
 OS_NAME=${PRETTY_NAME:-$ID}
 OS_VERSION=${VERSION_ID:-$(uname -r)}
 OS_ARCH=$(uname -m)
@@ -1898,7 +1920,6 @@ case "$OS_FAMILY" in
 		tools+=( pam-auth-update )
 		;;
     rhel)
-		RHEL_MAJOR="$(get_major_version_id)"
 		if (( RHEL_MAJOR < 8 )); then
 			tools+=( authconfig )
 		else
@@ -1939,7 +1960,6 @@ case "$OS_FAMILY" in
 		fi
 		;;
 	rhel)
-		RHEL_MAJOR="$(get_major_version_id)"
 		pkgs=( realmd sssd sssd-tools adcli oddjob oddjob-mkhomedir \
 			   krb5-workstation chrony openldap-clients nmap-ncat bind-utils iproute procps-ng )
 		if (( RHEL_MAJOR < 8 )); then
@@ -2019,7 +2039,6 @@ case "$OS_FAMILY" in
 		check_cmd pam-auth-update
 		;;
 	rhel)
-		RHEL_MAJOR="$(get_major_version_id)"
 		if (( RHEL_MAJOR < 8 )); then
 			check_cmd authconfig
 		else
@@ -2591,8 +2610,7 @@ fi
 # systemd-resolved symlink fix (Ubuntu 20.04+)
 # -------------------------------------------------------------------------
 if [[ "$ID" == "ubuntu" ]]; then
-    _ubuntu_major="$(get_major_version_id)"
-    if (( _ubuntu_major >= 20 )); then
+    if (( UBUNTU_MAJOR >= 20 )); then
         RESOLV_CONF="/etc/resolv.conf"
         STUB_TARGET="/run/systemd/resolve/stub-resolv.conf"
         FULL_TARGET="/run/systemd/resolve/resolv.conf"
@@ -3225,7 +3243,6 @@ case $OS_FAMILY in
 		cmd_must pam-auth-update --enable sss mkhomedir --force
 	;;
 	rhel)
-		RHEL_MAJOR="$(get_major_version_id)"
 		if (( RHEL_MAJOR < 8 )); then
 			# RHEL/CentOS/OL 6–7 -> authconfig
             cmd_must env LANG=C LC_ALL=C authconfig --enablesssd --enablesssdauth --enablemkhomedir --updateall
@@ -3342,26 +3359,44 @@ EOF
     if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
         log_info "✅ oddjob mkhomedir D-Bus service operational"
     else
-        log_info "⚠️ D-Bus Hello denied or unavailable - attempting full D-Bus restart"
+        log_info "⚠️ D-Bus Hello denied or unavailable - attempting remediation"
         DBUS_SERVICE="$(detect_service_unit "dbus.service" "messagebus.service")"
         [[ -z "$DBUS_SERVICE" ]] && DBUS_SERVICE="dbus.service"
 
-        log_info "🔄 Restarting $DBUS_SERVICE silently (detached from current D-Bus session)"
-		if $VALIDATE_ONLY; then
-            log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Suppressed restart of $DBUS_SERVICE (non-invasive mode)"
-        elif $DRY_RUN; then
-            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would restart $DBUS_SERVICE (detached) to heal oddjob D-Bus registration"
-        else
-            nohup setsid bash -c "systemctl restart '$DBUS_SERVICE' >/dev/null 2>&1 < /dev/null" >/dev/null 2>&1 &
-            disown || true
-            sleep 3
+        # Warn if running over SSH (restart may affect active sessions)
+        if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" ]]; then
+            log_info "⚠️ Detected SSH session: restarting $DBUS_SERVICE may temporarily disrupt this session"
         fi
 
-        # After D-Bus restart, re-test
-        if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
-            log_info "✅ oddjob mkhomedir D-Bus service operational after D-Bus restart"
+        # Try config reload first (cheaper/safer than restart)
+        if command -v busctl >/dev/null 2>&1; then
+            cmd_try busctl call org.freedesktop.DBus / org.freedesktop.DBus ReloadConfig >/dev/null 2>&1 || true
         else
-            log_info "⚠️ D-Bus Hello still denied - common on RHEL/OL 7 (AccessDenied not fatal)"
+            cmd_try dbus-send --system --type=method_call --dest=org.freedesktop.DBus / org.freedesktop.DBus.ReloadConfig >/dev/null 2>&1 || true
+        fi
+
+        # Re-test before full restart
+        if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
+            log_info "✅ oddjob mkhomedir D-Bus service operational after ReloadConfig"
+        else
+            log_info "🔄 Restarting $DBUS_SERVICE silently (detached) as last resort"
+            if $VALIDATE_ONLY; then
+                log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Suppressed restart of $DBUS_SERVICE (non-invasive mode)"
+            elif $DRY_RUN; then
+                log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would restart $DBUS_SERVICE (detached) to heal oddjob D-Bus registration"
+            else
+                # Executa restart desconectado para tentar sobreviver à queda do D-Bus se estiver via SSH
+                nohup setsid bash -c "systemctl restart '$DBUS_SERVICE' >/dev/null 2>&1 < /dev/null" >/dev/null 2>&1 &
+                disown || true
+                sleep 3
+            fi
+
+            # After D-Bus restart, re-test
+            if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
+                log_info "✅ oddjob mkhomedir D-Bus service operational after D-Bus restart"
+            else
+                log_info "⚠️ D-Bus Hello still denied - common on RHEL/OL 7 (AccessDenied not fatal)"
+            fi
         fi
     fi
 
@@ -5234,13 +5269,11 @@ else
 				grp_escaped="${grp_escaped//./\\.}"    # Escape dots (most common in AD groups)
 				grp_escaped="${grp_escaped//[/\\[}"    # Escape [
 				grp_escaped="${grp_escaped//]/\\]}"    # Escape ]
-				grp_escaped="${grp_escaped//*/\\*}"    # Escape *
-                grp_escaped="${grp_escaped//\*/\\*}"    # Escape * (both literal and escaped versions)
+                grp_escaped="${grp_escaped//\*/\\*}"   # Escape *
 				grp_escaped="${grp_escaped//^/\\^}"    # Escape ^
 				grp_escaped="${grp_escaped//$/\\$}"    # Escape $
 				grp_escaped="${grp_escaped//+/\\+}"    # Escape +
-				grp_escaped="${grp_escaped//?/\\?}"    # Escape ?
-                grp_escaped="${grp_escaped//\?/\\?}"    # Escape ? (both literal and escaped versions)
+                grp_escaped="${grp_escaped//\?/\\?}"   # Escape ?
 				grp_escaped="${grp_escaped//(/\\(}"    # Escape (
 				grp_escaped="${grp_escaped//)/\\)}"    # Escape )
 				grp_escaped="${grp_escaped//{/\\{}"    # Escape {
