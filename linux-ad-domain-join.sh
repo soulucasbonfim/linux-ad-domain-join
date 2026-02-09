@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.9.0
+# Version:     2.9.1
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -372,7 +372,10 @@ validate_username() {
     [[ "$username" =~ ^([^@]+)@.+$ ]] && user_part="${BASH_REMATCH[1]}"
 
     [[ ! "$user_part" =~ ^[A-Za-z0-9._-]+$ ]] && { log_info "⚠ Username has invalid chars: $user_part"; return 1; }
-    [[ "$user_part" =~ ^[.-]|[.-]$ ]] && { log_info "⚠ Username cannot start/end with .-: $user_part"; return 1; }
+    
+    # FIX: Separe as duas condições em regex distintas
+    [[ "$user_part" =~ ^[.-] ]] && { log_info "⚠ Username cannot start with . or -: $user_part"; return 1; }
+    [[ "$user_part" =~ [.-]$ ]] && { log_info "⚠ Username cannot end with . or -: $user_part"; return 1; }
 
     return 0
 }
