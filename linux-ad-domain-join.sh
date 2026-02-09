@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.8.9
+# Version:     2.9.0
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -106,8 +106,11 @@
 # Define script version
 scriptVersion="$(grep -m1 "^# Version:" "${BASH_SOURCE[0]:-$0}" 2>/dev/null | cut -d: -f2 | tr -d ' ' || echo "unknown")"
 
-# Strict mode
+# Strict mode: fail fast, track errors, prevent unset vars, propagate pipe failures
 set -Eeuo pipefail
+
+# Safe IFS: prevent word splitting issues (space-only IFS for controlled behavior)
+IFS=$' \t\n'
 
 # Require Bash 4+ (associative arrays, mapfile).
 if [[ -z "${BASH_VERSINFO[0]:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
@@ -160,24 +163,24 @@ else
   C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""; C_MAGENTA=""
 fi
 
+# Compute best available UTF-8 locale once (avoids repeated locale -a calls)
+_CACHED_SED_LOCALE="C"
+if locale -a 2>/dev/null | grep -qiE '^(C\.UTF-8|en_US\.UTF-8|pt_BR\.UTF-8)$'; then
+    if locale -a 2>/dev/null | grep -qi '^C\.UTF-8$'; then
+        _CACHED_SED_LOCALE="C.UTF-8"
+    elif locale -a 2>/dev/null | grep -qi '^en_US\.UTF-8$'; then
+        _CACHED_SED_LOCALE="en_US.UTF-8"
+    else
+        _CACHED_SED_LOCALE="pt_BR.UTF-8"
+    fi
+fi
+
 # -------------------------------------------------------------------------
 # Log message sanitizer - replaces emojis with ASCII equivalents + colorization
 # -------------------------------------------------------------------------
 sanitize_log_msg() {
-    local sed_locale="C"
-
-    if locale -a 2>/dev/null | grep -qiE '^(C\.UTF-8|en_US\.UTF-8|pt_BR\.UTF-8)$'; then
-        if locale -a 2>/dev/null | grep -qi '^C\.UTF-8$'; then
-            sed_locale="C.UTF-8"
-        elif locale -a 2>/dev/null | grep -qi '^en_US\.UTF-8$'; then
-            sed_locale="en_US.UTF-8"
-        else
-            sed_locale="pt_BR.UTF-8"
-        fi
-    fi
-
     # shellcheck disable=SC2086
-    LC_ALL="$sed_locale" sed $SED_EXT '
+    LC_ALL="$_CACHED_SED_LOCALE" sed $SED_EXT '
         # Warnings / Alerts
         s/⚠|⚠️|❗|❕|🚨|📛|🧯|🔥|💣|🧨/[!]/g;
         # Informational / Neutral
@@ -219,17 +222,15 @@ colorize_tag() {
     echo "$msg"
 }
 
-# -------------------------------------------------------------------------
-# Log info and error functions with sanitization and colors
-# -------------------------------------------------------------------------
+# Log functions: ALL output goes to stderr (never pollute stdout)
 log_info() {
     local msg="$1"
     local ts="${C_DIM}[$(date '+%F %T')]${C_RESET}"
-    
+
     msg="$(sanitize_log_msg <<< "$msg")"
     msg="$(colorize_tag "$msg")"
-    
-    echo "${ts} ${msg}"
+
+    echo "${ts} ${msg}" >&2
 }
 
 log_error() {
@@ -326,6 +327,56 @@ validate_ad_group_name() {
     return 0
 }
 
+# LDAP filter escaping per RFC 4515: escape * ( ) \ NUL as \XX hex
+ldap_escape_filter() {
+    local input="$1"
+    local output=""
+    local char
+
+    # Process each character individually
+    for (( i=0; i<${#input}; i++ )); do
+        char="${input:$i:1}"
+        case "$char" in
+            '(')  output+='\28' ;;    # Left parenthesis
+            ')')  output+='\29' ;;    # Right parenthesis
+            '\')  output+='\5c' ;;    # Backslash
+            '*')  output+='\2a' ;;    # Asterisk (wildcard)
+            $'\0') output+='\00' ;;   # NUL byte
+            *)    output+="$char" ;;  # Pass-through safe characters
+        esac
+    done
+
+    printf '%s' "$output"
+}
+
+# Validate DNS domain name (RFC 1035: FQDN, alphanumeric+hyphen, no leading/trailing dots/hyphens)
+validate_domain_name() {
+    local domain="$1"
+
+    [[ -z "$domain" ]] && return 1
+    (( ${#domain} > 255 )) && { log_info "⚠ Domain name too long (max 255): $domain"; return 1; }
+    [[ ! "$domain" =~ ^([a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)*[a-zA-Z0-9]([a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?$ ]] && { log_info "⚠ Invalid domain format: $domain"; return 1; }
+    [[ ! "$domain" =~ \. ]] && { log_info "⚠ Domain must be FQDN (e.g., example.com)"; return 1; }
+    return 0
+}
+
+# Validate AD username: alphanumeric+._-, no leading/trailing dots/hyphens, max 256 chars
+validate_username() {
+    local username="$1" user_part="$username"
+
+    [[ -z "$username" ]] && return 1
+    (( ${#username} > 256 )) && { log_info "⚠ Username too long (max 256): $username"; return 1; }
+
+    # Strip domain prefix: DOMAIN\user or user@domain
+    [[ "$username" =~ ^[^\\]+\\(.+)$ ]] && user_part="${BASH_REMATCH[1]}"
+    [[ "$username" =~ ^([^@]+)@.+$ ]] && user_part="${BASH_REMATCH[1]}"
+
+    [[ ! "$user_part" =~ ^[A-Za-z0-9._-]+$ ]] && { log_info "⚠ Username has invalid chars: $user_part"; return 1; }
+    [[ "$user_part" =~ ^[.-]|[.-]$ ]] && { log_info "⚠ Username cannot start/end with .-: $user_part"; return 1; }
+
+    return 0
+}
+
 # -------------------------------------------------------------------------
 # Global error trap - catches any unexpected command failure
 # -------------------------------------------------------------------------
@@ -392,25 +443,46 @@ VALIDATE_ONLY="${VALIDATE_ONLY:-false}"
 
 # -------------------------------------------------------------------------
 # Logging + Backup roots (after flags/defaults)
-# - avoids hard dependency on tee before deps are installed
+# - Logs go to /var/log/linux-ad-domain-join/ with timestamped filenames
 # - VALIDATE_ONLY uses /tmp to keep the run non-invasive
 # -------------------------------------------------------------------------
+LOG_TIMESTAMP="$(date +%Y%m%d_%H%M%S)"
+LOG_HOSTNAME="$(hostname -s 2>/dev/null || echo "localhost")"
+
 if $VALIDATE_ONLY || $DRY_RUN; then
-    LOG_FILE="${LOG_FILE:-/tmp/linux-ad-domain-join.validate.log}"
+    LOG_DIR="${LOG_DIR:-/tmp/linux-ad-domain-join}"
     BACKUP_ROOT="${BACKUP_ROOT:-/tmp/linux-ad-domain-join-backups}"
 else
-    LOG_FILE="${LOG_FILE:-/var/log/linux-ad-domain-join.log}"
+    LOG_DIR="${LOG_DIR:-/var/log/linux-ad-domain-join}"
     BACKUP_ROOT="${BACKUP_ROOT:-/var/backups/linux-ad-domain-join}"
 fi
 
+# Build timestamped log filename
+LOG_FILE="${LOG_DIR}/${LOG_TIMESTAMP}_${LOG_HOSTNAME}.log"
+
 # Ensure log directory exists (best-effort) + ensure log is writable
-mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+mkdir -p "$LOG_DIR" 2>/dev/null || true
 if ! : >>"$LOG_FILE" 2>/dev/null; then
-    # Fallback if /var/log is not writable for any reason (shouldn't happen as root, but safe)
-    LOG_FILE="/tmp/linux-ad-domain-join.log"
-    mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+    # Fallback if /var/log is not writable
+    LOG_DIR="/tmp/linux-ad-domain-join"
+    LOG_FILE="${LOG_DIR}/${LOG_TIMESTAMP}_${LOG_HOSTNAME}.log"
+    mkdir -p "$LOG_DIR" 2>/dev/null || true
     : >>"$LOG_FILE" 2>/dev/null || { echo "[$(date '+%F %T')] [ERROR] Cannot write LOG_FILE=$LOG_FILE" >&2; exit 1; }
 fi
+
+# Prune old log files (keep last 30 logs)
+LOG_RETENTION="${LOG_RETENTION:-30}"
+_prune_old_logs() {
+    local log_dir="$1" keep="$2"
+    [[ -d "$log_dir" ]] || return 0
+    local count
+    count="$(find "$log_dir" -maxdepth 1 -type f -name '*.log' 2>/dev/null | wc -l)"
+    (( count > keep )) || return 0
+    find "$log_dir" -maxdepth 1 -type f -name '*.log' -printf '%T@ %p\n' 2>/dev/null \
+        | sort -n | head -n "$(( count - keep ))" | cut -d' ' -f2- \
+        | while IFS= read -r old_log; do rm -f -- "$old_log" 2>/dev/null; done
+}
+_prune_old_logs "$LOG_DIR" "$LOG_RETENTION"
 
 # -------------------------------------------------------------------------
 # Single-instance lock (prevents concurrent executions)
@@ -470,6 +542,14 @@ BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_RUN_ID}"
 
 to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
 
+# Standardized mktemp wrapper: validates result, consistent errors, works with set -eu
+safe_mktemp() {
+    local tmpfile template="${1:-}"
+    tmpfile="$(mktemp "$@" 2>&1)" || log_error "mktemp failed${template:+ (template: $template)}" 1
+    [[ -z "$tmpfile" ]] && log_error "mktemp returned empty path" 1
+    printf '%s' "$tmpfile"
+}
+
 trim_line() {
     # shellcheck disable=SC2086  # SED_EXT must be expanded as a flag (-E/-r)
     sed $SED_EXT \
@@ -479,6 +559,91 @@ trim_line() {
         -e '/[Cc]url error/ s/[[:space:]]\[[^]]*][[:space:]]*$//'
 }
 
+# Service mgmt wrapper: systemctl -> service -> /etc/init.d/ (auto-detects; supports start/stop/restart/enable/disable/status)
+service_control() {
+    local svc_name="$1"
+    local action="$2"
+    local rc=0
+
+    # Modern systemd-based systems (RHEL 7+, Ubuntu 16.04+, Debian 8+)
+    if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+        case "$action" in
+            start)   systemctl start "$svc_name" || rc=$? ;;
+            stop)    systemctl stop "$svc_name" || rc=$? ;;
+            restart) systemctl restart "$svc_name" || rc=$? ;;
+            enable)  systemctl enable "$svc_name" || rc=$? ;;
+            disable) systemctl disable "$svc_name" || rc=$? ;;
+            status)  systemctl status "$svc_name" || rc=$? ;;
+            enable-now) systemctl enable --now "$svc_name" || rc=$? ;;
+            *)       log_error "Unknown service action: $action" 1 ;;
+        esac
+        return $rc
+    fi
+
+    # Legacy systems with service wrapper (RHEL 6, older Ubuntu/Debian)
+    if command -v service >/dev/null 2>&1; then
+        case "$action" in
+            start|stop|restart|status)
+                service "$svc_name" "$action" || rc=$?
+                ;;
+            enable)
+                # Use chkconfig on RHEL-like systems
+                if command -v chkconfig >/dev/null 2>&1; then
+                    chkconfig "$svc_name" on || rc=$?
+                # Use update-rc.d on Debian-like systems
+                elif command -v update-rc.d >/dev/null 2>&1; then
+                    update-rc.d "$svc_name" defaults || rc=$?
+                    update-rc.d "$svc_name" enable || rc=$?
+                else
+                    log_info "⚠ Cannot enable service $svc_name: no chkconfig or update-rc.d found"
+                    rc=1
+                fi
+                ;;
+            disable)
+                if command -v chkconfig >/dev/null 2>&1; then
+                    chkconfig "$svc_name" off || rc=$?
+                elif command -v update-rc.d >/dev/null 2>&1; then
+                    update-rc.d "$svc_name" disable || rc=$?
+                else
+                    log_info "⚠ Cannot disable service $svc_name: no chkconfig or update-rc.d found"
+                    rc=1
+                fi
+                ;;
+            enable-now)
+                # Enable and start in two steps for legacy systems
+                service_control "$svc_name" enable || rc=$?
+                service_control "$svc_name" start || rc=$?
+                ;;
+            *)
+                log_error "Unknown service action: $action" 1
+                ;;
+        esac
+        return $rc
+    fi
+
+    # Direct init.d script invocation (last resort for very old systems)
+    if [[ -x "/etc/init.d/$svc_name" ]]; then
+        case "$action" in
+            start|stop|restart|status)
+                "/etc/init.d/$svc_name" "$action" || rc=$?
+                ;;
+            enable|disable|enable-now)
+                log_info "⚠ Service $svc_name must be enabled manually (no service management tools found)"
+                [[ "$action" == "enable-now" ]] && "/etc/init.d/$svc_name" start || true
+                rc=0
+                ;;
+            *)
+                log_error "Unknown service action: $action" 1
+                ;;
+        esac
+        return $rc
+    fi
+
+    # No service management method available
+    log_error "Cannot manage service $svc_name: no systemctl, service, or init.d script found" 1
+}
+
+# Init timestamped backup dir (0700, one per run, suppressed in VALIDATE_ONLY/DRY_RUN)
 init_backup_dir() {
     if $VALIDATE_ONLY; then
         log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Backup directory creation suppressed: $BACKUP_DIR"
@@ -490,14 +655,13 @@ init_backup_dir() {
         return 0
     fi
 
-    mkdir -p -- "$BACKUP_DIR"
+    mkdir -p -- "$BACKUP_DIR" || log_error "Failed to create backup directory: $BACKUP_DIR" 19
     chmod 700 -- "$BACKUP_DIR" 2>/dev/null || true
     log_info "💾 Backup directory: $BACKUP_DIR"
 }
 
+# Prune old backups (keep N newest, best-effort, safe under set -eEuo)
 backup_prune_old_runs() {
-    # Prune old backup runs safely under set -eEuo pipefail.
-    # Uses find+sort, does not fail when directory is empty.
     local keep="${1:-20}"
 
     if $VALIDATE_ONLY; then
@@ -653,7 +817,7 @@ sshd_set_directive_dedup() {
     chown --reference="$file" "$tmp" 2>/dev/null || true
     chmod --reference="$file" "$tmp" 2>/dev/null || true
 
-    mv -f "$tmp" "$file"
+    mv -f "$tmp" "$file" || { rm -f "$tmp"; log_error "Failed to install updated $file" 1; }
 }
 
 validate_sshd_config_or_die() {
@@ -665,16 +829,36 @@ validate_sshd_config_or_die() {
     fi
 
     local sshd_bin=""
-    command -v sshd >/dev/null 2>&1 && sshd_bin="$(command -v sshd)"
-    [[ -z "$sshd_bin" && -x /usr/sbin/sshd ]] && sshd_bin="/usr/sbin/sshd"
+    # Check multiple possible locations for sshd binary
+    if command -v sshd >/dev/null 2>&1; then
+        sshd_bin="$(command -v sshd)"
+    elif [[ -x /usr/sbin/sshd ]]; then
+        sshd_bin="/usr/sbin/sshd"
+    elif [[ -x /sbin/sshd ]]; then
+        sshd_bin="/sbin/sshd"
+    fi
 
     [[ -z "$sshd_bin" ]] && log_error "sshd binary not found; cannot validate $file safely" 1
 
-    "$sshd_bin" -t -f "$file" || log_error "Invalid sshd_config after changes. Backup preserved; refusing to restart SSH." 1
+    # Validate sshd config; on failure, restore backup and exit
+    if ! "$sshd_bin" -t -f "$file" 2>&1; then
+        log_error "sshd config validation failed for: $file"
+
+        # Find and restore latest backup
+        local rel="${file#/}"
+        local backup_path="${BACKUP_DIR}/${rel}"
+
+        if [[ -f "$backup_path" ]]; then
+            log_info "Restoring backup: $backup_path -> $file"
+            cp -f "$backup_path" "$file" || log_error "Failed to restore backup from $backup_path" 1
+            log_error "sshd_config restored from backup. Refusing to proceed." 1
+        else
+            log_error "No backup found at $backup_path. Refusing to proceed with broken config." 1
+        fi
+    fi
 }
 
 detect_service_unit() {
-    # Returns the first unit that exists (systemd).
     local u
     command -v systemctl >/dev/null 2>&1 || { echo ""; return 1; }
 
@@ -682,6 +866,7 @@ detect_service_unit() {
         if systemctl list-unit-files --no-legend --no-pager "$u" 2>/dev/null | awk '{print $1}' | grep -qx "$u"; then
             echo "$u"; return 0
         fi
+        # Also check direct file existence (for masked/static units)
         if [[ -f "/etc/systemd/system/$u" || -f "/usr/lib/systemd/system/$u" || -f "/lib/systemd/system/$u" ]]; then
             echo "$u"; return 0
         fi
@@ -708,17 +893,17 @@ first_bin_from_cmd() {
                 ;;
         esac
 
-        # timeout: pula opções (-k, --foreground, etc) e a duração (ex: 90, 90s, 0.5, 2m)
+        # timeout: skip options (-k, --foreground, etc) and duration (e.g., 90, 90s, 0.5, 2m)
         if $timeout_skip_next_nonflag; then
             if [[ "$arg" == -* ]]; then
                 continue
             fi
-            # provável duração
+            # Likely a duration argument
             if [[ "$arg" =~ ^[0-9]+([.][0-9]+)?([smhd])?$ ]]; then
                 timeout_skip_next_nonflag=false
                 continue
             fi
-            # se não parecia duração, então é o bin real
+            # If it didn't look like a duration, then it's the real binary
             timeout_skip_next_nonflag=false
         fi
 
@@ -841,17 +1026,17 @@ _cmd_run_capture() {
 }
 
 is_mutating_cmd() {
-    # Decide se um comando pode alterar o sistema. Se sim, em VALIDATE_ONLY ele será suprimido.
+    # Determines if a command can modify the system. If yes, it will be suppressed in VALIDATE_ONLY mode.
     local first_bin="$1"; shift
     local -a args=( "$@" )
 
-    # Bins tipicamente mutáveis
+    # Typically mutating binaries
     case "$first_bin" in
         rm|mv|cp|install|chmod|chown|chgrp|ln|truncate|dd|tee|visudo|useradd|usermod|groupadd|groupmod|passwd)
             return 0
             ;;
         systemctl|service|chkconfig|update-rc.d)
-            # start/stop/restart/enable/disable são mutáveis
+            # start/stop/restart/enable/disable are mutating operations
             for a in "${args[@]}"; do
                 case "$a" in
                     start|stop|restart|reload|enable|disable|mask|unmask|daemon-reload|daemon-reexec)
@@ -861,7 +1046,7 @@ is_mutating_cmd() {
             done
             ;;
         sed)
-            # sed -i é mutável
+            # sed -i is mutating (in-place edit)
             for a in "${args[@]}"; do
                 [[ "$a" == -i* ]] && return 0
             done
@@ -918,7 +1103,7 @@ cmd_run() {
     first_bin="$(first_bin_from_cmd "${cmd[@]}")"
     [[ -z "$first_bin" ]] && first_bin="$exec_bin"
 
-    # VALIDATE_ONLY: suprimir comandos mutáveis (read-only mode)
+    # VALIDATE_ONLY: suppress mutating commands (read-only mode)
     if $VALIDATE_ONLY; then
         if is_mutating_cmd "$first_bin" "${cmd[@]:1}"; then
             log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Suppressed mutating command: $(print_cmd_quoted "${cmd[@]}")"
@@ -933,10 +1118,18 @@ cmd_run() {
         return 0
     fi
 
-    # Validate the “real” binary, not just env-wrapper
+    # Validate the "real" binary, not just env-wrapper
     if ! _cmd_bin_exists "$first_bin"; then
         log_info "❗ Command not found: $first_bin"
         return 127
+    fi
+
+    # Auto-handle immutable attribute for in-place sed operations
+    if [[ "$first_bin" == "sed" ]]; then
+        local _imf
+        while IFS= read -r _imf; do
+            [[ -n "$_imf" ]] && _file_ensure_mutable "$_imf"
+        done < <(_extract_sed_target_files "${cmd[@]}")
     fi
 
     if $VERBOSE; then
@@ -1215,8 +1408,6 @@ backup_file() {
 }
 
 write_file() {
-    # Usage: write_file <mode> <path>  (content via stdin)
-    # Notes: VALIDATE_ONLY suppresses writes but still consumes stdin.
     local mode="$1"
     local path="$2"
 
@@ -1232,7 +1423,13 @@ write_file() {
         return 0
     fi
 
+    local parent_dir
+    parent_dir="$(dirname "$path")"
+    [[ -d "$parent_dir" ]] || mkdir -p "$parent_dir" || log_error "Failed to create parent directory: $parent_dir" 20
+
+    _file_ensure_mutable "$path"
     install -m "$mode" -o root -g root -D /dev/stdin "$path"
+    _file_restore_attr "$path"
 }
 
 append_line() {
@@ -1250,7 +1447,9 @@ append_line() {
         return 0
     fi
 
+    _file_ensure_mutable "$path"
     printf '%s\n' "$line" >>"$path"
+    _file_restore_attr "$path"
 }
 
 write_line_file() {
@@ -1264,6 +1463,83 @@ append_line_unique() {
     local path="$1" line="$2"
     grep -Fxq -- "$line" "$path" 2>/dev/null && return 0
     append_line "$path" "$line"
+}
+
+# -------------------------------------------------------------------------
+# Immutable attribute (chattr +i) - auto-handling infrastructure
+# -------------------------------------------------------------------------
+# Associative array tracking files whose immutable bit was removed.
+# Key = file path, Value = "1". Restored automatically by file ops or on exit.
+declare -A _IMMUTABLE_TRACKER=()
+
+_chattr_available() { command -v lsattr >/dev/null 2>&1 && command -v chattr >/dev/null 2>&1; }
+
+_file_has_immutable() {
+    local f="$1"
+    _chattr_available || return 1
+    [[ -e "$f" ]] || return 1
+    local flags
+    flags="$(lsattr -d -- "$f" 2>/dev/null | awk '{print $1}' || true)"
+    [[ -n "$flags" ]] && echo "$flags" | grep -q 'i' && return 0
+    return 1
+}
+
+# Transparently remove immutable bit before a file operation (idempotent)
+_file_ensure_mutable() {
+    local f="$1"
+    [[ -e "$f" ]] || return 0
+    [[ "${_IMMUTABLE_TRACKER[$f]:-}" == "1" ]] && return 0  # already handled
+    _file_has_immutable "$f" || return 0
+    if $DRY_RUN || $VALIDATE_ONLY; then return 0; fi
+    chattr -i -- "$f" || { log_info "⚠ Failed to remove immutable bit from $f"; return 1; }
+    _IMMUTABLE_TRACKER["$f"]="1"
+    $VERBOSE && log_info "🔓 Temporarily removed immutable bit from $f"
+    return 0
+}
+
+# Restore immutable bit for a single file (idempotent)
+_file_restore_attr() {
+    local f="$1"
+    [[ "${_IMMUTABLE_TRACKER[$f]:-}" == "1" ]] || return 0
+    if [[ -e "$f" ]]; then
+        chattr +i -- "$f" 2>/dev/null || true
+        $VERBOSE && log_info "🔒 Restored immutable bit on $f"
+    fi
+    unset '_IMMUTABLE_TRACKER[$f]'
+}
+
+# Restore all tracked immutable bits (called from cleanup trap)
+_file_restore_all_attrs() {
+    local f
+    for f in "${!_IMMUTABLE_TRACKER[@]}"; do
+        _file_restore_attr "$f"
+    done
+}
+
+# Extract target file(s) from a sed -i command's argument list
+_extract_sed_target_files() {
+    local -a args=("$@")
+    local -a files=()
+    local skip_next=false has_inplace=false
+
+    for arg in "${args[@]}"; do
+        [[ "$arg" == -i* ]] && has_inplace=true
+    done
+    $has_inplace || return 0
+
+    # The file arguments in sed come after all options/expressions
+    # Walk backwards from the end: any arg that is an existing file or
+    # not starting with '-' (and not an -e expression value) is a target
+    local i
+    for (( i=${#args[@]}-1; i>=0; i-- )); do
+        local a="${args[$i]}"
+        [[ "$a" == -* ]] && break
+        # Skip expression values (arg after -e)
+        if (( i > 0 )) && [[ "${args[$((i-1))]}" == "-e" ]]; then break; fi
+        [[ -f "$a" ]] && files+=("$a")
+    done
+
+    printf '%s\n' "${files[@]}"
 }
 
 # Milliseconds timestamp with fallback
@@ -1371,9 +1647,9 @@ validate_allowgroups_tokens() {
 
     [[ -z "$raw" || "$raw" == "(none)" ]] && return 0
 
-    # tokens separados por espaço
+    # Space-separated tokens
     for g in $raw; do
-        # sshd AllowGroups e nomes POSIX/SSSD típicos
+        # sshd AllowGroups and typical POSIX/SSSD names
         [[ "$g" =~ ^[A-Za-z0-9._-]+$ ]] || bad+=("$g")
     done
 
@@ -1781,13 +2057,25 @@ else
     log_info "🧪 Collecting inputs"
     print_divider
 
-    # Require DOMAIN
+    # Require DOMAIN with validation
     while true; do
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Domain (e.g., acme.net): " "$(date '+%F %T')"
         read -r DOMAIN
         DOMAIN=$(echo "$DOMAIN" | xargs)
-        [[ -n "$DOMAIN" ]] && break
-        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Domain is required.\n" "$(date '+%F %T')"
+
+        # Check for empty input
+        if [[ -z "$DOMAIN" ]]; then
+            printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Domain is required.\n" "$(date '+%F %T')"
+            continue
+        fi
+
+        # Validate domain name format
+        if ! validate_domain_name "$DOMAIN"; then
+            printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Please enter a valid domain name.\n" "$(date '+%F %T')"
+            continue
+        fi
+
+        break
     done
     DOMAIN_LOWER="${DOMAIN,,}"
     DOMAIN_UPPER="${DOMAIN^^}"
@@ -1818,13 +2106,25 @@ else
     NTP_SERVER="$(echo "${NTP_SERVER:-}" | xargs)"
     NTP_SERVER="${NTP_SERVER:-$default_NTP_SERVER}"
 
-    # Require Join User
+    # Require Join User with validation
     while true; do
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Join user (e.g., administrator): " "$(date '+%F %T')"
         read -r DOMAIN_USER
         DOMAIN_USER=$(echo "$DOMAIN_USER" | xargs)
-        [[ -n "$DOMAIN_USER" ]] && break
-        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Join user is required.\n" "$(date '+%F %T')"
+
+        # Check for empty input
+        if [[ -z "$DOMAIN_USER" ]]; then
+            printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Join user is required.\n" "$(date '+%F %T')"
+            continue
+        fi
+
+        # Validate username format
+        if ! validate_username "$DOMAIN_USER"; then
+            printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Please enter a valid username.\n" "$(date '+%F %T')"
+            continue
+        fi
+
+        break
     done
 
     # Require Password
@@ -2013,6 +2313,10 @@ LDAP_SERVER="$DC_SERVER_INPUT"
 # Hostname format for Kerberos (uppercase short name)
 HOST_SHORT=$(hostname -s)
 HOST_SHORT_U=$(echo "$HOST_SHORT" | tr '[:lower:]' '[:upper:]')
+
+# Escaped version for LDAP filter injection protection (RFC 4515)
+HOST_SHORT_U_ESCAPED=$(ldap_escape_filter "$HOST_SHORT_U")
+
 MACHINE_PRINCIPAL="${HOST_SHORT_U}\$@${REALM}"
 
 # -------------------------------------------------------------------------
@@ -2025,20 +2329,19 @@ HOSTS_FILE="/etc/hosts"
 backup_file "$HOSTS_FILE"
 
 # Skip Docker/Podman networks early
-SKIP_IFACES="docker|br-|virbr|veth|cni|flannel|tun|tap|wg|vboxnet|vmnet"
-
-# Detect primary IPv4 address (route-aware; avoids Docker/VPN first-IP issues)
+# Primary IP detection (multi-strategy fallback chain)
+SKIP_IFACES="docker|br-|virbr|veth|cni|flannel|tun|tap|wg|vboxnet|vmnet"  # Skip virtual/container/VPN interfaces
 PRIMARY_IP=""
 PRIMARY_IFACE=""
 
-# 0) Prefer the source IP used to reach the DC (best signal; no Internet dependency)
+# Strategy 0: Source IP used to reach DC (most reliable: guarantees AD connectivity, handles multi-homed)
 DC_V4="$(getent ahostsv4 "$DC_SERVER" 2>/dev/null | awk 'NR==1{print $1; exit}')"
 if [[ -n "$DC_V4" ]]; then
     PRIMARY_IP="$(ip -4 route get "$DC_V4" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
     PRIMARY_IFACE="$(ip -4 route get "$DC_V4" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
 fi
 
-# 1) Fallback to default route interface (intranet-safe)
+# Strategy 1: Default route interface (fallback if DC resolution fails)
 if [[ -z "$PRIMARY_IP" ]]; then
     PRIMARY_IFACE="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
     if [[ -n "$PRIMARY_IFACE" ]]; then
@@ -2046,7 +2349,7 @@ if [[ -z "$PRIMARY_IP" ]]; then
     fi
 fi
 
-# 2) Fallback: first global address excluding common container/vpn interfaces
+# Strategy 2: First global-scope address (excludes virtual/container interfaces)
 if [[ -z "$PRIMARY_IP" ]]; then
     if ip -o -4 addr show scope global >/dev/null 2>&1; then
         PRIMARY_IFACE="$(ip -o -4 addr show scope global 2>/dev/null | awk '!/(docker|br-|virbr|veth|cni|flannel|tun|tap|wg|vboxnet|vmnet)/ {print $2; exit}')"
@@ -2054,7 +2357,7 @@ if [[ -z "$PRIMARY_IP" ]]; then
     fi
 fi
 
-# 3) Legacy fallback: ifconfig (old net-tools)
+# Strategy 3: ifconfig fallback (legacy systems: RHEL 6, Ubuntu 14.04, Debian 7)
 if [[ -z "$PRIMARY_IP" ]] && command -v ifconfig >/dev/null 2>&1; then
     PRIMARY_IP="$(ifconfig 2>/dev/null | grep -Eo 'inet (addr:)?([0-9]*\.){3}[0-9]*' | grep -v '127.0.0.1' | awk '{print $2}' | sed 's/addr://g' | head -n1 || true)"
 fi
@@ -2076,9 +2379,7 @@ else
     NETSTAT_CMD=""
 fi
 
-WEB_ACTIVE=false
 if [[ -n "$NETSTAT_CMD" ]] && $NETSTAT_CMD 2>/dev/null | grep -qE ':(80|443)\b'; then
-    WEB_ACTIVE=true
     log_info "🌐 Detected active web service (port 80/443 in use)"
 fi
 
@@ -2122,6 +2423,7 @@ fi
 CLOUD_ALIASES=""
 
 # Collect ALL entries for this IP (not only the first one)
+MATCHING_LINES=()
 mapfile -t MATCHING_LINES < <(grep -E "^[[:space:]]*${PRIMARY_IP_RE}[[:space:]]+" "$HOSTS_FILE" || true)
 
 if [[ ${#MATCHING_LINES[@]} -gt 0 ]]; then
@@ -2203,6 +2505,287 @@ fi
 
 log_info "✅ Hostname/FQDN consistency validation complete"
 
+# -------------------------------------------------------------------------
+# Cloud-init hostname preservation (prevent reboot hostname reset)
+# -------------------------------------------------------------------------
+CLOUD_INIT_CFG="/etc/cloud/cloud.cfg"
+CLOUD_INIT_DROPIN="/etc/cloud/cloud.cfg.d/99-preserve-hostname.cfg"
+if command -v cloud-init >/dev/null 2>&1 || [[ -f "$CLOUD_INIT_CFG" ]]; then
+    log_info "🧩 Cloud-init detected - ensuring hostname is preserved across reboots"
+
+    # Check if preserve_hostname is already set
+    _preserve_set=false
+    if [[ -f "$CLOUD_INIT_CFG" ]] && grep -qE '^preserve_hostname:[[:space:]]*true' "$CLOUD_INIT_CFG" 2>/dev/null; then
+        _preserve_set=true
+    fi
+    if [[ -d /etc/cloud/cloud.cfg.d ]]; then
+        for _cf in /etc/cloud/cloud.cfg.d/*.cfg; do
+            [[ -f "$_cf" ]] && grep -qE '^preserve_hostname:[[:space:]]*true' "$_cf" 2>/dev/null && _preserve_set=true
+        done
+    fi
+
+    if $_preserve_set; then
+        log_info "✅ Cloud-init preserve_hostname already enabled"
+    else
+        if $VALIDATE_ONLY; then
+            log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would write $CLOUD_INIT_DROPIN (preserve_hostname: true)"
+        elif $DRY_RUN; then
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would write $CLOUD_INIT_DROPIN (preserve_hostname: true)"
+        else
+            mkdir -p /etc/cloud/cloud.cfg.d 2>/dev/null || true
+            write_file 0644 "$CLOUD_INIT_DROPIN" <<'EOF'
+# Managed by linux-ad-domain-join.sh - prevent cloud-init from resetting hostname
+preserve_hostname: true
+EOF
+            log_info "✅ Cloud-init preserve_hostname configured via $CLOUD_INIT_DROPIN"
+        fi
+    fi
+fi
+
+# -------------------------------------------------------------------------
+# systemd-resolved symlink fix (Ubuntu 20.04+)
+# -------------------------------------------------------------------------
+if [[ "$ID" == "ubuntu" ]]; then
+    _ubuntu_major="$(get_major_version_id)"
+    if (( _ubuntu_major >= 20 )); then
+        RESOLV_CONF="/etc/resolv.conf"
+        STUB_TARGET="/run/systemd/resolve/stub-resolv.conf"
+        FULL_TARGET="/run/systemd/resolve/resolv.conf"
+
+        if [[ -L "$RESOLV_CONF" ]]; then
+            _link_target="$(readlink -f "$RESOLV_CONF" 2>/dev/null || true)"
+            if [[ ! -e "$_link_target" ]]; then
+                log_info "⚠ $RESOLV_CONF symlink is broken (target: $_link_target)"
+                _file_ensure_mutable "$RESOLV_CONF"
+
+                if $VALIDATE_ONLY; then
+                    log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would fix $RESOLV_CONF symlink"
+                elif $DRY_RUN; then
+                    log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would fix $RESOLV_CONF symlink -> $STUB_TARGET"
+                else
+                    if [[ -e "$STUB_TARGET" ]]; then
+                        ln -sf "$STUB_TARGET" "$RESOLV_CONF"
+                        log_info "✅ Fixed $RESOLV_CONF symlink -> $STUB_TARGET"
+                    elif [[ -e "$FULL_TARGET" ]]; then
+                        ln -sf "$FULL_TARGET" "$RESOLV_CONF"
+                        log_info "✅ Fixed $RESOLV_CONF symlink -> $FULL_TARGET (fallback)"
+                    else
+                        log_info "⚠ Neither $STUB_TARGET nor $FULL_TARGET exist; cannot fix symlink"
+                    fi
+                fi
+
+                _file_restore_attr "$RESOLV_CONF"
+            else
+                $VERBOSE && log_info "ℹ $RESOLV_CONF symlink OK (-> $_link_target)"
+            fi
+        fi
+    fi
+fi
+
+# -------------------------------------------------------------------------
+# DNS Persistence Configuration (NetworkManager, systemd-resolved, static)
+# Ensures DC DNS server is configured and persists across reboots/restarts
+# -------------------------------------------------------------------------
+log_info "🔧 Configuring DNS persistence for Active Directory"
+
+# Detect network management system and configure DNS accordingly
+_dns_configured=false
+DC_DNS_IP="${DC_DNS_IP:-$DC_V4}"  # Use DC IP as DNS server (if not explicitly set)
+[[ -z "$DC_DNS_IP" ]] && DC_DNS_IP="$(getent ahostsv4 "$DC_SERVER" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+
+if [[ -z "$DC_DNS_IP" ]]; then
+    log_info "⚠ Could not determine DC IP address for DNS configuration"
+else
+    log_info "ℹ Using DNS server: $DC_DNS_IP (DC: $DC_SERVER)"
+
+    # Method 1: NetworkManager (nmcli) - most common on modern RHEL/Fedora/Ubuntu Desktop
+    if command -v nmcli >/dev/null 2>&1 && systemctl is-active NetworkManager &>/dev/null; then
+        log_info "🔧 NetworkManager detected - configuring DNS via nmcli"
+
+        # Get active connection for primary interface
+        _nm_conn=""
+        if [[ -n "$PRIMARY_IFACE" ]]; then
+            _nm_conn="$(nmcli -t -f NAME,DEVICE con show --active 2>/dev/null | grep ":${PRIMARY_IFACE}$" | cut -d: -f1 | head -n1)"
+        fi
+        [[ -z "$_nm_conn" ]] && _nm_conn="$(nmcli -t -f NAME con show --active 2>/dev/null | head -n1)"
+
+        if [[ -n "$_nm_conn" ]]; then
+            if $VALIDATE_ONLY; then
+                log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would configure DNS via nmcli for connection '$_nm_conn'"
+                _dns_configured=true
+            elif $DRY_RUN; then
+                log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would run: nmcli con mod '$_nm_conn' ipv4.dns '$DC_DNS_IP' ipv4.dns-search '$DOMAIN'"
+                _dns_configured=true
+            else
+                # Get current DNS to prepend DC (avoid overwriting all DNS)
+                _current_dns="$(nmcli -g ipv4.dns con show "$_nm_conn" 2>/dev/null | tr ',' ' ' | xargs)"
+                if [[ "$_current_dns" != *"$DC_DNS_IP"* ]]; then
+                    _new_dns="$DC_DNS_IP"
+                    [[ -n "$_current_dns" ]] && _new_dns="$DC_DNS_IP $_current_dns"
+                    nmcli con mod "$_nm_conn" ipv4.dns "$_new_dns" 2>/dev/null || true
+                fi
+                # Add search domain
+                _current_search="$(nmcli -g ipv4.dns-search con show "$_nm_conn" 2>/dev/null | tr ',' ' ' | xargs)"
+                if [[ "$_current_search" != *"$DOMAIN"* ]]; then
+                    _new_search="$DOMAIN"
+                    [[ -n "$_current_search" ]] && _new_search="$DOMAIN $_current_search"
+                    nmcli con mod "$_nm_conn" ipv4.dns-search "$_new_search" 2>/dev/null || true
+                fi
+                # Prevent DHCP from overwriting DNS (ignore-auto-dns)
+                nmcli con mod "$_nm_conn" ipv4.ignore-auto-dns yes 2>/dev/null || true
+                # Apply changes
+                nmcli con up "$_nm_conn" 2>/dev/null || true
+                log_info "✅ DNS configured via NetworkManager (connection: $_nm_conn)"
+                _dns_configured=true
+            fi
+        else
+            log_info "⚠ NetworkManager active but no connection found for interface $PRIMARY_IFACE"
+        fi
+    fi
+
+    # Method 2: systemd-resolved (resolvectl) - Ubuntu 18.04+, Fedora, Arch
+    if ! $_dns_configured && command -v resolvectl >/dev/null 2>&1 && systemctl is-active systemd-resolved &>/dev/null; then
+        log_info "🔧 systemd-resolved detected - configuring DNS via resolvectl"
+
+        _resolve_iface="${PRIMARY_IFACE:-$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')}"
+        if [[ -n "$_resolve_iface" ]]; then
+            if $VALIDATE_ONLY; then
+                log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would configure DNS via resolvectl for $_resolve_iface"
+                _dns_configured=true
+            elif $DRY_RUN; then
+                log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would run: resolvectl dns $_resolve_iface $DC_DNS_IP"
+                _dns_configured=true
+            else
+                resolvectl dns "$_resolve_iface" "$DC_DNS_IP" 2>/dev/null || true
+                resolvectl domain "$_resolve_iface" "$DOMAIN" 2>/dev/null || true
+                log_info "✅ DNS configured via systemd-resolved (interface: $_resolve_iface)"
+                _dns_configured=true
+
+                # Make persistent via resolved.conf.d drop-in
+                _resolved_dropin="/etc/systemd/resolved.conf.d"
+                mkdir -p "$_resolved_dropin" 2>/dev/null || true
+                if [[ -d "$_resolved_dropin" ]]; then
+                    write_file 0644 "${_resolved_dropin}/99-ad-domain.conf" <<EOF
+# Managed by linux-ad-domain-join.sh - AD DNS configuration
+[Resolve]
+DNS=$DC_DNS_IP
+Domains=$DOMAIN
+EOF
+                    systemctl restart systemd-resolved 2>/dev/null || true
+                    log_info "✅ DNS persisted via ${_resolved_dropin}/99-ad-domain.conf"
+                fi
+            fi
+        fi
+    fi
+
+    # Method 3: Netplan (Ubuntu Server 18.04+) - create override config
+    if ! $_dns_configured && command -v netplan >/dev/null 2>&1 && [[ -d /etc/netplan ]]; then
+        log_info "🔧 Netplan detected - configuring DNS via drop-in config"
+
+        _netplan_dropin="/etc/netplan/99-ad-dns.yaml"
+        if $VALIDATE_ONLY; then
+            log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would create $_netplan_dropin"
+            _dns_configured=true
+        elif $DRY_RUN; then
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would create $_netplan_dropin with DNS $DC_DNS_IP"
+            _dns_configured=true
+        else
+            # Netplan requires proper YAML indentation
+            _np_iface="${PRIMARY_IFACE:-eth0}"
+            write_file 0600 "$_netplan_dropin" <<EOF
+# Managed by linux-ad-domain-join.sh - AD DNS override
+network:
+  version: 2
+  ethernets:
+    ${_np_iface}:
+      nameservers:
+        addresses: [$DC_DNS_IP]
+        search: [$DOMAIN]
+EOF
+            chmod 0600 "$_netplan_dropin"
+            netplan apply 2>/dev/null || log_info "⚠ netplan apply failed - manual review recommended"
+            log_info "✅ DNS configured via Netplan ($_netplan_dropin)"
+            _dns_configured=true
+        fi
+    fi
+
+    # Method 4: dhclient hook (Debian/Ubuntu with traditional DHCP)
+    if ! $_dns_configured && [[ -d /etc/dhcp/dhclient-enter-hooks.d ]]; then
+        log_info "🔧 dhclient detected - configuring DNS via hook"
+
+        _dhclient_hook="/etc/dhcp/dhclient-enter-hooks.d/ad-dns"
+        if $VALIDATE_ONLY; then
+            log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would create $_dhclient_hook"
+            _dns_configured=true
+        elif $DRY_RUN; then
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would create $_dhclient_hook"
+            _dns_configured=true
+        else
+            write_file 0755 "$_dhclient_hook" <<EOF
+#!/bin/bash
+# Managed by linux-ad-domain-join.sh - prepend AD DNS server
+make_resolv_conf() {
+    echo "nameserver $DC_DNS_IP" > /etc/resolv.conf
+    echo "search $DOMAIN" >> /etc/resolv.conf
+    if [ -n "\$new_domain_name_servers" ]; then
+        for ns in \$new_domain_name_servers; do
+            [ "\$ns" != "$DC_DNS_IP" ] && echo "nameserver \$ns" >> /etc/resolv.conf
+        done
+    fi
+}
+EOF
+            log_info "✅ DNS configured via dhclient hook ($_dhclient_hook)"
+            _dns_configured=true
+        fi
+    fi
+
+    # Method 5: Static /etc/resolv.conf (fallback for minimal systems)
+    if ! $_dns_configured; then
+        log_info "🔧 Fallback: configuring DNS directly in /etc/resolv.conf"
+
+        RESOLV_CONF="/etc/resolv.conf"
+        if $VALIDATE_ONLY; then
+            log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would update $RESOLV_CONF with DNS $DC_DNS_IP"
+            _dns_configured=true
+        elif $DRY_RUN; then
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would update $RESOLV_CONF with DNS $DC_DNS_IP"
+            _dns_configured=true
+        else
+            _file_ensure_mutable "$RESOLV_CONF"
+
+            # Backup current resolv.conf
+            backup_file "$RESOLV_CONF"
+
+            # Check if already configured
+            if ! grep -qE "^nameserver[[:space:]]+${DC_DNS_IP//./\\.}([[:space:]]|$)" "$RESOLV_CONF" 2>/dev/null; then
+                # Prepend DC DNS to existing config
+                _tmp_resolv="$(mktemp)"
+                {
+                    echo "# Managed by linux-ad-domain-join.sh"
+                    echo "nameserver $DC_DNS_IP"
+                    echo "search $DOMAIN"
+                    # Keep existing nameservers (excluding DC to avoid duplicates)
+                    grep -E '^nameserver[[:space:]]' "$RESOLV_CONF" 2>/dev/null | grep -v "$DC_DNS_IP" | head -n 2 || true
+                } > "$_tmp_resolv"
+                cat "$_tmp_resolv" > "$RESOLV_CONF"
+                rm -f "$_tmp_resolv"
+                log_info "✅ DNS configured in $RESOLV_CONF"
+            else
+                log_info "✅ DNS already configured in $RESOLV_CONF"
+            fi
+
+            _file_restore_attr "$RESOLV_CONF"
+            _dns_configured=true
+        fi
+    fi
+fi
+
+if $_dns_configured; then
+    log_info "✅ DNS persistence configuration complete"
+else
+    log_info "⚠ DNS persistence could not be automatically configured - manual configuration may be required"
+fi
+
 # Pre-check: verify DNS and KDC connectivity
 log_info "🔎 Performing pre-check for DNS and KDC reachability"
 
@@ -2228,27 +2811,79 @@ fi
 log_info "✅ DNS and KDC reachability OK"
 
 # -------------------------------------------------------------------------
-# Secret handling: DOMAIN_PASS (no args exposure; auto-clean on exit)
+# Time skew pre-check (fail fast before Kerberos - max 300s allowed by AD)
 # -------------------------------------------------------------------------
+log_info "🕒 Checking system clock skew before Kerberos authentication"
+_time_skew_ok=false
+
+# Strategy 1: ntpdate -q (query only, no adjustment)
+if command -v ntpdate >/dev/null 2>&1 && [[ -n "${NTP_SERVER:-}" ]]; then
+    _ntp_out="$(timeout 10 ntpdate -q "$NTP_SERVER" 2>/dev/null || true)"
+    _ntp_offset="$(echo "$_ntp_out" | awk '/offset/ {for(i=1;i<=NF;i++) if($i=="offset") print $(i+1)}' | tail -n1)"
+    if [[ -n "$_ntp_offset" ]]; then
+        # Convert to absolute integer seconds
+        _abs_offset="$(echo "$_ntp_offset" | awk '{v=($1<0)?-$1:$1; printf "%d", v}')"
+        if (( _abs_offset > 300 )); then
+            log_info "⚠ System clock skew is ${_ntp_offset}s (max 300s for Kerberos)"
+            log_info "🔄 Attempting forced time sync via ntpdate"
+            if ! $DRY_RUN && ! $VALIDATE_ONLY; then
+                ntpdate -u "$NTP_SERVER" >/dev/null 2>&1 && log_info "✅ Time synchronized via ntpdate" \
+                    || log_info "⚠ ntpdate sync failed; Kerberos may reject authentication"
+            fi
+        else
+            log_info "✅ Clock skew within tolerance (${_ntp_offset}s)"
+            _time_skew_ok=true
+        fi
+    fi
+fi
+
+# Strategy 2: HTTP Date header from DC (fallback when ntpdate unavailable)
+if ! $_time_skew_ok && command -v curl >/dev/null 2>&1; then
+    _http_date="$(timeout 5 curl -sI "http://${DC_SERVER}/" 2>/dev/null | awk -F': ' '/^[Dd]ate:/{print $2}' | tr -d '\r')"
+    if [[ -n "$_http_date" ]]; then
+        _remote_epoch="$(date -d "$_http_date" +%s 2>/dev/null || true)"
+        _local_epoch="$(date +%s)"
+        if [[ -n "$_remote_epoch" ]]; then
+            _diff=$(( _local_epoch - _remote_epoch ))
+            _abs_diff=$(( _diff < 0 ? -_diff : _diff ))
+            if (( _abs_diff > 300 )); then
+                log_info "⚠ Clock skew detected via HTTP Date header: ${_diff}s (max 300s for Kerberos)"
+            else
+                log_info "✅ Clock skew within tolerance (${_diff}s, via HTTP header)"
+                _time_skew_ok=true
+            fi
+        fi
+    fi
+fi
+
+if ! $_time_skew_ok; then
+    log_info "ℹ Time skew check inconclusive (ntpdate/curl unavailable or failed); proceeding"
+fi
+
+# Create secure password file (tmpfs, 0600, no TOCTOU race, no ps exposure)
 create_secret_passfile() {
     local old_umask
-    old_umask="$(umask)"              # Save current umask
-    trap 'umask "$old_umask"; trap - RETURN' RETURN  # Restore umask when the function returns
+    old_umask="$(umask)"              # Save current umask for restoration
+    trap 'umask "$old_umask"; trap - RETURN' RETURN  # Restore umask when function returns
 
-    umask 077                         # Secure temp file permissions for this function only
+    # Set umask to 077 (file permissions will be 0600 = rw-------)
+    # This prevents TOCTOU race conditions by ensuring secure permissions at creation time
+    umask 077
 
-    # Prefer tmpfs (best-effort), fallback to /tmp for legacy
+    # Prefer tmpfs-backed directories (memory-only, no disk writes)
+    # Fallback to /tmp for legacy systems or containers without tmpfs
     local base=""
     if [[ -d /run && -w /run ]]; then
-        base="/run"
+        base="/run"                   # systemd standard tmpfs location
     elif [[ -d /dev/shm && -w /dev/shm ]]; then
-        base="/dev/shm"
+        base="/dev/shm"               # POSIX shared memory tmpfs
     else
-        base="/tmp"
+        base="/tmp"                   # Legacy fallback (may be disk-backed)
     fi
 
+    # Create temp file with secure permissions (0600) atomically via umask
+    # No separate chmod needed - umask 077 ensures correct permissions at creation
     PASS_FILE="$(mktemp "${base}/.adjoin.pass.XXXXXX")" || log_error "Failed to create PASS_FILE in ${base}" 1
-    chmod 600 "$PASS_FILE" 2>/dev/null || true
 
     # Store password as a single line (no trailing newline).
     # OpenLDAP -y reads the entire file as password; newline/CR would be treated as part of the secret.
@@ -2270,7 +2905,8 @@ create_secret_passfile() {
 }
 
 cleanup_secrets() {
-    # Close any stray FDs if you add them later; keep simple now.
+    # Restore immutable bits on any files we unlocked
+    _file_restore_all_attrs 2>/dev/null || true
 
     # Best-effort secure delete
     if [[ -n "${PASS_FILE:-}" && -f "${PASS_FILE:-}" ]]; then
@@ -2353,8 +2989,7 @@ rm -f "$KRB_TRACE"
 #fi
 
 # -------------------------------------------------------------------------
-# Build BASE_DN and normalize OU format
-# -------------------------------------------------------------------------
+# Convert DNS domain to LDAP DN: "example.com" -> "DC=EXAMPLE,DC=COM"
 DOMAIN_DN=$(awk -F'.' '{
     for (i = 1; i <= NF; i++) printf "%sDC=%s", (i>1?",":""), toupper($i)
 }' <<< "$DOMAIN")
@@ -2440,11 +3075,12 @@ if [[ -n "$REALM_JOINED" ]]; then
 
         cmd_try "${REALM_LEAVE_CMD[@]}"
         REALMLEAVE_RC=$CMD_LAST_RC
-	
+
+        # Defensive initialization for set -u
         if [ -z "${REALMLEAVE_RC+x}" ]; then
-			REALMLEAVE_RC=0
-		fi
-		
+            REALMLEAVE_RC=0
+        fi
+
         if [[ $REALMLEAVE_RC -eq 0 ]]; then
             log_info "✅ Successfully left current realm."
         else
@@ -2815,45 +3451,18 @@ services:	files
 netgroup:	files
 EOF
 
-    chown root:root "$NSS_FILE" 2>/dev/null || true
-    umask "$old_umask"                # Restore umask for the rest of the script
+    if ! $DRY_RUN && ! $VALIDATE_ONLY; then
+        chown root:root "$NSS_FILE" 2>/dev/null || true
+    fi
+    umask "$old_umask"
 fi
 
 # Basic access checks (after creation above to avoid false negatives)
 [[ -r "$NSS_FILE" ]] || log_error "Cannot read $NSS_FILE - verify overlay/permissions." 1
 [[ -w "$(dirname "$NSS_FILE")" ]] || log_error "NSS path $(dirname "$NSS_FILE") is not writable (read-only filesystem)." 1
 
-# -------------------------------------------------------------------------
-# ROBUST IMMUTABILITY DETECTION (lsattr/chattr)
-# -------------------------------------------------------------------------
-if command -v lsattr >/dev/null 2>&1; then
-    # Temporarily disable -e to tolerate unsupported filesystems (e.g., XFS, Btrfs)
-    set +e
-    LSATTR_SUPPORTED=false
-
-    # Test whether lsattr can actually operate on the target file
-    if lsattr -d -- "$NSS_FILE" >/dev/null 2>&1; then
-        LSATTR_SUPPORTED=true
-    fi
-
-    # Re-enable strict error mode
-    set -e
-
-    if $LSATTR_SUPPORTED; then
-        log_info "🧩 Filesystem supports lsattr - checking for immutable attribute"
-
-        # Extract flags safely; tolerate legacy lsattr output or missing fields
-        LSATTR_FLAGS="$(lsattr -d -- "$NSS_FILE" 2>/dev/null | awk '{print $1}' || true)"
-
-        if [[ -n "$LSATTR_FLAGS" ]] && echo "$LSATTR_FLAGS" | grep -q 'i'; then
-            log_error "$NSS_FILE is immutable (chattr +i). Remove the immutable bit to proceed." 1
-        fi
-    else
-        log_info "ℹ lsattr operation not supported by the underlying filesystem - skipping immutability check"
-    fi
-else
-    log_info "ℹ lsattr not available on this system - skipping immutability check"
-fi
+# Ensure nsswitch.conf is mutable before editing (auto-restores via cleanup trap)
+_file_ensure_mutable "$NSS_FILE"
 
 # Normalize line endings (CRLF-safe) before backup
 if $DRY_RUN; then
@@ -2874,26 +3483,28 @@ backup_file "$NSS_FILE"
 NSS_EDIT="$NSS_FILE"
 NSS_EDIT_TMP=""
 
-if $DRY_RUN; then
+# VALIDATE_ONLY and DRY_RUN both work on a temp copy to avoid modifying the real file
+if $DRY_RUN || $VALIDATE_ONLY; then
     NSS_EDIT_TMP="$(mktemp "/tmp/nsswitch.conf.XXXXXX")"
     if [[ -f "$NSS_FILE" ]]; then
-        backup_file "$NSS_EDIT_TMP"
+        cp -p -- "$NSS_FILE" "$NSS_EDIT_TMP"
     else
         : >"$NSS_EDIT_TMP"
     fi
     NSS_EDIT="$NSS_EDIT_TMP"
 fi
 
+# All edits below operate on $NSS_EDIT (temp file in DRY_RUN/VALIDATE_ONLY, real file otherwise).
+# Direct sed/awk is used intentionally to bypass cmd_must suppression on temp files.
 for key in passwd shadow group services netgroup; do
     pattern="^[[:space:]]*${key}:"
 
-    # 1. Ensure file exists (work file)
     [ -f "$NSS_EDIT" ] || : >"$NSS_EDIT"
 
-    # 2. Normalize whitespace early (work file)
-    cmd_must sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
+    # Normalize whitespace (work file)
+    sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
 
-    # 3. Remove duplicate entries (preserve first non-commented)
+    # Remove duplicate entries (preserve first non-commented)
     if grep -Eq "${pattern}" "$NSS_EDIT"; then
         awk -v key="${key}" '
             BEGIN {found=0}
@@ -2906,21 +3517,21 @@ for key in passwd shadow group services netgroup; do
         ' "$NSS_EDIT" > "${NSS_EDIT}.tmp" && mv "${NSS_EDIT}.tmp" "$NSS_EDIT"
     fi
 
-    # 4. Skip if entry already includes 'sss'
+    # Skip if entry already includes 'sss'
     if grep -Eq "${pattern}[^#]*[[:space:]]sss([[:space:]]|\$)" "$NSS_EDIT"; then
         $VERBOSE && log_info "ℹ️ '${key}' already includes sss"
         continue
     fi
 
-    # 5. If entry exists but lacks 'sss', patch it
+    # If entry exists but lacks 'sss', patch it
     if grep -qE "${pattern}[^#]*" "$NSS_EDIT"; then
         log_info "🧩 Updating existing '${key}' entry to include sss"
-        # shellcheck disable=SC2086  # SED_EXT must expand to -E/-r
-        cmd_must sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_EDIT"
-        cmd_must sed -i \
+        # shellcheck disable=SC2086
+        sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_EDIT"
+        sed -i \
             -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
             -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_EDIT"
-        cmd_must sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_EDIT"
+        sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_EDIT"
         log_info "✅ '${key}' updated"
     else
         printf '%s\n' "${key}: files sss" >>"$NSS_EDIT"
@@ -2939,21 +3550,26 @@ if ! grep -qE '^passwd:[^#]*sss' "$NSS_EDIT" || ! grep -qE '^group:[^#]*sss' "$N
 fi
 
 # -------------------------------------------------------------------------
-# Commit (only when not DRY-RUN)
+# Commit (only when not DRY-RUN and not VALIDATE_ONLY)
 # -------------------------------------------------------------------------
 if $DRY_RUN; then
     log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would update $NSS_FILE with NSS/SSSD mappings (preview):"
-    # Read via process substitution to avoid pipefail abort when grep finds no matches
     while IFS= read -r l || [[ -n "$l" ]]; do
         [[ -n "$l" ]] && log_info "   $l"
     done < <(grep -E '^(passwd|shadow|group|services|netgroup):' "$NSS_EDIT" 2>/dev/null || true)
+elif $VALIDATE_ONLY; then
+    log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} NSS/SSSD mappings validated (no changes applied to $NSS_FILE)"
 else
-    # NSS_EDIT may already be NSS_FILE in non-DRY-RUN mode; avoid cp same-file failure.
+    # Real mode: commit temp work to actual file
     if [[ "$NSS_EDIT" != "$NSS_FILE" ]]; then
         backup_file "$NSS_FILE"
+        cp -p -- "$NSS_EDIT" "$NSS_FILE"
     fi
     command -v restorecon >/dev/null 2>&1 && cmd_try restorecon -F "$NSS_FILE" || true
 fi
+
+# Restore immutable bit if it was originally set
+_file_restore_attr "$NSS_FILE"
 
 # Optional runtime sanity checks (non-blocking)
 if ! timeout 5 getent passwd root >/dev/null 2>&1; then
@@ -3220,10 +3836,9 @@ EOF
         log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would update $chrony_conf with embedded managed block (preview suppressed)"
         rm -f "$tmp_chrony"
     else
-        # Keep ownership/perms sane
         chown root:root "$tmp_chrony" 2>/dev/null || true
         chmod 644 "$tmp_chrony" 2>/dev/null || true
-        mv -f "$tmp_chrony" "$chrony_conf"
+        mv -f "$tmp_chrony" "$chrony_conf" || log_error "Failed to install chrony config: $chrony_conf" 1
     fi
 fi
 
@@ -3325,8 +3940,8 @@ if $VALIDATE_ONLY; then
     log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Skipping active sync wait"
 else
     if $has_waitsync; then
-        # Best-effort: if waitsync fails, we fall back to manual polling.
-        cmd_try timeout 45 chronyc -a waitsync 45 0.5 >/dev/null 2>&1 || true
+        # Use timeout with SIGKILL fallback for stubborn processes
+        cmd_try timeout --signal=KILL 50 timeout 45 chronyc -a waitsync 45 0.5 >/dev/null 2>&1 || true
     fi
 
     # Manual polling (works everywhere)
@@ -3393,7 +4008,7 @@ if $VERBOSE; then
     set +e
     LDAP_RAW=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
       -H "ldap://${LDAP_SERVER}" \
-      -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U}\$)" distinguishedName 2>&1)
+      -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U_ESCAPED}\$)" distinguishedName 2>&1)
     LDAP_CODE=$?
     set -e
 
@@ -3410,7 +4025,7 @@ log_info "🔍 Checking if computer object exists in AD"
 # Perform search allowing non-fatal exit codes (e.g. not found)
 set +e
 LDAP_OUT=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
-  -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U}\$)" distinguishedName 2>/dev/null)
+  -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U_ESCAPED}\$)" distinguishedName 2>/dev/null)
 LDAP_CODE=$?
 set -e
 
@@ -3440,22 +4055,22 @@ EOF
         # -------------------------------------------------------------------------
         # SAFETY ZONE: OU Move Operation (Handle Permission Denied Gracefully)
         # -------------------------------------------------------------------------
-        # Temporarily disable global error trap to prevent script abort on LDAP error
-        trap - ERR
-        set +e
-
-        if $VERBOSE; then
-            ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF"
-            LDAP_MOVE_CODE=$?
+        LDAP_MOVE_CODE=0
+        if $DRY_RUN; then
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would move computer object via ldapmodify"
         else
-            ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1
-            LDAP_MOVE_CODE=$?
+            trap - ERR
+            set +e
+            if $VERBOSE; then
+                ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF"
+                LDAP_MOVE_CODE=$?
+            else
+                ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1
+                LDAP_MOVE_CODE=$?
+            fi
+            set -e
+            trap "$ERROR_TRAP_CMD" ERR
         fi
-
-        # Restore global error trap immediately
-        set -e
-        trap "$ERROR_TRAP_CMD" ERR
-        # -------------------------------------------------------------------------
 
         rm -f "$TMP_LDIF"
 
@@ -3581,32 +4196,48 @@ description: [${HOST_IP}] - Joined with adcli by ${DOMAIN_USER} on ${timestamp}
 EOF
     if $DRY_RUN; then
         log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would update AD description via ldapmodify (execution suppressed)."
-        true
-    elif ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1; then
-        log_info "✅ Description updated successfully in AD"
     else
-        log_info "⚠️ Unable to update AD description (check permissions or ticket validity)"
+        # Retry with backoff to tolerate AD replication delay
+        _desc_ok=false
+        for _desc_attempt in 1 2 3; do
+            if ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1; then
+                log_info "✅ Description updated successfully in AD"
+                _desc_ok=true
+                break
+            fi
+            if (( _desc_attempt < 3 )); then
+                log_info "⚠ AD description update failed (attempt ${_desc_attempt}/3, retrying in 5s)"
+                sleep 5
+            fi
+        done
+        $_desc_ok || log_info "⚠️ Unable to update AD description after 3 attempts (check permissions or ticket validity)"
     fi
     rm -f "$TMP_LDIF"
 else
     log_info "⚠️ Unable to detect host IP for AD description update"
 fi
 
-# Read the current msDS-KeyVersionNumber (to validate keytab update)
-set +e +o pipefail
-MSDS_KVNO=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
-    -H "ldap://${LDAP_SERVER}" \
-    -b "CN=${HOST_SHORT_U},${OU}" msDS-KeyVersionNumber 2>/dev/null | \
-    awk '/^msDS-KeyVersionNumber:/ {print $2}' | head -n1)
-LDAP_RC=$?
-set -e -o pipefail
+# Read the current msDS-KeyVersionNumber with retry (tolerates AD replication delay)
+MSDS_KVNO=""
+for _kvno_attempt in 1 2 3; do
+    set +e +o pipefail
+    MSDS_KVNO=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
+        -H "ldap://${LDAP_SERVER}" \
+        -b "CN=${HOST_SHORT_U},${OU}" msDS-KeyVersionNumber 2>/dev/null | \
+        awk '/^msDS-KeyVersionNumber:/ {print $2}' | head -n1)
+    LDAP_RC=$?
+    set -e -o pipefail
 
-if [[ $LDAP_RC -ne 0 || -z "$MSDS_KVNO" ]]; then
-    log_info "⚠️ Unable to read msDS-KeyVersionNumber from AD (replication or Kerberos cache delay)"
-    MSDS_KVNO="Unknown"
-else
-    log_info "ℹ️ msDS-KeyVersionNumber in AD: ${MSDS_KVNO}"
-fi
+    if [[ $LDAP_RC -eq 0 && -n "$MSDS_KVNO" ]]; then
+        log_info "ℹ️ msDS-KeyVersionNumber in AD: ${MSDS_KVNO}"
+        break
+    fi
+    if (( _kvno_attempt < 3 )); then
+        log_info "⚠ msDS-KeyVersionNumber not available yet (attempt ${_kvno_attempt}/3, retrying in 5s)"
+        sleep 5
+    fi
+done
+[[ -z "$MSDS_KVNO" ]] && { MSDS_KVNO="Unknown"; log_info "⚠️ Unable to read msDS-KeyVersionNumber from AD after 3 attempts"; }
 
 # Clean up temporary Kerberos ticket
 kdestroy -q 2>/dev/null || true
@@ -4381,32 +5012,34 @@ tmp_sudo="$(mktemp)"
 includedir_present=false
 
 while IFS= read -r line || [[ -n "$line" ]]; do
-    # Remove any explicit "#include /etc/sudoers.d/..." lines
-    if [[ "$line" =~ ^[[:space:]]*#include[[:space:]]+/etc/sudoers\.d/ ]]; then
-        # Skipping explicit include to rely on #includedir instead
+    # Remove any explicit "#include /etc/sudoers.d/..." lines (per-file includes)
+    if [[ "$line" =~ ^[[:space:]]*[#@]include[[:space:]]+/etc/sudoers\.d/ ]]; then
         continue
     fi
 
-    # Detect existing "#includedir /etc/sudoers.d" or "@includedir /etc/sudoers.d"
+    # Detect active "#includedir /etc/sudoers.d" or "@includedir /etc/sudoers.d"
     if [[ "$line" =~ ^[[:space:]]*[@#]includedir[[:space:]]+/etc/sudoers\.d ]]; then
+        includedir_present=true
+    fi
+
+    # Fix incorrectly commented includedir (e.g. "# #includedir" or "## #includedir")
+    if [[ "$line" =~ ^[[:space:]]*#+[[:space:]]*[#@]includedir[[:space:]]+/etc/sudoers\.d ]]; then
+        line="#includedir /etc/sudoers.d"
         includedir_present=true
     fi
 
     echo "$line" >>"$tmp_sudo"
 done <"$SUDOERS_MAIN"
 
-# If no includedir was found, append it at the end with a short comment
+# If no includedir was found, append it
 if [[ "$includedir_present" == false ]]; then
-    # Use sequential echo commands appended to the temp file
     echo "" >>"$tmp_sudo"
-    echo "# Include all drop-in sudoers policies" >>"$tmp_sudo"
-    echo "# This is the preferred way to manage role-based sudo rules." >>"$tmp_sudo"
     echo "#includedir /etc/sudoers.d" >>"$tmp_sudo"
 fi
 
-# Align temporary sudoers file permissions/ownership with visudo expectations
+# Align temporary sudoers file permissions (required for visudo validation)
 chown root:root "$tmp_sudo" 2>/dev/null || true
-chmod 440 "$tmp_sudo"
+chmod 440 "$tmp_sudo" || log_error "Failed to set permissions on temporary sudoers file" 1
 
 # Validate new sudoers before committing (Capture output for detailed error logging)
 log_info "🔍 Validating temporary sudoers configuration..."
@@ -4525,7 +5158,7 @@ else
 
 	log_info "⚙️ Updating rules"
 
-	for f in "${FILES[@]}"; do
+    for f in "${FILES[@]}"; do
 		declare -a patched=()
 		declare -a compliant=()
 
@@ -4540,8 +5173,25 @@ else
 				good_all="%${grp} ALL=(ALL:ALL) ALL, !ROOT_SHELLS"
 				good_npw="%${grp} ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS"
 
-				pat_all="^%${grp}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+ALL$"
-				pat_npw="^%${grp}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]+ALL$"
+				# Escape regex metacharacters in group name for safe pattern matching
+				grp_escaped="$grp"
+				grp_escaped="${grp_escaped//\\/\\\\}"  # Escape backslashes first
+				grp_escaped="${grp_escaped//./\\.}"    # Escape dots (most common in AD groups)
+				grp_escaped="${grp_escaped//[/\\[}"    # Escape [
+				grp_escaped="${grp_escaped//]/\\]}"    # Escape ]
+				grp_escaped="${grp_escaped//*/\\*}"    # Escape *
+				grp_escaped="${grp_escaped//^/\\^}"    # Escape ^
+				grp_escaped="${grp_escaped//$/\\$}"    # Escape $
+				grp_escaped="${grp_escaped//+/\\+}"    # Escape +
+				grp_escaped="${grp_escaped//?/\\?}"    # Escape ?
+				grp_escaped="${grp_escaped//(/\\(}"    # Escape (
+				grp_escaped="${grp_escaped//)/\\)}"    # Escape )
+				grp_escaped="${grp_escaped//{/\\{}"    # Escape {
+				grp_escaped="${grp_escaped//}/\\}}"    # Escape }
+				grp_escaped="${grp_escaped//|/\\|}"    # Escape |
+
+				pat_all="^%${grp_escaped}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+ALL$"
+				pat_npw="^%${grp_escaped}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]+ALL$"
 
 				# Already compliant
 				if [[ "$line" == "$good_all" || "$line" == "$good_npw" ]]; then
@@ -4578,9 +5228,9 @@ else
 
 		done <"$f"
 
-		# Align temporary drop-in file permissions with visudo expectations
+		# Align temporary drop-in file permissions (required for visudo)
 		chown root:root "$tmp" 2>/dev/null || true
-		chmod 440 "$tmp"
+		chmod 440 "$tmp" || { rm -f "$tmp"; log_error "Failed to set permissions on $tmp" 1; }
 
 		# Validate syntax before committing changes
 		# Temporarily disable 'set -e' so a syntax error doesn't crash the script immediately
