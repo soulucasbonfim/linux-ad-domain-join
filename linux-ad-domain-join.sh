@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.9.5
+# Version:     2.9.6
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2860,7 +2860,8 @@ fi
 
 # Strategy 2: HTTP Date header from DC (fallback when ntpdate unavailable)
 if ! $_time_skew_ok && command -v curl >/dev/null 2>&1; then
-    _http_date="$(timeout 5 curl -sI "http://${DC_SERVER}/" 2>/dev/null | awk -F': ' '/^[Dd]ate:/{print $2}' | tr -d '\r')"
+    # FIX: Protect pipeline with || true to handle empty/missing Date header
+    _http_date="$(timeout 5 curl -sI "http://${DC_SERVER}/" 2>/dev/null | awk -F': ' '/^[Dd]ate:/{print $2}' | tr -d '\r' || true)"
     if [[ -n "$_http_date" ]]; then
         _remote_epoch="$(date -d "$_http_date" +%s 2>/dev/null || true)"
         _local_epoch="$(date +%s)"
