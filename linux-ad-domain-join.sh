@@ -175,6 +175,21 @@ if locale -a 2>/dev/null | grep -qiE '^(C\.UTF-8|en_US\.UTF-8|pt_BR\.UTF-8)$'; t
     fi
 fi
 
+# =========================================================================
+# Terminal Initialization & Screen Clear (MAXIMUM COMPATIBILITY)
+# =========================================================================
+init_terminal_safe() {
+    # Silently fail in non-interactive environments
+    [[ -t 1 ]] || return 0
+    
+    # Only use widely supported commands
+    clear 2>/dev/null || printf '\033[2J\033[H' 2>/dev/null || true
+    
+    return 0
+}
+
+init_terminal_safe || true
+
 # -------------------------------------------------------------------------
 # Log message sanitizer - replaces emojis with ASCII equivalents + colorization
 # -------------------------------------------------------------------------
@@ -540,13 +555,6 @@ else
 fi
 
 log_info "💾 Log file: $LOG_FILE"
-
-# -------------------------------------------------------------------------
-# Clear screen for clean output (interactive sessions only)
-# -------------------------------------------------------------------------
-if [[ -t 1 ]]; then
-    clear
-fi
 
 # -------------------------------------------------------------------------
 # Backup root (centralized) - one directory per execution
@@ -2198,10 +2206,9 @@ else
     log_info "📋 Configuring Administrative Groups"
     log_info "ℹ️  AD groups control sudo privileges and SSH access on this host."
     log_info "ℹ️  Two scopes are supported:"
-    log_info "    • Host-specific groups (e.g., grp-adm-hostname)"
-    log_info "    • Global groups (e.g., grp-adm-all-linux-servers)"
-    echo ""
-
+    log_info "    - Host-specific groups (e.g., grp-adm-hostname)"
+    log_info "    - Global groups (e.g., grp-adm-all-linux-servers)"
+    print_divider
     HOST_L=$(to_lower "$(hostname -s)")
 
     # ADM - Operational Administrators (host-specific)
