@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.9.3
+# Version:     2.9.4
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -368,18 +368,23 @@ validate_domain_name() {
 
 # Validate AD username: alphanumeric+._-, no leading/trailing dots/hyphens, max 256 chars
 validate_username() {
-    local username="${1:-}" user_part="${username:-}"
-
+    local username="${1:-}" user_part
+    
     [[ -z "$username" ]] && return 1
     (( ${#username} > 256 )) && { log_info "⚠ Username too long (max 256): $username"; return 1; }
 
     # Strip domain prefix: DOMAIN\user or user@domain
-    [[ "$username" =~ ^[^\\]+\\(.+)$ ]] && user_part="${BASH_REMATCH[1]}"
-    [[ "$username" =~ ^([^@]+)@.+$ ]] && user_part="${BASH_REMATCH[1]}"
+    if [[ "$username" =~ ^[^\\]+\\(.+)$ ]]; then
+        user_part="${BASH_REMATCH[1]}"
+    elif [[ "$username" =~ ^([^@]+)@.+$ ]]; then
+        user_part="${BASH_REMATCH[1]}"
+    else
+        # If no prefix, use the username as-is
+        user_part="$username"
+    fi
 
-    [[ ! "$user_part" =~ ^[A-Za-z0-9._-]+$ ]] && { log_info "⚠ Username has invalid chars: $user_part"; return 1; }
+    [[ ! "$user_part" =~ ^[A-Za-z0-9._-]+$ ]] && { log_info "⚠ Username has invalid characters: $user_part"; return 1; }
     
-    # FIX: Proteja $user_part com :- para set -u
     [[ "${user_part:-}" =~ ^[.-] ]] && { log_info "⚠ Username cannot start with . or -: $user_part"; return 1; }
     [[ "${user_part:-}" =~ [.-]$ ]] && { log_info "⚠ Username cannot end with . or -: $user_part"; return 1; }
 
