@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.0.0
+# Version:     3.0.1
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
