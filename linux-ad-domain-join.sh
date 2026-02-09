@@ -257,13 +257,19 @@ log_error() {
 # Read wrapper with safe emoji sanitization
 # -------------------------------------------------------------------------
 read_sanitized() {
-    local prompt sanitized var_name
-    prompt="$1"
-    var_name="$2"
-    local ts="${C_DIM}[$(date '+%F %T')]${C_RESET}"
+    local prompt sanitized var_name ts
+    prompt="${1:-}"
+    var_name="${2:-}"
+    
+    [[ -z "$var_name" ]] && log_error "read_sanitized: missing var_name" 1
+    
+    ts="${C_DIM}[$(date '+%F %T')]${C_RESET}"
     sanitized="$(sanitize_log_msg <<< "$prompt")"
     sanitized="$(colorize_tag "$sanitized")"
-    read -rp "${ts} ${sanitized}" "$var_name"
+    
+    # Use declare -n para referência segura com set -u
+    local -n __var_ref="$var_name"
+    read -rp "${ts} ${sanitized}" __var_ref
 }
 
 # -------------------------------------------------------------------------
