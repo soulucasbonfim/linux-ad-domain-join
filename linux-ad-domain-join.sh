@@ -3925,21 +3925,43 @@ EOF
 
             # Comment out existing time-sync directives that we are about to enforce
             # to prevent duplication and configuration ambiguity.
-            if [[ "$line" =~ ^[[:space:]]*(server|pool|driftfile|makestep|rtcsync|logdir)([[:space:]]|$) ]]; then
-                echo "# disabled-by-linux-ad-domain-join: $line" >>"$tmp_chrony"
+            if [[ "$line" =~ ^[[:space:]]*(server|pool|driftfile|makestep|rtcsync|logdir)([[:space:]]+|$) ]]; then
+                if [[ "$line" =~ disabled-by-linux-ad-domain-join: ]]; then
+                    echo "$line" >>"$tmp_chrony"
+                else
+                    echo "# disabled-by-linux-ad-domain-join: $line" >>"$tmp_chrony"
+                fi
             else
                 echo "$line" >>"$tmp_chrony"
             fi
         fi
     done <"$chrony_conf"
 
+    # Ensure a single blank line before our managed block (visual hygiene)
+    tail -n 1 "$tmp_chrony" 2>/dev/null | grep -q '^[[:space:]]*$' || echo "" >>"$tmp_chrony"
+
     {
-        echo ""
         echo "# BEGIN linux-ad-domain-join chrony"
         echo "$chrony_payload"
         echo "# END linux-ad-domain-join chrony"
         echo ""
     } >>"$tmp_chrony"
+
+
+    # Normalize excessive blank lines to keep config visually clean.
+    # Rule: collapse 2+ consecutive blank lines into a single blank line.
+    tmp_chrony_norm="$(mktemp)"
+    awk '
+        BEGIN { blank=0 }
+        /^[[:space:]]*$/ {
+            blank++
+            if (blank <= 1) print ""
+            next
+        }
+        { blank=0; print }
+    ' "$tmp_chrony" >"$tmp_chrony_norm"
+
+    mv -f "$tmp_chrony_norm" "$tmp_chrony"
 
     if $DRY_RUN; then
         log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would update $chrony_conf with embedded managed block (preview suppressed)"
