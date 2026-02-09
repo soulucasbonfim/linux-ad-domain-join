@@ -5372,7 +5372,7 @@ if command -v systemctl >/dev/null 2>&1; then
     # ---------------------------------------------------------------
     # SSSD service status (systemd)
     # ---------------------------------------------------------------
-    if systemctl list-unit-files | grep -q '^sssd\.service'; then
+    if systemctl list-unit-files "sssd.service" 2>/dev/null | grep -q 'sssd\.service'; then
         SSSD_STATUS=$(systemctl is-active sssd 2>/dev/null || echo "inactive")
     else
         pgrep sssd >/dev/null 2>&1 && SSSD_STATUS="active" || SSSD_STATUS="inactive"
@@ -5382,9 +5382,9 @@ if command -v systemctl >/dev/null 2>&1; then
     # ---------------------------------------------------------------
     # SSH service status (handle ssh vs sshd naming)
     # ---------------------------------------------------------------
-    if systemctl list-unit-files | grep -q '^ssh\.service'; then
+    if systemctl list-unit-files "ssh.service" 2>/dev/null | grep -q 'ssh\.service'; then
         SSH_STATUS=$(systemctl is-active ssh 2>/dev/null || echo "inactive")
-    elif systemctl list-unit-files | grep -q '^sshd\.service'; then
+    elif systemctl list-unit-files "sshd.service" 2>/dev/null | grep -q 'sshd\.service'; then
         SSH_STATUS=$(systemctl is-active sshd 2>/dev/null || echo "inactive")
     else
         # fallback for systems without standard ssh unit
