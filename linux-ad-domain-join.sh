@@ -3909,9 +3909,27 @@ EOF
             continue
         fi
 
-        # Preserve everything outside our managed block
+        # Preserve everything outside our managed block, but disable conflicting directives
         if (( in_managed == 0 )); then
-            echo "$line" >>"$tmp_chrony"
+            # Do not touch comments or blank lines
+            if [[ "$line" =~ ^[[:space:]]*# ]] || [[ -z "$line" ]]; then
+                echo "$line" >>"$tmp_chrony"
+                continue
+            fi
+
+            # Do not disable include/confdir statements (drop-in support)
+            if [[ "$line" =~ ^[[:space:]]*(include|confdir)[[:space:]]+ ]]; then
+                echo "$line" >>"$tmp_chrony"
+                continue
+            fi
+
+            # Comment out existing time-sync directives that we are about to enforce
+            # to prevent duplication and configuration ambiguity.
+            if [[ "$line" =~ ^[[:space:]]*(server|pool|driftfile|makestep|rtcsync|logdir)([[:space:]]|$) ]]; then
+                echo "# disabled-by-linux-ad-domain-join: $line" >>"$tmp_chrony"
+            else
+                echo "$line" >>"$tmp_chrony"
+            fi
         fi
     done <"$chrony_conf"
 
