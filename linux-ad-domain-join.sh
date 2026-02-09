@@ -368,7 +368,7 @@ validate_domain_name() {
 
 # Validate AD username: alphanumeric+._-, no leading/trailing dots/hyphens, max 256 chars
 validate_username() {
-    local username="$1" user_part="$username"
+    local username="${1:-}" user_part="${username:-}"
 
     [[ -z "$username" ]] && return 1
     (( ${#username} > 256 )) && { log_info "⚠ Username too long (max 256): $username"; return 1; }
@@ -379,9 +379,9 @@ validate_username() {
 
     [[ ! "$user_part" =~ ^[A-Za-z0-9._-]+$ ]] && { log_info "⚠ Username has invalid chars: $user_part"; return 1; }
     
-    # FIX: Separe as duas condições em regex distintas
-    [[ "$user_part" =~ ^[.-] ]] && { log_info "⚠ Username cannot start with . or -: $user_part"; return 1; }
-    [[ "$user_part" =~ [.-]$ ]] && { log_info "⚠ Username cannot end with . or -: $user_part"; return 1; }
+    # FIX: Proteja $user_part com :- para set -u
+    [[ "${user_part:-}" =~ ^[.-] ]] && { log_info "⚠ Username cannot start with . or -: $user_part"; return 1; }
+    [[ "${user_part:-}" =~ [.-]$ ]] && { log_info "⚠ Username cannot end with . or -: $user_part"; return 1; }
 
     return 0
 }
