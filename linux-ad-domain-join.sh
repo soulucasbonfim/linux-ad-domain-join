@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.9.8
+# Version:     3.0.0
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -96,7 +96,9 @@
 #   21 - AD account locked/disabled
 #   22 - AD password expired
 #   23 - AD principal not found
-#   19-21 - Internal script errors (backup, file operations, etc)
+#   30 - Backup directory creation failure
+#   31 - Parent directory creation failure
+#   32 - File copy/backup failure
 #  100 - Missing packages and system offline (no installation possible)
 #  101 - Unsupported Linux distribution
 #  127 - Command not found
@@ -108,6 +110,9 @@ scriptVersion="$(grep -m1 "^# Version:" "${BASH_SOURCE[0]:-$0}" 2>/dev/null | cu
 
 # Strict mode: fail fast, track errors, prevent unset vars, propagate pipe failures
 set -Eeuo pipefail
+
+# Ignore SIGPIPE (broken pipe) — prevents silent death when output is piped
+trap '' PIPE 2>/dev/null || true
 
 # Safe IFS: prevent word splitting issues (space-only IFS for controlled behavior)
 IFS=$' \t\n'
@@ -242,8 +247,19 @@ log_info() {
     local msg="$1"
     local ts="${C_DIM}[$(date '+%F %T')]${C_RESET}"
 
-    msg="$(sanitize_log_msg <<< "$msg")"
-    msg="$(colorize_tag "$msg")"
+    # Fast path: skip sanitization if no emoji bytes (0xE2-0xF0 range)
+    if [[ "$msg" == *$'\xe2'* || "$msg" == *$'\xf0'* ]]; then
+        msg="$(sanitize_log_msg <<< "$msg")"
+    fi
+
+    if (( ENABLE_COLORS )); then
+        msg="${msg//\[x\]/${C_RED}[x]${C_RESET}}"
+        msg="${msg//\[!\]/${C_YELLOW}[!]${C_RESET}}"
+        msg="${msg//\[+\]/${C_GREEN}[+]${C_RESET}}"
+        msg="${msg//\[i\]/${C_BLUE}[i]${C_RESET}}"
+        msg="${msg//\[>\]/${C_CYAN}[>]${C_RESET}}"
+        msg="${msg//\[\*\]/${C_MAGENTA}[*]${C_RESET}}"
+    fi
 
     echo "${ts} ${msg}" >&2
 }
@@ -282,7 +298,7 @@ read_sanitized() {
     sanitized="$(sanitize_log_msg <<< "$prompt")"
     sanitized="$(colorize_tag "$sanitized")"
     
-    # Use declare -n para referência segura com set -u
+    # Use declare -n for safe reference under set -u
     local -n __var_ref="$var_name"
     read -rp "${ts} ${sanitized}" __var_ref
 }
@@ -301,9 +317,8 @@ print_divider() {
     # Safety threshold — also catches non-numeric values
     [[ "$cols" =~ ^[0-9]+$ && "$cols" -ge 20 ]] || cols=80
 
-    # Divider generation + sync (com cor dim)
+    # Divider generation + sync (flush tee pipeline)
     sync
-    sleep 0.05
     printf '%s' "$C_DIM"
     printf '%*s\n' "$cols" '' | tr ' ' '-' >&2
     printf '%s' "$C_RESET"
@@ -368,6 +383,27 @@ ldap_escape_filter() {
     done
 
     printf '%s' "$output"
+}
+
+# Escape ERE (Extended Regular Expression) metacharacters for safe use in regex patterns
+regex_escape_ere() {
+    local s="$1"
+    # Escape backslash first (prevents double-escaping other characters)
+    s="${s//\\/\\\\}"
+    s="${s//./\\.}"
+    s="${s//\[/\\[}"
+    s="${s//\]/\\]}"
+    s="${s//\*/\\*}"
+    s="${s//^/\\^}"
+    s="${s//$/\\$}"
+    s="${s//+/\\+}"
+    s="${s//\?/\\?}"
+    s="${s//(/\\(}"
+    s="${s//)/\\)}"
+    s="${s//\{/\\{}"
+    s="${s//\}/\\}}"
+    s="${s//|/\\|}"
+    printf '%s' "$s"
 }
 
 # Validate DNS domain name (RFC 1035: FQDN, alphanumeric+hyphen, no leading/trailing dots/hyphens)
@@ -680,7 +716,7 @@ init_backup_dir() {
         return 0
     fi
 
-    mkdir -p -- "$BACKUP_DIR" || log_error "Failed to create backup directory: $BACKUP_DIR" 19
+    mkdir -p -- "$BACKUP_DIR" || log_error "Failed to create backup directory: $BACKUP_DIR" 30
     chmod 700 -- "$BACKUP_DIR" 2>/dev/null || true
     log_info "💾 Backup directory: $BACKUP_DIR"
 }
@@ -1217,18 +1253,14 @@ cmd_run() {
 CMD_LAST_RC=0
 
 cmd_try() {
-    # Assumption: this script uses only ERROR_TRAP_CMD as ERR trap.
-    # If a different ERR trap is set by the caller, cmd_try will NOT restore it.
-
     local rc=0
     local had_errexit=false
-    local restore_trap=false
+    local _prev_err_trap=""
 
     [[ $- == *e* ]] && had_errexit=true
 
-    if [[ -n "$(trap -p ERR)" ]]; then
-        restore_trap=true
-    fi
+    # Capture current ERR trap verbatim (not just existence)
+    _prev_err_trap="$(trap -p ERR)" || true
 
     trap - ERR
     set +e
@@ -1238,9 +1270,8 @@ cmd_try() {
 
     $had_errexit && set -e
 
-    if $restore_trap; then
-        : "${ERROR_TRAP_CMD:?ERROR_TRAP_CMD not set}"
-        trap "$ERROR_TRAP_CMD" ERR
+    if [[ -n "$_prev_err_trap" ]]; then
+        eval "$_prev_err_trap"
     fi
 
     CMD_LAST_RC=$rc
@@ -1388,17 +1419,17 @@ backup_file() {
     local __outvar="${2:-}"
 
     if [[ -z "$path" ]]; then
-        log_error "backup_file: missing path argument" 19
+        log_error "backup_file: missing path argument" 30
     fi
 
     # Prevent path traversal attacks
     if [[ "$path" == *".."* ]]; then
-        log_error "backup_file: path traversal detected in '$path'" 19
+        log_error "backup_file: path traversal detected in '$path'" 30
     fi
 
     # Validate outvar name if provided
     if [[ -n "$__outvar" && ! "$__outvar" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]]; then
-        log_error "backup_file: invalid output variable name: '$__outvar'" 19
+        log_error "backup_file: invalid output variable name: '$__outvar'" 30
     fi
 
     local rel="${path#/}"  # remove leading /
@@ -1425,7 +1456,7 @@ backup_file() {
         return 0
     fi
 
-    mkdir -p -- "$bak_dir" || log_error "Failed to create backup dir: $bak_dir" 20
+    mkdir -p -- "$bak_dir" || log_error "Failed to create backup dir: $bak_dir" 31
 
     # If we already backed up this file in this run, do not copy again
     if [[ -f "$bak" ]]; then
@@ -1449,7 +1480,7 @@ backup_file() {
     log_info "💾 Backing up: '$path' -> '$bak'" >&2
 
     # Perform the backup copy, preserving attributes
-    cp -p -- "$path" "$bak" || log_error "Failed to backup '$path' to '$bak'" 21
+    cp -p -- "$path" "$bak" || log_error "Failed to backup '$path' to '$bak'" 32
 
     if [[ -n "$__outvar" ]]; then
         printf -v "$__outvar" '%s' "$bak"
@@ -1474,7 +1505,7 @@ write_file() {
 
     local parent_dir
     parent_dir="$(dirname "$path")"
-    [[ -d "$parent_dir" ]] || mkdir -p "$parent_dir" || log_error "Failed to create parent directory: $parent_dir" 20
+    [[ -d "$parent_dir" ]] || mkdir -p "$parent_dir" || log_error "Failed to create parent directory: $parent_dir" 31
 
     _file_ensure_mutable "$path"
     install -m "$mode" -o root -g root -D /dev/stdin "$path"
@@ -2068,8 +2099,8 @@ if $NONINTERACTIVE; then
     HOST_L=$(to_lower "$(hostname -s)")
     ADM="${ADM_GROUP:-grp-adm-$HOST_L}"
     ADM_ALL="${ADM_GROUP_ALL:-grp-adm-all-linux-servers}"
-    SSH="${SSH_GROUP:-grp-ssh-$HOST_L}"
-    SSH_ALL="${SSH_GROUP_ALL:-grp-ssh-all-linux-servers}"
+    GRP_SSH="${SSH_GROUP:-grp-ssh-$HOST_L}"
+    GRP_SSH_ALL="${SSH_GROUP_ALL:-grp-ssh-all-linux-servers}"
     SEC="${SEC_GROUP:-grp-sec-$HOST_L}"
     SEC_ALL="${SEC_GROUP_ALL:-grp-sec-all-linux-servers}"
     SUPER="${SUPER_GROUP:-grp-super-$HOST_L}"
@@ -2086,7 +2117,7 @@ if $NONINTERACTIVE; then
     [[ -n "$PASSWORD_AUTHENTICATION" ]] || log_error "PASSWORD_AUTHENTICATION must be yes or no" 1
 
     # Validate group names
-    for grp_var in ADM ADM_ALL SSH SSH_ALL SEC SEC_ALL SUPER SUPER_ALL; do
+    for grp_var in ADM ADM_ALL GRP_SSH GRP_SSH_ALL SEC SEC_ALL SUPER SUPER_ALL; do
         grp_val="${!grp_var}"
         if ! validate_ad_group_name "$grp_val" "$grp_var"; then
             log_error "Invalid AD group name for $grp_var: $grp_val" 1
@@ -2097,8 +2128,8 @@ if $NONINTERACTIVE; then
     log_info "📋 Administrative groups configured:"
     log_info "   ADM (operational):     $ADM"
     log_info "   ADM_ALL (global):      $ADM_ALL"
-    log_info "   SSH (access):          $SSH"
-    log_info "   SSH_ALL (global):      $SSH_ALL"
+    log_info "   SSH (access):          $GRP_SSH"
+    log_info "   SSH_ALL (global):      $GRP_SSH_ALL"
     log_info "   SEC (security):        $SEC"
     log_info "   SEC_ALL (global):      $SEC_ALL"
     log_info "   SUPER (full):          $SUPER"
@@ -2127,8 +2158,6 @@ else
 
         break
     done
-    DOMAIN_LOWER="${DOMAIN,,}"
-    DOMAIN_UPPER="${DOMAIN^^}"
     DOMAIN_SHORT="$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')"
 
     # OU (optional, default filled)
@@ -2269,10 +2298,10 @@ else
     while true; do
         default_SSH="grp-ssh-$HOST_L"
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SSH group (access, host-specific) ${C_DIM}[default: ${default_SSH}]${C_RESET}: " "$(date '+%F %T')"
-        read -r SSH
-        SSH="${SSH:-$default_SSH}"
-        SSH="$(echo "$SSH" | xargs)"
-        if validate_ad_group_name "$SSH" "SSH"; then
+        read -r GRP_SSH
+        GRP_SSH="${GRP_SSH:-$default_SSH}"
+        GRP_SSH="$(echo "$GRP_SSH" | xargs)"
+        if validate_ad_group_name "$GRP_SSH" "GRP_SSH"; then
             break
         fi
         printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
@@ -2282,10 +2311,10 @@ else
     while true; do
         default_SSH_ALL="grp-ssh-all-linux-servers"
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SSH_ALL group (access, global) ${C_DIM}[default: ${default_SSH_ALL}]${C_RESET}: " "$(date '+%F %T')"
-        read -r SSH_ALL
-        SSH_ALL="${SSH_ALL:-$default_SSH_ALL}"
-        SSH_ALL="$(echo "$SSH_ALL" | xargs)"
-        if validate_ad_group_name "$SSH_ALL" "SSH_ALL"; then
+        read -r GRP_SSH_ALL
+        GRP_SSH_ALL="${GRP_SSH_ALL:-$default_SSH_ALL}"
+        GRP_SSH_ALL="$(echo "$GRP_SSH_ALL" | xargs)"
+        if validate_ad_group_name "$GRP_SSH_ALL" "GRP_SSH_ALL"; then
             break
         fi
         printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid group name. Please retry.\n" "$(date '+%F %T')"
@@ -2386,7 +2415,7 @@ PRIMARY_IFACE=""
 # Strategy 0: Source IP used to reach DC (most reliable: guarantees AD connectivity, handles multi-homed)
 DC_V4="$(getent ahostsv4 "$DC_SERVER" 2>/dev/null | awk 'NR==1{print $1; exit}')"
 
-# Fallback: se getent falha, tentar resolução via dig/host
+# Fallback: if getent fails, attempt resolution via dig/host
 if [[ -z "$DC_V4" || ! "$DC_V4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     DC_V4="$(dig +short "$DC_SERVER" 2>/dev/null | grep -E '^[0-9]+\.' | head -n1)" || true
 fi
@@ -2394,7 +2423,7 @@ if [[ -z "$DC_V4" || ! "$DC_V4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     DC_V4="$(host "$DC_SERVER" 2>/dev/null | awk '/has address/ {print $4; exit}')" || true
 fi
 
-# Se DC_SERVER já for um IP, usar diretamente
+# If DC_SERVER is already an IP address, use it directly
 if [[ -z "$DC_V4" && "$DC_SERVER" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     DC_V4="$DC_SERVER"
 fi
@@ -3043,16 +3072,6 @@ fi
 rm -f "$KRB_TRACE"
 
 # -------------------------------------------------------------------------
-# Self-Destruction Mechanism (Local Execution Safety Guard)
-# -------------------------------------------------------------------------
-#if [[ -f "$0" && -w "$0" ]]; then
-#    exec 3< "$0"             # Keep script loaded in memory
-#    rm -f -- "$0"            # Delete file from disk (cleanup)
-#else
-#    log_info "ℹ Skipping self-removal (script not a regular file: $0)"
-#fi
-
-# -------------------------------------------------------------------------
 # Convert DNS domain to LDAP DN: "example.com" -> "DC=EXAMPLE,DC=COM"
 DOMAIN_DN=$(awk -F'.' '{
     for (i = 1; i <= NF; i++) printf "%sDC=%s", (i>1?",":""), toupper($i)
@@ -3139,11 +3158,6 @@ if [[ -n "$REALM_JOINED" ]]; then
 
         cmd_try "${REALM_LEAVE_CMD[@]}"
         REALMLEAVE_RC=$CMD_LAST_RC
-
-        # Defensive initialization for set -u
-        if [ -z "${REALMLEAVE_RC+x}" ]; then
-            REALMLEAVE_RC=0
-        fi
 
         if [[ $REALMLEAVE_RC -eq 0 ]]; then
             log_info "✅ Successfully left current realm."
@@ -3385,7 +3399,7 @@ EOF
             elif $DRY_RUN; then
                 log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would restart $DBUS_SERVICE (detached) to heal oddjob D-Bus registration"
             else
-                # Executa restart desconectado para tentar sobreviver à queda do D-Bus se estiver via SSH
+                # Run detached restart to survive D-Bus drop when executing over SSH
                 nohup setsid bash -c "systemctl restart '$DBUS_SERVICE' >/dev/null 2>&1 < /dev/null" >/dev/null 2>&1 &
                 disown || true
                 sleep 3
@@ -3833,11 +3847,7 @@ fi
 # - logdir is optional; some minimal images don’t have it; harmless if absent.
 chrony_drift_dir="/var/lib/chrony"
 chrony_drift_file="/var/lib/chrony/drift"
-if [[ -d /var/lib/chrony ]]; then
-    :
-elif [[ -d /var/lib/chrony/ ]]; then
-    :
-elif [[ -d /var/lib/chrony-drift ]]; then
+if [[ -d /var/lib/chrony-drift && ! -d /var/lib/chrony ]]; then
     chrony_drift_dir="/var/lib/chrony-drift"
     chrony_drift_file="/var/lib/chrony-drift/drift"
 fi
@@ -4437,14 +4447,18 @@ else
             log_info "♻️ Computer object is disabled (userAccountControl=$UAC). Re-enabling..."
 
             NEW_UAC=$((UAC & ~2))  # Clear only the disable bit, preserve other flags
-            LDAP_OUT="/dev/null"
-            $VERBOSE && LDAP_OUT="/dev/stderr"
 
             if $DRY_RUN; then
                 log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would re-enable computer object via ldapmodify (execution suppressed)."
+            elif $VERBOSE; then
+                ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" <<EOF
+dn: CN=${HOST_SHORT_U},${OU}
+changetype: modify
+replace: userAccountControl
+userAccountControl: $NEW_UAC
+EOF
             else
-
-                ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" >"$LDAP_OUT" 2>&1 <<EOF
+                ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" >/dev/null 2>&1 <<EOF
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: userAccountControl
@@ -4750,7 +4764,7 @@ else
 fi
 
 # Build AllowGroups safely (skip empty or '(none)')
-ALLOW_GROUPS="$SSH $SSH_ALL $SSH_G root"
+ALLOW_GROUPS="$GRP_SSH $GRP_SSH_ALL $SSH_G root"
 if [[ -n "$GLOBAL_ADMIN_GROUPS" && "$GLOBAL_ADMIN_GROUPS" != "(none)" ]]; then
     ALLOW_GROUPS="$ALLOW_GROUPS $GLOBAL_ADMIN_GROUPS"
 fi
@@ -5264,21 +5278,7 @@ else
 				good_npw="%${grp} ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS"
 
 				# Escape regex metacharacters in group name for safe pattern matching
-				grp_escaped="$grp"
-				grp_escaped="${grp_escaped//\\/\\\\}"  # Escape backslashes first
-				grp_escaped="${grp_escaped//./\\.}"    # Escape dots (most common in AD groups)
-				grp_escaped="${grp_escaped//[/\\[}"    # Escape [
-				grp_escaped="${grp_escaped//]/\\]}"    # Escape ]
-                grp_escaped="${grp_escaped//\*/\\*}"   # Escape *
-				grp_escaped="${grp_escaped//^/\\^}"    # Escape ^
-				grp_escaped="${grp_escaped//$/\\$}"    # Escape $
-				grp_escaped="${grp_escaped//+/\\+}"    # Escape +
-                grp_escaped="${grp_escaped//\?/\\?}"   # Escape ?
-				grp_escaped="${grp_escaped//(/\\(}"    # Escape (
-				grp_escaped="${grp_escaped//)/\\)}"    # Escape )
-				grp_escaped="${grp_escaped//{/\\{}"    # Escape {
-				grp_escaped="${grp_escaped//}/\\}}"    # Escape }
-				grp_escaped="${grp_escaped//|/\\|}"    # Escape |
+				grp_escaped="$(regex_escape_ere "$grp")"
 
 				pat_all="^%${grp_escaped}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+ALL$"
 				pat_npw="^%${grp_escaped}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]+ALL$"
