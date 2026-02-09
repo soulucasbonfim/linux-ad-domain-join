@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     2.9.6
+# Version:     2.9.7
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -294,12 +294,12 @@ print_divider() {
     local cols
 
     # Terminal width detection with multiple fallbacks
-    cols=$(tput cols 2>/dev/null ||
-           stty size 2>/dev/null | awk '{print $2}' ||
-           echo 80)
+    cols=$(tput cols 2>/dev/null) || \
+    cols=$(stty size 2>/dev/null | awk '{print $2}') || \
+    cols=""
 
-    # Safety threshold
-    [[ -z "$cols" || "$cols" -lt 20 ]] && cols=80
+    # Safety threshold — also catches non-numeric values
+    [[ "$cols" =~ ^[0-9]+$ && "$cols" -ge 20 ]] || cols=80
 
     # Divider generation + sync (com cor dim)
     sync
@@ -353,17 +353,17 @@ ldap_escape_filter() {
     local input="$1"
     local output=""
     local char
+    local i
 
-    # Process each character individually
     for (( i=0; i<${#input}; i++ )); do
         char="${input:$i:1}"
         case "$char" in
-            '(')  output+='\28' ;;    # Left parenthesis
-            ')')  output+='\29' ;;    # Right parenthesis
-            '\')  output+='\5c' ;;    # Backslash
-            '*')  output+='\2a' ;;    # Asterisk (wildcard)
-            $'\0') output+='\00' ;;   # NUL byte
-            *)    output+="$char" ;;  # Pass-through safe characters
+            '(')   output+='\28' ;;
+            ')')   output+='\29' ;;
+            \\)    output+='\5c' ;;
+            '*')   output+='\2a' ;;
+            $'\0') output+='\00' ;;
+            *)     output+="$char" ;;
         esac
     done
 
@@ -469,6 +469,7 @@ DRY_RUN="${DRY_RUN:-false}"
 NONINTERACTIVE="${NONINTERACTIVE:-false}"
 VERBOSE="${VERBOSE:-false}"
 VALIDATE_ONLY="${VALIDATE_ONLY:-false}"
+LDAP_TIMEOUT="${LDAP_TIMEOUT:-30}"
 
 # -------------------------------------------------------------------------
 # Logging + Backup roots (after flags/defaults)
@@ -651,7 +652,9 @@ service_control() {
                 ;;
             enable|disable|enable-now)
                 log_info "⚠ Service $svc_name must be enabled manually (no service management tools found)"
-                [[ "$action" == "enable-now" ]] && "/etc/init.d/$svc_name" start || true
+                if [[ "$action" == "enable-now" ]]; then
+                    "/etc/init.d/$svc_name" start || true
+                fi
                 rc=0
                 ;;
             *)
@@ -707,7 +710,9 @@ backup_prune_old_runs() {
 
     if (( total > keep )); then
         tail -n +"$((keep+1))" "$tmp_list" | awk '{print $2}' | while IFS= read -r d || [[ -n "$d" ]]; do
-            [[ -n "$d" ]] && rm -rf -- "$d" || true
+            if [[ -n "$d" ]]; then
+                rm -rf -- "$d" 2>/dev/null || true
+            fi
         done
     fi
 
@@ -736,8 +741,8 @@ normalize_yes_no() {
     local v
     v="$(to_lower "${1:-}" | xargs)"
     case "$v" in
-        y|yes|s|sim) echo "yes" ;;
-        n|no|nao|não) echo "no" ;;
+        y|yes|s|sim|true|1|on)    echo "yes" ;;
+        n|no|nao|não|false|0|off) echo "no"  ;;
         *) echo "" ;;
     esac
 }
@@ -829,7 +834,10 @@ sshd_set_directive_dedup() {
         }
         {
             if (in_match==0) {
-                if ($0 ~ "^[[:space:]]*"k"[[:space:]]+") next
+                line = $0
+                sub(/^[[:space:]]+/, "", line)
+                n = split(line, parts, /[[:space:]]+/)
+                if (n >= 1 && parts[1] == k) next
             }
             print
         }
@@ -1017,7 +1025,6 @@ parse_pkg_error() {
 }
 
 print_cmd_quoted() {
-    # Shell-escaped single-line representation (no trailing space)
     local a out=()
     for a in "$@"; do
         out+=( "$(printf '%q' "$a")" )
@@ -1335,11 +1342,11 @@ safe_realm_list() {
         log_info "ℹ realmd not installed; skipping realm enumeration" >&2
     else
         # Execute with timeout; suppress DBus activation logs
-        timeout "$timeout_s" bash -c 'realm list 2>/dev/null' >"$tmp_out" 2>/dev/null || true
-        local code=$?
+        local code=0
+        timeout "$timeout_s" bash -c 'realm list 2>/dev/null' >"$tmp_out" 2>/dev/null || code=$?
         if (( code != 0 )); then
             log_info "ℹ realm list timed out or failed (code $code)" >&2
-            echo "" > "$tmp_out"
+            : > "$tmp_out"
         fi
     fi
 
@@ -1685,7 +1692,9 @@ get_major_version_id() {
     if [[ "$v" =~ ^[0-9]+$ ]]; then
         echo "$v"; return 0
     fi
+    log_info "⚠ Could not determine major version from VERSION_ID='$VERSION_ID'" >&2
     echo 0
+    return 1  # ← Sinalizar falha
 }
 
 # -------------------------------------------------------------------------
@@ -2357,9 +2366,24 @@ PRIMARY_IFACE=""
 
 # Strategy 0: Source IP used to reach DC (most reliable: guarantees AD connectivity, handles multi-homed)
 DC_V4="$(getent ahostsv4 "$DC_SERVER" 2>/dev/null | awk 'NR==1{print $1; exit}')"
-if [[ -n "$DC_V4" ]]; then
+
+# Fallback: se getent falha, tentar resolução via dig/host
+if [[ -z "$DC_V4" || ! "$DC_V4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    DC_V4="$(dig +short "$DC_SERVER" 2>/dev/null | grep -E '^[0-9]+\.' | head -n1)" || true
+fi
+if [[ -z "$DC_V4" || ! "$DC_V4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    DC_V4="$(host "$DC_SERVER" 2>/dev/null | awk '/has address/ {print $4; exit}')" || true
+fi
+
+# Se DC_SERVER já for um IP, usar diretamente
+if [[ -z "$DC_V4" && "$DC_SERVER" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+    DC_V4="$DC_SERVER"
+fi
+
+if [[ -n "$DC_V4" && "$DC_V4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
     PRIMARY_IP="$(ip -4 route get "$DC_V4" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="src"){print $(i+1); exit}}')"
-    PRIMARY_IFACE="$(ip -4 route get "$DC_V4" 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
+else
+    $VERBOSE && log_info "⚠ DC server resolution failed or invalid IP: '$DC_V4'"
 fi
 
 # Strategy 1: Default route interface (fallback if DC resolution fails)
@@ -3029,7 +3053,7 @@ fi
 log_info "🔍 Checking OU: $OU"
 
 set +e
-LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
+LDAP_OUT=$(timeout "$LDAP_TIMEOUT" ldapsearch -x -LLL -o ldif-wrap=no \
     -H "ldap://${LDAP_SERVER}" \
     -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
     -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
@@ -3043,7 +3067,7 @@ if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
 
     # Test fallback OU also under safe mode
     set +e
-    LDAP_OUT=$(ldapsearch -x -LLL -o ldif-wrap=no \
+    LDAP_OUT=$(timeout "$LDAP_TIMEOUT" ldapsearch -x -LLL -o ldif-wrap=no \
         -H "ldap://${LDAP_SERVER}" \
         -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
         -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
@@ -3963,7 +3987,11 @@ if $VALIDATE_ONLY; then
 else
     if $has_waitsync; then
         # Use timeout with SIGKILL fallback for stubborn processes
-        cmd_try timeout --signal=KILL 50 timeout 45 chronyc -a waitsync 45 0.5 >/dev/null 2>&1 || true
+        if timeout --signal=KILL 0 true >/dev/null 2>&1; then
+            cmd_try timeout --signal=KILL 50 timeout 45 chronyc -a waitsync 45 0.5 >/dev/null 2>&1 || true
+        else
+            cmd_try timeout 45 chronyc -a waitsync 45 0.5 >/dev/null 2>&1 || true
+        fi
     fi
 
     # Manual polling (works everywhere)
@@ -4028,7 +4056,7 @@ if $VERBOSE; then
     echo "🔸 BASE_DN: $BASE_DN"
 
     set +e
-    LDAP_RAW=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
+    LDAP_RAW=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
       -H "ldap://${LDAP_SERVER}" \
       -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U_ESCAPED}\$)" distinguishedName 2>&1)
     LDAP_CODE=$?
@@ -4046,7 +4074,7 @@ log_info "🔍 Checking if computer object exists in AD"
 
 # Perform search allowing non-fatal exit codes (e.g. not found)
 set +e
-LDAP_OUT=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
+LDAP_OUT=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
   -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U_ESCAPED}\$)" distinguishedName 2>/dev/null)
 LDAP_CODE=$?
 set -e
@@ -4243,7 +4271,7 @@ fi
 MSDS_KVNO=""
 for _kvno_attempt in 1 2 3; do
     set +e +o pipefail
-    MSDS_KVNO=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
+    MSDS_KVNO=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
         -H "ldap://${LDAP_SERVER}" \
         -b "CN=${HOST_SHORT_U},${OU}" msDS-KeyVersionNumber 2>/dev/null | \
         awk '/^msDS-KeyVersionNumber:/ {print $2}' | head -n1)
@@ -4350,7 +4378,7 @@ trap "$ERROR_TRAP_CMD" ERR
 log_info "🔧 Checking if computer object is disabled in AD..."
 
 # Query userAccountControl via GSSAPI (machine trust)
-UAC_RAW=$(ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
+UAC_RAW=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
     -b "CN=${HOST_SHORT_U},${OU}" userAccountControl \
     2>$($VERBOSE && echo /dev/stderr || echo /dev/null) | \
     awk '/^userAccountControl:/ {print $2}' || true)
@@ -5137,12 +5165,16 @@ log_info "🗂️ Enumerating sudoers configuration files"
 
 FILES=("$SUDOERS_MAIN")
 
-while IFS= read -r -d '' f; do
-    [[ "$f" == "$BLOCK_FILE" ]] && continue
-    [[ "$f" =~ README ]] && continue
-    [[ "$f" =~ \.bak ]] && continue
-    FILES+=("$f")
-done < <(find "$SUDOERS_DIR" -maxdepth 1 -type f -print0)
+# Bash 4.4+ required for mapfile -d ''
+if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
+    mapfile -t -d '' _DROPIN_FILES < <(find "$SUDOERS_DIR" -maxdepth 1 -type f -print0)
+    FILES+=("${_DROPIN_FILES[@]}")
+    unset _DROPIN_FILES
+else
+    while IFS= read -r -d '' f || [[ -n "$f" ]]; do
+        FILES+=("$f")
+    done < <(find "$SUDOERS_DIR" -maxdepth 1 -type f -print0)
+fi
 
 # -------------------------------------------------------------------------
 # Extract administrative groups from all sudoers files
@@ -5158,14 +5190,15 @@ for f in "${FILES[@]}"; do
     done <"$f"
 done
 
+declare -A _SEEN_GROUPS=()
 declare -a TARGET_GROUPS=()
-for g in "${RAW_GROUPS[@]}"; do
-    exists=false
-    for e in "${TARGET_GROUPS[@]}"; do
-        [[ "$g" == "$e" ]] && exists=true
-    done
-    [[ "$exists" == false ]] && TARGET_GROUPS+=("$g")
+for g in "${RAW_GROUPS[@]+"${RAW_GROUPS[@]}"}"; do
+    if [[ -z "${_SEEN_GROUPS[$g]+set}" ]]; then
+        _SEEN_GROUPS["$g"]=1
+        TARGET_GROUPS+=("$g")
+    fi
 done
+unset _SEEN_GROUPS
 
 if [[ ${#TARGET_GROUPS[@]} -eq 0 ]]; then
     log_info "📌 No sudo groups detected for hardening (nothing to patch)."
@@ -5202,10 +5235,12 @@ else
 				grp_escaped="${grp_escaped//[/\\[}"    # Escape [
 				grp_escaped="${grp_escaped//]/\\]}"    # Escape ]
 				grp_escaped="${grp_escaped//*/\\*}"    # Escape *
+                grp_escaped="${grp_escaped//\*/\\*}"    # Escape * (both literal and escaped versions)
 				grp_escaped="${grp_escaped//^/\\^}"    # Escape ^
 				grp_escaped="${grp_escaped//$/\\$}"    # Escape $
 				grp_escaped="${grp_escaped//+/\\+}"    # Escape +
 				grp_escaped="${grp_escaped//?/\\?}"    # Escape ?
+                grp_escaped="${grp_escaped//\?/\\?}"    # Escape ? (both literal and escaped versions)
 				grp_escaped="${grp_escaped//(/\\(}"    # Escape (
 				grp_escaped="${grp_escaped//)/\\)}"    # Escape )
 				grp_escaped="${grp_escaped//{/\\{}"    # Escape {
@@ -5270,7 +5305,7 @@ else
 
 			rm -f "$tmp"
 			# The 'continue' statement prevents committing the bad file, relying on the backup.
-			log_error "Invalid syntax after modifying $f (changes discarded, original file preserved)"
+			log_info "⚠️ Invalid syntax after modifying $f (changes discarded, original file preserved). Skipping."
 			continue
 		fi
 
