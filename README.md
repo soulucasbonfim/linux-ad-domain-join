@@ -219,7 +219,7 @@ Every file modified by the script is **backed up automatically** before changes 
 **Backup location:** `/var/backups/linux-ad-domain-join/<timestamp>_<hostname>_<pid>/`
 Old backups are pruned automatically (last 20 retained).
 
-**Logs:** `/var/log/linux-ad-domain-join.log` (last 30 retained).
+**Logs:** `/var/log/linux-ad-domain-join/<timestamp>_<hostname>.log` (last 30 retained).
 
 ---
 
