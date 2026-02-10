@@ -889,7 +889,7 @@ sshd_set_directive_dedup() {
         return 0
     fi
 
-    tmp="$(safe_mktemp "${file}.XXXXXX")" || log_error "Failed to create temporary file for $file" 1
+    tmp="$(safe_mktemp "${file}.XXXXXX")"
 
     awk -v k="$key" -v v="$value" '
         BEGIN { in_match=0; inserted=0 }
