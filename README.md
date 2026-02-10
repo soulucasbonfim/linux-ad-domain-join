@@ -12,7 +12,7 @@ A single-script solution that handles the entire AD join lifecycle - from packag
 
 ---
 
-[Quick Start](#-quick-start) · [Features](#-what-it-does) · [Supported Platforms]([#-supported-platforms]) · [Parameters](#-parameters) · [Security Model]([#-security-model]) · [Exit Codes](#-exit-codes) · [Contributing](#-contributing)
+[Quick Start](#-quick-start) · [Features](#-what-it-does) · [Supported Platforms](#-supported-platforms) · [Parameters](#-parameters) · [Security Model](#-security-model) · [Exit Codes](#-exit-codes) · [Contributing](#-contributing)
 
 </div>
 
