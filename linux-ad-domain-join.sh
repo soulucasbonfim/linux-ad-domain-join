@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.0.1
+# Version:     3.1.0
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -506,6 +506,7 @@ NONINTERACTIVE="${NONINTERACTIVE:-false}"
 VERBOSE="${VERBOSE:-false}"
 VALIDATE_ONLY="${VALIDATE_ONLY:-false}"
 LDAP_TIMEOUT="${LDAP_TIMEOUT:-30}"
+KRB5_KEYTAB="${KRB5_KEYTAB:-/etc/krb5.keytab}"
 
 # -------------------------------------------------------------------------
 # Logging + Backup roots (after flags/defaults)
@@ -544,9 +545,10 @@ _prune_old_logs() {
     local count
     count="$(find "$log_dir" -maxdepth 1 -type f -name '*.log' 2>/dev/null | wc -l)"
     (( count > keep )) || return 0
-    find "$log_dir" -maxdepth 1 -type f -name '*.log' -printf '%T@ %p\n' 2>/dev/null \
-        | sort -n | head -n "$(( count - keep ))" | cut -d' ' -f2- \
-        | while IFS= read -r old_log; do rm -f -- "$old_log" 2>/dev/null; done
+    # NUL-delimited to handle paths with spaces safely
+    find "$log_dir" -maxdepth 1 -type f -name '*.log' -printf '%T@\t%p\0' 2>/dev/null \
+        | sort -z -t$'\t' -k1,1n | head -z -n "$(( count - keep ))" \
+        | while IFS=$'\t' read -r -d '' _ts old_log; do rm -f -- "$old_log" 2>/dev/null; done
 }
 _prune_old_logs "$LOG_DIR" "$LOG_RETENTION"
 
@@ -573,10 +575,22 @@ if command -v flock >/dev/null 2>&1; then
     printf '%s\n' "$$" 1>&200 2>/dev/null || true
     LOCK_MODE="flock"
 else
-    # Portable fallback: atomic mkdir lock. Requires explicit cleanup.
+    # Portable fallback: atomic mkdir lock with stale detection
     if ! mkdir "$LOCK_DIR_FALLBACK" 2>/dev/null; then
-        echo "[$(date '+%F %T')] [ERROR] Another instance is already running (lock: $LOCK_DIR_FALLBACK)" >&2
-        exit 16
+        # Check if the holder PID is still alive
+        _lock_pid=""
+        _lock_pid="$(cat "${LOCK_DIR_FALLBACK}/pid" 2>/dev/null || true)"
+        if [[ -n "$_lock_pid" ]] && kill -0 "$_lock_pid" 2>/dev/null; then
+            echo "[$(date '+%F %T')] [ERROR] Another instance is already running (PID $_lock_pid, lock: $LOCK_DIR_FALLBACK)" >&2
+            exit 16
+        fi
+        # Stale lock: previous run crashed without cleanup
+        echo "[$(date '+%F %T')] [WARN] Removing stale lock from PID ${_lock_pid:-unknown} (lock: $LOCK_DIR_FALLBACK)" >&2
+        rm -rf "$LOCK_DIR_FALLBACK" 2>/dev/null || true
+        if ! mkdir "$LOCK_DIR_FALLBACK" 2>/dev/null; then
+            echo "[$(date '+%F %T')] [ERROR] Failed to acquire lock after stale cleanup (lock: $LOCK_DIR_FALLBACK)" >&2
+            exit 16
+        fi
     fi
     printf '%s\n' "$$" >"${LOCK_DIR_FALLBACK}/pid" 2>/dev/null || true
     LOCK_MODE="mkdir"
@@ -586,6 +600,12 @@ fi
 if command -v tee >/dev/null 2>&1; then
     : >"$LOG_FILE" 2>/dev/null || true
     exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
+    # Brief pause to let tee process substitutions initialize
+    sleep 0.1
+    # Verify log pipeline is functional (catches disk-full / permission issues early)
+    if ! echo "[$(date '+%F %T')] [i] Log pipeline initialized" >>"$LOG_FILE" 2>/dev/null; then
+        echo "[$(date '+%F %T')] [!] Warning: LOG_FILE may not be writable ($LOG_FILE)" >&2
+    fi
 else
     : >"$LOG_FILE" 2>/dev/null || true
     exec >>"$LOG_FILE" 2>&1
@@ -600,6 +620,14 @@ BACKUP_RUN_ID="$(date +%Y%m%d_%H%M%S)_$(hostname -s)_$$"
 BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_RUN_ID}"
 
 to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
+
+# Trim leading/trailing whitespace (pure bash, xargs-safe)
+trim_ws() {
+    local v="$1"
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
+    printf '%s' "$v"
+}
 
 # Standardized mktemp wrapper: validates result, consistent errors, works with set -eu
 safe_mktemp() {
@@ -734,7 +762,7 @@ backup_prune_old_runs() {
     [[ -d "$BACKUP_ROOT" ]] || return 0
 
     local tmp_list
-    tmp_list="$(mktemp)" || return 0
+    tmp_list="$(safe_mktemp)" || return 0
 
     # List subdirs by mtime (newest first). No failure if empty.
     find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
@@ -775,7 +803,10 @@ require_uint_range() {
 
 normalize_yes_no() {
     local v
-    v="$(to_lower "${1:-}" | xargs)"
+    v="$(to_lower "${1:-}")"
+    # Trim leading/trailing whitespace without xargs (safe for special chars)
+    v="${v#"${v%%[![:space:]]*}"}"
+    v="${v%"${v##*[![:space:]]}"}"
     case "$v" in
         y|yes|s|sim|true|1|on)    echo "yes" ;;
         n|no|nao|não|false|0|off) echo "no"  ;;
@@ -858,7 +889,7 @@ sshd_set_directive_dedup() {
         return 0
     fi
 
-    tmp="$(mktemp "${file}.XXXXXX")" || log_error "Failed to create temporary file for $file" 1
+    tmp="$(safe_mktemp "${file}.XXXXXX")" || log_error "Failed to create temporary file for $file" 1
 
     awk -v k="$key" -v v="$value" '
         BEGIN { in_match=0; inserted=0 }
@@ -1356,13 +1387,25 @@ cmd_run_in() {
 cmd_try_in() {
     # Usage: cmd_try_in <stdin_file> <cmd> [args...]
     local rc=0
+    local had_errexit=false
+    local _prev_err_trap=""
+
+    [[ $- == *e* ]] && had_errexit=true
+
+    # Capture current ERR trap verbatim (consistent with cmd_try)
+    _prev_err_trap="$(trap -p ERR)" || true
 
     trap - ERR
     set +e
+
     cmd_run_in "$@"
     rc=$?
-    set -e
-    trap "$ERROR_TRAP_CMD" ERR
+
+    $had_errexit && set -e
+
+    if [[ -n "$_prev_err_trap" ]]; then
+        eval "$_prev_err_trap"
+    fi
 
     CMD_LAST_RC=$rc
     return 0
@@ -1560,7 +1603,8 @@ _file_has_immutable() {
     [[ -e "$f" ]] || return 1
     local flags
     flags="$(lsattr -d -- "$f" 2>/dev/null | awk '{print $1}' || true)"
-    [[ -n "$flags" ]] && echo "$flags" | grep -q 'i' && return 0
+    # Match 'i' only in ext2/3/4 attribute positions (4th char: ----i---)
+    [[ -n "$flags" && "$flags" == *i* ]] && return 0
     return 1
 }
 
@@ -1745,7 +1789,7 @@ get_major_version_id() {
     fi
     log_info "⚠ Could not determine major version from VERSION_ID='$VERSION_ID'" >&2
     echo 0
-    return 1  # ← Sinalizar falha
+    return 1
 }
 
 # -------------------------------------------------------------------------
@@ -2142,7 +2186,7 @@ else
     while true; do
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Domain (e.g., acme.net): " "$(date '+%F %T')"
         read -r DOMAIN
-        DOMAIN=$(echo "$DOMAIN" | xargs)
+        DOMAIN="$(trim_ws "$DOMAIN")"
 
         # Check for empty input
         if [[ -z "$DOMAIN" ]]; then
@@ -2168,28 +2212,28 @@ else
     default_OU="CN=Computers,${DOMAIN_DN}"
     printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} OU ${C_DIM}[default: ${default_OU}]${C_RESET}: " "$(date '+%F %T')"
     read -r OU
-    OU="$(echo "${OU:-}" | xargs)"
+    OU="$(trim_ws "${OU:-}")"
     OU="${OU:-$default_OU}"
 
     # DC Server (optional, default filled)
     default_DC_SERVER="${DOMAIN_SHORT,,}-sp-ad01.${DOMAIN,,}"
     printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} DC server ${C_DIM}[default: ${default_DC_SERVER}]${C_RESET}: " "$(date '+%F %T')"
     read -r DC_SERVER
-    DC_SERVER="$(echo "${DC_SERVER:-}" | xargs)"
+    DC_SERVER="$(trim_ws "${DC_SERVER:-}")"
     DC_SERVER="${DC_SERVER:-$default_DC_SERVER}"
 
 	# NTP Server (optional, default filled)
     default_NTP_SERVER="ntp.${DOMAIN,,}"
     printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} NTP server ${C_DIM}[default: ${default_NTP_SERVER}]${C_RESET}: " "$(date '+%F %T')"
     read -r NTP_SERVER
-    NTP_SERVER="$(echo "${NTP_SERVER:-}" | xargs)"
+    NTP_SERVER="$(trim_ws "${NTP_SERVER:-}")"
     NTP_SERVER="${NTP_SERVER:-$default_NTP_SERVER}"
 
     # Require Join User with validation
     while true; do
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Join user (e.g., administrator): " "$(date '+%F %T')"
         read -r DOMAIN_USER
-        DOMAIN_USER=$(echo "$DOMAIN_USER" | xargs)
+        DOMAIN_USER="$(trim_ws "$DOMAIN_USER")"
 
         # Check for empty input
         if [[ -z "$DOMAIN_USER" ]]; then
@@ -2219,7 +2263,7 @@ else
     printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Define the global admin group(s) allowed SSH access (space-separated):\n" "$(date '+%F %T')" >&2
     printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Global admin group(s): " "$(date '+%F %T')" >&2
     read -r GLOBAL_ADMIN_GROUPS
-    GLOBAL_ADMIN_GROUPS="$(echo "$GLOBAL_ADMIN_GROUPS" | xargs)"  # trim spaces
+    GLOBAL_ADMIN_GROUPS="$(trim_ws "$GLOBAL_ADMIN_GROUPS")"
 
     # handle optional input gracefully
     [[ -z "$GLOBAL_ADMIN_GROUPS" ]] && GLOBAL_ADMIN_GROUPS="(none)"
@@ -2230,7 +2274,7 @@ else
     while true; do
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Session timeout in seconds (SSH + shell) ${C_DIM}[default: ${default_SESSION_TIMEOUT_SECONDS}]${C_RESET}: " "$(date '+%F %T')"
         read -r SESSION_TIMEOUT_SECONDS
-        SESSION_TIMEOUT_SECONDS="$(echo "${SESSION_TIMEOUT_SECONDS:-$default_SESSION_TIMEOUT_SECONDS}" | xargs)"
+        SESSION_TIMEOUT_SECONDS="$(trim_ws "${SESSION_TIMEOUT_SECONDS:-$default_SESSION_TIMEOUT_SECONDS}")"
 
         if is_uint "$SESSION_TIMEOUT_SECONDS" && (( SESSION_TIMEOUT_SECONDS >= 30 && SESSION_TIMEOUT_SECONDS <= 86400 )); then
             break
@@ -2274,7 +2318,7 @@ else
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} ADM group (operational, host-specific) ${C_DIM}[default: ${default_ADM}]${C_RESET}: " "$(date '+%F %T')"
         read -r ADM
         ADM="${ADM:-$default_ADM}"
-        ADM="$(echo "$ADM" | xargs)"
+        ADM="$(trim_ws "$ADM")"
         if validate_ad_group_name "$ADM" "ADM"; then
             break
         fi
@@ -2287,7 +2331,7 @@ else
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} ADM_ALL group (operational, global) ${C_DIM}[default: ${default_ADM_ALL}]${C_RESET}: " "$(date '+%F %T')"
         read -r ADM_ALL
         ADM_ALL="${ADM_ALL:-$default_ADM_ALL}"
-        ADM_ALL="$(echo "$ADM_ALL" | xargs)"
+        ADM_ALL="$(trim_ws "$ADM_ALL")"
         if validate_ad_group_name "$ADM_ALL" "ADM_ALL"; then
             break
         fi
@@ -2300,7 +2344,7 @@ else
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SSH group (access, host-specific) ${C_DIM}[default: ${default_SSH}]${C_RESET}: " "$(date '+%F %T')"
         read -r GRP_SSH
         GRP_SSH="${GRP_SSH:-$default_SSH}"
-        GRP_SSH="$(echo "$GRP_SSH" | xargs)"
+        GRP_SSH="$(trim_ws "$GRP_SSH")"
         if validate_ad_group_name "$GRP_SSH" "GRP_SSH"; then
             break
         fi
@@ -2313,7 +2357,7 @@ else
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SSH_ALL group (access, global) ${C_DIM}[default: ${default_SSH_ALL}]${C_RESET}: " "$(date '+%F %T')"
         read -r GRP_SSH_ALL
         GRP_SSH_ALL="${GRP_SSH_ALL:-$default_SSH_ALL}"
-        GRP_SSH_ALL="$(echo "$GRP_SSH_ALL" | xargs)"
+        GRP_SSH_ALL="$(trim_ws "$GRP_SSH_ALL")"
         if validate_ad_group_name "$GRP_SSH_ALL" "GRP_SSH_ALL"; then
             break
         fi
@@ -2326,7 +2370,7 @@ else
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SEC group (security, host-specific) ${C_DIM}[default: ${default_SEC}]${C_RESET}: " "$(date '+%F %T')"
         read -r SEC
         SEC="${SEC:-$default_SEC}"
-        SEC="$(echo "$SEC" | xargs)"
+        SEC="$(trim_ws "$SEC")"
         if validate_ad_group_name "$SEC" "SEC"; then
             break
         fi
@@ -2339,7 +2383,7 @@ else
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SEC_ALL group (security, global) ${C_DIM}[default: ${default_SEC_ALL}]${C_RESET}: " "$(date '+%F %T')"
         read -r SEC_ALL
         SEC_ALL="${SEC_ALL:-$default_SEC_ALL}"
-        SEC_ALL="$(echo "$SEC_ALL" | xargs)"
+        SEC_ALL="$(trim_ws "$SEC_ALL")"
         if validate_ad_group_name "$SEC_ALL" "SEC_ALL"; then
             break
         fi
@@ -2352,7 +2396,7 @@ else
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SUPER group (full admin, host-specific) ${C_DIM}[default: ${default_SUPER}]${C_RESET}: " "$(date '+%F %T')"
         read -r SUPER
         SUPER="${SUPER:-$default_SUPER}"
-        SUPER="$(echo "$SUPER" | xargs)"
+        SUPER="$(trim_ws "$SUPER")"
         if validate_ad_group_name "$SUPER" "SUPER"; then
             break
         fi
@@ -2365,7 +2409,7 @@ else
         printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} SUPER_ALL group (full admin, global) ${C_DIM}[default: ${default_SUPER_ALL}]${C_RESET}: " "$(date '+%F %T')"
         read -r SUPER_ALL
         SUPER_ALL="${SUPER_ALL:-$default_SUPER_ALL}"
-        SUPER_ALL="$(echo "$SUPER_ALL" | xargs)"
+        SUPER_ALL="$(trim_ws "$SUPER_ALL")"
         if validate_ad_group_name "$SUPER_ALL" "SUPER_ALL"; then
             break
         fi
@@ -2710,14 +2754,16 @@ else
                 _dns_configured=true
             else
                 # Get current DNS to prepend DC (avoid overwriting all DNS)
-                _current_dns="$(nmcli -g ipv4.dns con show "$_nm_conn" 2>/dev/null | tr ',' ' ' | xargs)"
+                _current_dns="$(nmcli -g ipv4.dns con show "$_nm_conn" 2>/dev/null | tr ',' ' ')"
+                _current_dns="$(trim_ws "$_current_dns")"
                 if [[ "$_current_dns" != *"$DC_DNS_IP"* ]]; then
                     _new_dns="$DC_DNS_IP"
                     [[ -n "$_current_dns" ]] && _new_dns="$DC_DNS_IP $_current_dns"
                     nmcli con mod "$_nm_conn" ipv4.dns "$_new_dns" 2>/dev/null || true
                 fi
                 # Add search domain
-                _current_search="$(nmcli -g ipv4.dns-search con show "$_nm_conn" 2>/dev/null | tr ',' ' ' | xargs)"
+                _current_search="$(nmcli -g ipv4.dns-search con show "$_nm_conn" 2>/dev/null | tr ',' ' ')"
+                _current_search="$(trim_ws "$_current_search")"
                 if [[ "$_current_search" != *"$DOMAIN"* ]]; then
                     _new_search="$DOMAIN"
                     [[ -n "$_current_search" ]] && _new_search="$DOMAIN $_current_search"
@@ -2851,7 +2897,7 @@ EOF
             # Check if already configured
             if ! grep -qE "^nameserver[[:space:]]+${DC_DNS_IP//./\\.}([[:space:]]|$)" "$RESOLV_CONF" 2>/dev/null; then
                 # Prepend DC DNS to existing config
-                _tmp_resolv="$(mktemp)"
+                _tmp_resolv="$(safe_mktemp)"
                 {
                     echo "# Managed by linux-ad-domain-join.sh"
                     echo "nameserver $DC_DNS_IP"
@@ -2976,7 +3022,7 @@ create_secret_passfile() {
 
     # Create temp file with secure permissions (0600) atomically via umask
     # No separate chmod needed - umask 077 ensures correct permissions at creation
-    PASS_FILE="$(mktemp "${base}/.adjoin.pass.XXXXXX")" || log_error "Failed to create PASS_FILE in ${base}" 1
+    PASS_FILE="$(mktemp "${base}/.adjoin.pass.XXXXXX")" || log_error "Failed to create temporary password file" 1
 
     # Store password as a single line (no trailing newline).
     # OpenLDAP -y reads the entire file as password; newline/CR would be treated as part of the secret.
@@ -2984,7 +3030,7 @@ create_secret_passfile() {
         log_error "DOMAIN_PASS contains newline/CR characters; refusing because ldapsearch -y would treat them as part of the password." 1
     fi
 
-    printf '%s' "$DOMAIN_PASS" > "$PASS_FILE" || log_error "Failed to write PASS_FILE" 1
+    printf '%s' "$DOMAIN_PASS" > "$PASS_FILE" || log_error "Failed to write temporary password file" 1
 
     # Remove from memory ASAP
     unset DOMAIN_PASS
@@ -3033,7 +3079,7 @@ create_secret_passfile
 # Kerberos credential validation (controlled error handling block)
 # -------------------------------------------------------------------------
 log_info "🔐 Verifying credentials for $DOMAIN_USER@$REALM"
-KRB_TRACE=$(mktemp)
+KRB_TRACE=$(safe_mktemp)
 
 # Temporarily relax -e and disable ERR trap to classify kinit failures
 trap - ERR
@@ -3048,7 +3094,7 @@ trap "$ERROR_TRAP_CMD" ERR
 
 # analyze both return code AND trace contents
 if (( KINIT_CODE == 0 )) && ! grep -qiE 'CLIENT_LOCKED_OUT|revoked|disabled|locked out|denied|expired' "$KRB_TRACE"; then
-    kdestroy -q
+    kdestroy -q 2>/dev/null || true
     log_info "✅ Credentials verified successfully"
 else
     if grep -qiE 'CLIENT_LOCKED_OUT|client.*locked out|credentials have been revoked|Client account disabled|STATUS_ACCOUNT_LOCKED_OUT' "$KRB_TRACE"; then
@@ -3089,13 +3135,13 @@ fi
 # -------------------------------------------------------------------------
 log_info "🔍 Checking OU: $OU"
 
-set +e
-LDAP_OUT=$(timeout "$LDAP_TIMEOUT" ldapsearch -x -LLL -o ldif-wrap=no \
-    -H "ldap://${LDAP_SERVER}" \
-    -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
-    -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
-LDAP_CODE=$?
-set -e
+LDAP_OUT="$(
+    set +e +o pipefail
+    timeout "$LDAP_TIMEOUT" ldapsearch -x -LLL -o ldif-wrap=no \
+        -H "ldap://${LDAP_SERVER}" \
+        -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
+        -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1
+)" && LDAP_CODE=0 || LDAP_CODE=$?
 
 if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
     log_info "⚠ OU not found - applying fallback"
@@ -3103,13 +3149,13 @@ if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
     log_info "↪ Using fallback: $OU"
 
     # Test fallback OU also under safe mode
-    set +e
-    LDAP_OUT=$(timeout "$LDAP_TIMEOUT" ldapsearch -x -LLL -o ldif-wrap=no \
-        -H "ldap://${LDAP_SERVER}" \
-        -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
-        -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1)
-    LDAP_CODE=$?
-    set -e
+    LDAP_OUT="$(
+        set +e +o pipefail
+        timeout "$LDAP_TIMEOUT" ldapsearch -x -LLL -o ldif-wrap=no \
+            -H "ldap://${LDAP_SERVER}" \
+            -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
+            -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1
+    )" && LDAP_CODE=0 || LDAP_CODE=$?
 
     [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]] && log_error "Invalid OU and fallback missing - aborting" 4
 fi
@@ -3125,8 +3171,8 @@ if [[ -n "$REALM_JOINED" ]]; then
     log_info "🔎 Realm configuration found for $DOMAIN (local state)"
 
     # Test Kerberos trust using the machine principal
-    if kinit -kt /etc/krb5.keytab "$MACHINE_PRINCIPAL" >/dev/null 2>&1; then
-        kdestroy -q
+    if kinit -kt "$KRB5_KEYTAB" "$MACHINE_PRINCIPAL" >/dev/null 2>&1; then
+        kdestroy -q 2>/dev/null || true
         log_info "✅ Kerberos trust is intact (keytab is valid)"
         if ! $NONINTERACTIVE; then
           read_sanitized "⚠️ Joined locally with valid trust. Rejoin anyway? [y/N]: " REPLY
@@ -3169,7 +3215,7 @@ if [[ -n "$REALM_JOINED" ]]; then
     fi
 
     # Always perform residual cleanup
-    cmd_try rm -f /etc/krb5.keytab /etc/sssd/sssd.conf /etc/realmd.conf
+    cmd_try rm -f "$KRB5_KEYTAB" /etc/sssd/sssd.conf /etc/realmd.conf
     log_info "🧹 Residual realm configuration cleaned."
 
 else
@@ -3580,7 +3626,7 @@ NSS_EDIT_TMP=""
 
 # VALIDATE_ONLY and DRY_RUN both work on a temp copy to avoid modifying the real file
 if $DRY_RUN || $VALIDATE_ONLY; then
-    NSS_EDIT_TMP="$(mktemp "/tmp/nsswitch.conf.XXXXXX")"
+    NSS_EDIT_TMP="$(safe_mktemp "/tmp/nsswitch.conf.XXXXXX")"
     if [[ -f "$NSS_FILE" ]]; then
         cp -p -- "$NSS_FILE" "$NSS_EDIT_TMP"
     else
@@ -3596,8 +3642,12 @@ for key in passwd shadow group services netgroup; do
 
     [ -f "$NSS_EDIT" ] || : >"$NSS_EDIT"
 
-    # Normalize whitespace (work file)
-    sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
+    # Normalize whitespace (work file) — use cmd_must only on the real file
+    if [[ "$NSS_EDIT" == "$NSS_FILE" ]]; then
+        cmd_must sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
+    else
+        sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
+    fi
 
     # Remove duplicate entries (preserve first non-commented)
     if grep -Eq "${pattern}" "$NSS_EDIT"; then
@@ -3621,12 +3671,21 @@ for key in passwd shadow group services netgroup; do
     # If entry exists but lacks 'sss', patch it
     if grep -qE "${pattern}[^#]*" "$NSS_EDIT"; then
         log_info "🧩 Updating existing '${key}' entry to include sss"
-        # shellcheck disable=SC2086
-        sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_EDIT"
-        sed -i \
-            -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
-            -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_EDIT"
-        sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_EDIT"
+        if [[ "$NSS_EDIT" == "$NSS_FILE" ]]; then
+            # shellcheck disable=SC2086
+            cmd_must sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_EDIT"
+            cmd_must sed -i \
+                -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
+                -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_EDIT"
+            cmd_must sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_EDIT"
+        else
+            # shellcheck disable=SC2086
+            sed $SED_EXT -i "s/[[:space:]]+(ldap|nis|yp)//g; s/[[:space:]]{2,}/ /g" "$NSS_EDIT"
+            sed -i \
+                -e "s/^\([[:space:]]*${key}:[^#]*\)\(#.*\)$/\1 sss \2/" \
+                -e "s/^\([[:space:]]*${key}:[^#]*\)$/\1 sss/" "$NSS_EDIT"
+            sed -i 's/sss[[:space:]]\+sss/sss/g; s/[[:space:]]\{2,\}/ /g' "$NSS_EDIT"
+        fi
         log_info "✅ '${key}' updated"
     else
         printf '%s\n' "${key}: files sss" >>"$NSS_EDIT"
@@ -3892,7 +3951,7 @@ EOF
     # Replace an existing managed block, or append a new one.
     log_info "🧩 No include/confdir detected -> embedding managed block into $chrony_conf"
 
-    tmp_chrony="$(mktemp)"
+    tmp_chrony="$(safe_mktemp)"
     : >"$tmp_chrony"
 
     in_managed=0
@@ -3950,7 +4009,7 @@ EOF
 
     # Normalize excessive blank lines to keep config visually clean.
     # Rule: collapse 2+ consecutive blank lines into a single blank line.
-    tmp_chrony_norm="$(mktemp)"
+    tmp_chrony_norm="$(safe_mktemp)"
     awk '
         BEGIN { blank=0 }
         /^[[:space:]]*$/ {
@@ -4140,12 +4199,11 @@ if $VERBOSE; then
     echo "🔸 OU: $OU"
     echo "🔸 BASE_DN: $BASE_DN"
 
-    set +e
-    LDAP_RAW=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
-      -H "ldap://${LDAP_SERVER}" \
-      -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U_ESCAPED}\$)" distinguishedName 2>&1)
-    LDAP_CODE=$?
-    set -e
+    LDAP_RAW="$(
+        set +e +o pipefail
+        timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
+          -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U_ESCAPED}\$)" distinguishedName 2>&1
+    )" && LDAP_CODE=0 || LDAP_CODE=$?
 
     echo "🔹 Exit Code: $LDAP_CODE"
     echo "🔹 LDAP Output:"
@@ -4158,11 +4216,11 @@ fi
 log_info "🔍 Checking if computer object exists in AD"
 
 # Perform search allowing non-fatal exit codes (e.g. not found)
-set +e
-LDAP_OUT=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
-  -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U_ESCAPED}\$)" distinguishedName 2>/dev/null)
-LDAP_CODE=$?
-set -e
+LDAP_OUT="$(
+    set +e +o pipefail
+    timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
+      -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U_ESCAPED}\$)" distinguishedName 2>/dev/null
+)" && LDAP_CODE=0 || LDAP_CODE=$?
 
 # Extract DN using grep/PCRE
 CURRENT_DN="$(printf '%s\n' "$LDAP_OUT" | sed -n 's/^distinguishedName:[[:space:]]*//p' | head -n1)"
@@ -4178,7 +4236,7 @@ if [[ -n "$CURRENT_DN" ]]; then
         log_info "🚚 Attempting to move object to target OU: $OU"
 
         # Prepare LDIF for move operation
-        TMP_LDIF=$(mktemp)
+        TMP_LDIF=$(safe_mktemp)
         write_file 0600 "$TMP_LDIF" <<EOF
 dn: $CURRENT_DN
 changetype: modrdn
@@ -4194,6 +4252,8 @@ EOF
         if $DRY_RUN; then
             log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would move computer object via ldapmodify"
         else
+            # Save/restore ERR trap (consistent with trust validation block pattern)
+            _saved_move_trap="$(trap -p ERR)" || true
             trap - ERR
             set +e
             if $VERBOSE; then
@@ -4204,7 +4264,9 @@ EOF
                 LDAP_MOVE_CODE=$?
             fi
             set -e
-            trap "$ERROR_TRAP_CMD" ERR
+            if [[ -n "$_saved_move_trap" ]]; then
+                eval "$_saved_move_trap"
+            fi
         fi
 
         rm -f "$TMP_LDIF"
@@ -4253,13 +4315,13 @@ kinit "${DOMAIN_USER}@${REALM}" <"$PASS_FILE" >/dev/null 2>&1 || {
 }
 
 # Safely capture Kerberos principal (ignore klist exit errors)
-set +e +o pipefail
-KLIST_PRINCIPAL=$(klist 2>/dev/null | awk '/Default principal/ {print $3; exit}')
-KLIST_RC=$?
-set -e -o pipefail
-[[ $KLIST_RC -ne 0 || -z "$KLIST_PRINCIPAL" ]] && KLIST_PRINCIPAL="(no active ticket)"
+KLIST_PRINCIPAL="$(
+    set +e +o pipefail
+    klist 2>/dev/null | awk '/Default principal/ {print $3; exit}'
+)" || true
+[[ -z "$KLIST_PRINCIPAL" ]] && KLIST_PRINCIPAL="(no active ticket)"
 
-JOIN_LOG=$(mktemp)
+JOIN_LOG=$(safe_mktemp)
 
 # Execute adcli join deterministically
 if $DRY_RUN; then
@@ -4275,7 +4337,7 @@ elif timeout 90s adcli join \
     --stdin-password \
     --host-fqdn="$HOST_FQDN" \
     --computer-name="$HOST_SHORT_U" \
-    --host-keytab="/etc/krb5.keytab" \
+    --host-keytab="$KRB5_KEYTAB" \
     --os-name="$OS_NAME" \
     --os-version="$OS_VERSION" \
     --trusted-for-delegation=no \
@@ -4297,9 +4359,9 @@ elif timeout 90s adcli join \
     fi
 
     # Ensure keytab has correct permissions (security hardening)
-    if [[ -f /etc/krb5.keytab ]]; then
-        cmd_must chmod 600 /etc/krb5.keytab
-        cmd_must chown root:root /etc/krb5.keytab
+    if [[ -f "$KRB5_KEYTAB" ]]; then
+        cmd_must chmod 600 "$KRB5_KEYTAB"
+        cmd_must chown root:root "$KRB5_KEYTAB"
         log_info "🔒 Keytab permissions hardened (600, root:root)"
     fi
 
@@ -4309,7 +4371,7 @@ else
     log_error "Domain join failed via adcli" 3
 fi
 
-kdestroy -q
+kdestroy -q 2>/dev/null || true
 rm -f "$JOIN_LOG"
 
 # -------------------------------------------------------------------------
@@ -4321,7 +4383,7 @@ if [[ -n "$HOST_IP" ]]; then
     kinit "${DOMAIN_USER}@${REALM}" <"$PASS_FILE" >/dev/null 2>&1 || \
         log_info "⚠️ Failed to refresh Kerberos ticket for description update"
 
-    TMP_LDIF=$(mktemp)
+    TMP_LDIF=$(safe_mktemp)
 	timestamp=$(date '+%Y-%m-%dT%H:%M:%S%z')
     write_file 0600 "$TMP_LDIF" <<EOF
 dn: CN=${HOST_SHORT_U},${OU}
@@ -4355,15 +4417,16 @@ fi
 # Read the current msDS-KeyVersionNumber with retry (tolerates AD replication delay)
 MSDS_KVNO=""
 for _kvno_attempt in 1 2 3; do
-    set +e +o pipefail
-    MSDS_KVNO=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
-        -H "ldap://${LDAP_SERVER}" \
-        -b "CN=${HOST_SHORT_U},${OU}" msDS-KeyVersionNumber 2>/dev/null | \
-        awk '/^msDS-KeyVersionNumber:/ {print $2}' | head -n1)
-    LDAP_RC=$?
-    set -e -o pipefail
+    # Subshell isolates set +e +o pipefail from parent
+    MSDS_KVNO="$(
+        set +e +o pipefail
+        timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
+            -H "ldap://${LDAP_SERVER}" \
+            -b "CN=${HOST_SHORT_U},${OU}" msDS-KeyVersionNumber 2>/dev/null | \
+            awk '/^msDS-KeyVersionNumber:/ {print $2}' | head -n1
+    )" || true
 
-    if [[ $LDAP_RC -eq 0 && -n "$MSDS_KVNO" ]]; then
+    if [[ -n "$MSDS_KVNO" ]]; then
         log_info "ℹ️ msDS-KeyVersionNumber in AD: ${MSDS_KVNO}"
         break
     fi
@@ -4388,7 +4451,11 @@ log_info "ℹ Obtaining Kerberos ticket for synchronization"
 kinit "${DOMAIN_USER}@${REALM}" <"$PASS_FILE" >/dev/null 2>&1 || \
     log_error "Failed to obtain Kerberos ticket for ${DOMAIN_USER}@${REALM}" 2
 
-# Save and disable global ERR trap during trust validation
+# Save current trap/shell state before trust validation block
+_saved_err_trap="$(trap -p ERR)" || true
+_had_errexit=false; [[ $- == *e* ]] && _had_errexit=true
+_had_pipefail=false; [[ :$SHELLOPTS: == *:pipefail:* ]] && _had_pipefail=true
+
 trap - ERR
 set +e +o pipefail
 
@@ -4396,14 +4463,11 @@ set +e +o pipefail
 # Validate machine Kerberos keytab (domain trust check)
 # -------------------------------------------------------------------------
 TRUST_STATUS="⚠️ Trust check failed"
-
-REALM_UPPER="${REALM^^}"
-DOMAIN_LOWER="${DOMAIN,,}"
 PRINCIPAL="$(hostname -s | tr '[:lower:]' '[:upper:]')\$@${REALM_UPPER}"
-KRB_LOG=$(mktemp)
+KRB_LOG=$(safe_mktemp)
 START_MS="$(now_ms)"
 
-KRB5_TRACE=$KRB_LOG kinit -kt /etc/krb5.keytab "$PRINCIPAL" >/dev/null 2>&1
+KRB5_TRACE=$KRB_LOG kinit -kt "$KRB5_KEYTAB" "$PRINCIPAL" >/dev/null 2>&1
 EXIT_CODE=$?
 END_MS="$(now_ms)"
 ELAPSED=$((END_MS - START_MS))
@@ -4453,9 +4517,13 @@ fi
 kdestroy -q 2>/dev/null || true
 rm -f "$KRB_LOG" 2>/dev/null || true
 
-# Restore global error trap
-set -e -o pipefail
-trap "$ERROR_TRAP_CMD" ERR
+# Restore shell state after trust validation block
+$_had_errexit && set -e
+$_had_pipefail && set -o pipefail
+if [[ -n "$_saved_err_trap" ]]; then
+    eval "$_saved_err_trap"
+fi
+unset _saved_err_trap _had_errexit _had_pipefail
 
 # -------------------------------------------------------------------------
 # Validate and re-enable computer object if disabled in AD
@@ -4490,22 +4558,30 @@ else
 
             if $DRY_RUN; then
                 log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would re-enable computer object via ldapmodify (execution suppressed)."
-            elif $VERBOSE; then
-                ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" <<EOF
-dn: CN=${HOST_SHORT_U},${OU}
-changetype: modify
-replace: userAccountControl
-userAccountControl: $NEW_UAC
-EOF
             else
-                ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" >/dev/null 2>&1 <<EOF
+                _reenable_rc=0
+                if $VERBOSE; then
+                    ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" <<EOF || _reenable_rc=$?
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: userAccountControl
 userAccountControl: $NEW_UAC
 EOF
+                else
+                    ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" >/dev/null 2>&1 <<EOF || _reenable_rc=$?
+dn: CN=${HOST_SHORT_U},${OU}
+changetype: modify
+replace: userAccountControl
+userAccountControl: $NEW_UAC
+EOF
+                fi
+
+                if (( _reenable_rc == 0 )); then
+                    log_info "✅ Computer object re-enabled successfully (userAccountControl=$NEW_UAC)"
+                else
+                    log_info "⚠️ Failed to re-enable computer object (LDAP rc=$_reenable_rc, UAC target=$NEW_UAC)"
+                fi
             fi
-            log_info "✅ Computer object re-enabled successfully (userAccountControl=$NEW_UAC)"
         else
             $VERBOSE && log_info "ℹ userAccountControl=$UAC (object is already enabled or no action required)"
         fi
@@ -4517,7 +4593,7 @@ fi
 # -------------------------------------------------------------------------
 log_info "🔑 Rechecking Kerberos trust after re-enabling computer object"
 kdestroy -q 2>/dev/null || true
-kinit -kt /etc/krb5.keytab "${HOST_SHORT_U}\$@${REALM}" >/dev/null 2>&1 \
+kinit -kt "$KRB5_KEYTAB" "${HOST_SHORT_U}\$@${REALM}" >/dev/null 2>&1 \
     && log_info "✅ Trust OK after re-enable" \
     || log_info "⚠️ Trust still not valid after re-enable (replication delay?)"
 
@@ -4536,9 +4612,11 @@ log_info "🛠️ Writing SSSD configuration (auto-discovery mode for DNS update
 SSSD_DEBUG_LEVEL=0
 $VERBOSE && SSSD_DEBUG_LEVEL=9
 
-# Determine dyndns_iface if PRIMARY_IFACE is set
+# Determine dyndns_iface if PRIMARY_IFACE is set (rendered conditionally to avoid blank lines)
 DYNDNS_IFACE_LINE=""
-[[ -n "${PRIMARY_IFACE:-}" ]] && DYNDNS_IFACE_LINE="dyndns_iface = ${PRIMARY_IFACE}"
+if [[ -n "${PRIMARY_IFACE:-}" && "${PRIMARY_IFACE:-}" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    DYNDNS_IFACE_LINE="dyndns_iface = ${PRIMARY_IFACE}"
+fi
 
 # Render SSSD configuration
 write_file 0600 "$SSSD_CONF" <<EOF
@@ -4576,7 +4654,7 @@ chpass_provider = ad
 ad_domain = $DOMAIN_LOWER
 ad_hostname = $HOST_FQDN
 krb5_realm = $REALM_UPPER
-krb5_keytab = /etc/krb5.keytab
+krb5_keytab = $KRB5_KEYTAB
 realmd_tags = manages-system joined-with-adcli
 
 
@@ -4601,7 +4679,7 @@ use_fully_qualified_names = False
 # -------------------------------------------------------------------------
 # Dynamic DNS update (Secure Update)
 # -------------------------------------------------------------------------
-$DYNDNS_IFACE_LINE
+${DYNDNS_IFACE_LINE:+${DYNDNS_IFACE_LINE}}
 dyndns_update = True
 dyndns_refresh_interval = 43200
 dyndns_ttl = 3600
@@ -4655,7 +4733,7 @@ if [[ -f "$PAM_SU_FILE" ]]; then
         log_info "ℹ pam_sss already present in $PAM_SU_FILE (no changes applied)"
     else
         # Inject pam_sss.so right after pam_unix.so in the auth stack
-        tmp_su="$(mktemp)"
+        tmp_su="$(safe_mktemp)"
         awk '
           BEGIN { inserted=0 }
           /^[[:space:]]*auth[[:space:]]+sufficient[[:space:]]+pam_unix\.so/ && !inserted {
@@ -4810,7 +4888,7 @@ if [[ -n "$GLOBAL_ADMIN_GROUPS" && "$GLOBAL_ADMIN_GROUPS" != "(none)" ]]; then
 fi
 
 # Normalize multiple spaces and trim ends
-ALLOW_GROUPS="$(echo "$ALLOW_GROUPS" | xargs)"
+ALLOW_GROUPS="$(trim_ws "$ALLOW_GROUPS")"
 
 # Apply AllowGroups directive
 sshd_set_directive_dedup "AllowGroups" "$ALLOW_GROUPS" "$SSH_CFG"
@@ -5147,7 +5225,7 @@ log_info "🔧 Normalizing sudoers includes in $SUDOERS_MAIN"
 # Backup main sudoers file before changes
 backup_file "$SUDOERS_MAIN" SUDO_BAK
 
-tmp_sudo="$(mktemp)"
+tmp_sudo="$(safe_mktemp)"
 includedir_present=false
 
 while IFS= read -r line || [[ -n "$line" ]]; do
@@ -5184,10 +5262,7 @@ chmod 440 "$tmp_sudo" || log_error "Failed to set permissions on temporary sudoe
 log_info "🔍 Validating temporary sudoers configuration..."
 
 # Execute visudo using a temp file for log capture
-set +e
-VISUDO_OUTPUT="$(visudo -cf "$tmp_sudo" 2>&1)"
-VISUDO_RC=$?
-set -e
+VISUDO_OUTPUT="$(visudo -cf "$tmp_sudo" 2>&1)" && VISUDO_RC=0 || VISUDO_RC=$?
 
 if [[ $VISUDO_RC -eq 0 ]]; then
     # SUCCESS: Log the detailed output (including warnings and 'parsed OK' messages)
@@ -5306,7 +5381,7 @@ else
 		declare -a patched=()
 		declare -a compliant=()
 
-		tmp="$(mktemp "/tmp/$(basename "$f").XXXXXX")"
+		tmp="$(safe_mktemp "/tmp/$(basename "$f").XXXXXX")"
         : >"$tmp"
 
 		while IFS= read -r line || [[ -n "$line" ]]; do
@@ -5364,10 +5439,7 @@ else
 
 		# Validate syntax before committing changes
 		# Temporarily disable 'set -e' so a syntax error doesn't crash the script immediately
-		set +e
-		VISUDO_OUTPUT=$(visudo -cf "$tmp" 2>&1)
-		VISUDO_RC=$?
-		set -e
+		VISUDO_OUTPUT="$(visudo -cf "$tmp" 2>&1)" && VISUDO_RC=0 || VISUDO_RC=$?
 
 		if [[ $VISUDO_RC -ne 0 ]]; then
 			log_info "❌ Sudoers drop-in check failed for $f. Details:"
