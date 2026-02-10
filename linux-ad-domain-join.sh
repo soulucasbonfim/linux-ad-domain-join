@@ -4156,7 +4156,7 @@ else
 
         if [[ "$synced" == true ]]; then
             # Try to print what we are synced to (varies)
-            synced_server="$(chronyc tracking 2>/dev/null | awk -F': *' 'tolower($1)=="reference id" {print $2; exit}' | trim_line || true)"
+            synced_server="$(chronyc tracking 2>/dev/null | awk -F':' 'tolower($0) ~ /^reference id/ {print $2; exit}' | trim_line 2>/dev/null || true)"
             log_info "✅ NTP synchronized (Reference: ${synced_server:-unknown})"
             break
         fi
