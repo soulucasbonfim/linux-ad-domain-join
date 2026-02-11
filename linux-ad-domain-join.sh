@@ -637,6 +637,12 @@ safe_mktemp() {
     printf '%s' "$tmpfile"
 }
 
+# Restore SELinux security context after file creation/move.
+# No-op on systems without SELinux. Accepts same args as restorecon.
+selinux_restore() {
+    command -v restorecon >/dev/null 2>&1 && restorecon "$@" 2>/dev/null || true
+}
+
 trim_line() {
     # shellcheck disable=SC2086  # SED_EXT must be expanded as a flag (-E/-r)
     sed $SED_EXT \
@@ -875,6 +881,9 @@ export TMOUT
 readonly TMOUT
 EOF
 
+    # Restore SELinux context (install via /dev/stdin inherits wrong context)
+    selinux_restore "$target"
+
     log_info "✅ TMOUT enforced via $target (TMOUT=$timeout seconds)"
 }
 
@@ -915,6 +924,7 @@ sshd_set_directive_dedup() {
     chmod --reference="$file" "$tmp" 2>/dev/null || true
 
     mv -f "$tmp" "$file" || { rm -f "$tmp"; log_error "Failed to install updated $file" 1; }
+    selinux_restore "$file"
 }
 
 validate_sshd_config_or_die() {
@@ -1553,6 +1563,10 @@ write_file() {
     _file_ensure_mutable "$path"
     install -m "$mode" -o root -g root -D /dev/stdin "$path"
     _file_restore_attr "$path"
+
+    # Restore SELinux context if applicable (install via /dev/stdin
+    # inherits caller's context instead of the policy-defined context)
+    selinux_restore "$path"
 }
 
 append_line() {
@@ -1912,6 +1926,7 @@ if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release
                 log_info "⚙ RPM database appears corrupted - initiating recovery"
 
                 # Backup existing RPM database
+                # (backup_file does not support directories — use cp -a directly)
                 if [[ -d /var/lib/rpm ]]; then
                     backup_path="/var/lib/rpm.bak.$(date +%F_%H-%M)"
                     cp -a /var/lib/rpm "$backup_path" 2>/dev/null || true
@@ -2779,8 +2794,8 @@ else
                 fi
                 # Prevent DHCP from overwriting DNS (ignore-auto-dns)
                 nmcli con mod "$_nm_conn" ipv4.ignore-auto-dns yes 2>/dev/null || true
-                # Apply changes
-                nmcli con up "$_nm_conn" 2>/dev/null || true
+                # Apply changes (suppress stdout to keep log clean)
+                nmcli con up "$_nm_conn" >/dev/null 2>&1 || true
                 log_info "✅ DNS configured via NetworkManager (connection: $_nm_conn)"
                 _dns_configured=true
             fi
@@ -2848,7 +2863,6 @@ network:
         addresses: [$DC_DNS_IP]
         search: [$DOMAIN]
 EOF
-            chmod 0600 "$_netplan_dropin"
             netplan apply 2>/dev/null || log_info "⚠ netplan apply failed - manual review recommended"
             log_info "✅ DNS configured via Netplan ($_netplan_dropin)"
             _dns_configured=true
@@ -3381,9 +3395,7 @@ EOF
 
     # Apply SELinux contexts and reload systemd/dbus managers as needed
     if (( ODDJOB_CHANGED == 1 )); then
-        if command -v restorecon >/dev/null 2>&1; then
-            restorecon -F "$DBUS_SVC" "$ODDJOB_XML" 2>/dev/null || true
-        fi
+        selinux_restore -F "$DBUS_SVC" "$ODDJOB_XML"
 
         log_info "🔄 Updating system management daemons (systemd and D-Bus)"
         cmd_try systemctl daemon-reexec || true
@@ -3727,7 +3739,7 @@ else
         backup_file "$NSS_FILE"
         cp -p -- "$NSS_EDIT" "$NSS_FILE"
     fi
-    command -v restorecon >/dev/null 2>&1 && cmd_try restorecon -F "$NSS_FILE" || true
+    selinux_restore -F "$NSS_FILE"
 fi
 
 # Restore immutable bit if it was originally set
@@ -3992,7 +4004,7 @@ EOF
 
             # Comment out existing time-sync directives that we are about to enforce
             # to prevent duplication and configuration ambiguity.
-            if [[ "$line" =~ ^[[:space:]]*(server|pool|driftfile|makestep|rtcsync|logdir)([[:space:]]+|$) ]]; then
+            if [[ "$line" =~ ^[[:space:]]*(server|pool|driftfile|makestep|rtcsync|logdir|sourcedir)([[:space:]]+|$) ]]; then
                 if [[ "$line" =~ disabled-by-linux-ad-domain-join: ]]; then
                     echo "$line" >>"$tmp_chrony"
                 else
@@ -4036,7 +4048,8 @@ EOF
     else
         chown root:root "$tmp_chrony" 2>/dev/null || true
         chmod 644 "$tmp_chrony" 2>/dev/null || true
-        mv -f "$tmp_chrony" "$chrony_conf" || log_error "Failed to install chrony config: $chrony_conf" 1
+        cmd_must mv -f "$tmp_chrony" "$chrony_conf"
+        selinux_restore "$chrony_conf"
     fi
 fi
 
@@ -4097,6 +4110,7 @@ fi
 # Enable + restart chrony (systemd/sysvinit) ----
 log_info "🔧 Enabling and restarting Chrony service (${chrony_service})"
 
+_chrony_running=false
 if $VALIDATE_ONLY; then
     log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Suppressing service enable/restart for chrony"
 else
@@ -4114,29 +4128,41 @@ else
     else
         log_info "⚠️ No service manager found to restart chrony; skipping restart"
     fi
+
+    # Verify chrony is actually running before entering wait loop
+    sleep 1
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet "$chrony_service" 2>/dev/null && _chrony_running=true
+    elif pidof chronyd >/dev/null 2>&1 || pidof chrony >/dev/null 2>&1; then
+        _chrony_running=true
+    fi
+
+    if ! $_chrony_running; then
+        log_info "⚠️ Chrony service failed to start — skipping NTP sync wait"
+        log_info "ℹ Debug: systemctl status ${chrony_service} / journalctl -xeu ${chrony_service}"
+    fi
 fi
 
-# Wait for synchronization (chronyc compatibility aware) ----
-# We do NOT hard-require systemctl, and we don’t hard-require "Leap status".
+# Wait for synchronization (only if chrony is running) ----
 # Success criteria (portable):
 #   - chronyc sources shows a selected source (*), OR
 #   - chronyc tracking shows Reference ID != 00000000 and Stratum is a number.
-log_info "🕒 Waiting for NTP synchronization (up to 45s)"
-
 synced=false
 start_time="$(date +%s)"
 
-# If chronyc has 'waitsync', prefer it (cleaner on newer chrony).
-has_waitsync=false
-if chronyc -h 2>/dev/null | grep -qi 'waitsync'; then
-    has_waitsync=true
-elif chronyc help 2>/dev/null | grep -qi 'waitsync'; then
-    has_waitsync=true
-fi
-
 if $VALIDATE_ONLY; then
     log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Skipping active sync wait"
-else
+elif $_chrony_running; then
+    log_info "🕒 Waiting for NTP synchronization (up to 45s)"
+
+    # If chronyc has 'waitsync', prefer it (cleaner on newer chrony).
+    has_waitsync=false
+    if chronyc -h 2>/dev/null | grep -qi 'waitsync'; then
+        has_waitsync=true
+    elif chronyc help 2>/dev/null | grep -qi 'waitsync'; then
+        has_waitsync=true
+    fi
+
     if $has_waitsync; then
         # Use timeout with SIGKILL fallback for stubborn processes
         if timeout --signal=KILL 0 true >/dev/null 2>&1; then
@@ -4163,7 +4189,6 @@ else
         fi
 
         if [[ "$synced" == true ]]; then
-            # Try to print what we are synced to (varies)
             synced_server="$(chronyc tracking 2>/dev/null | awk -F':' 'tolower($0) ~ /^reference id/ {print $2; exit}' | trim_line 2>/dev/null || true)"
             log_info "✅ NTP synchronized (Reference: ${synced_server:-unknown})"
             break
@@ -4176,13 +4201,13 @@ else
     printf "\r\033[K" >&2
 fi
 
-if [[ "$synced" != true ]]; then
+if [[ "$synced" != true && "$_chrony_running" == true ]]; then
     log_info "⚠️ NTP not synchronized yet after 45s (server: $NTP_SERVER)."
     log_info "ℹ Debug hints:"
     log_info "   - Check: chronyc sources -v"
     log_info "   - Check: chronyc tracking"
     log_info "   - Check logs: journalctl -u ${chrony_service} (systemd) OR /var/log/chrony/*"
-else
+elif [[ "$synced" == true ]]; then
     end_time="$(date +%s)"
     elapsed=$(( end_time - start_time ))
     log_info "ℹ Time sync confirmed in ${elapsed}s - proceeding with Kerberos operations"
@@ -4694,7 +4719,9 @@ dyndns_ttl = 3600
 dyndns_update_ptr = True
 EOF
 
-# Ownership is enforced by write_file (install -o/-g), but keep a safety check
+# Defense-in-depth: re-enforce strict ownership/permissions
+# (write_file already sets these via install -m/-o/-g, but SSSD
+# refuses to start if permissions are not exactly 0600 root:root)
 cmd_try chown root:root "$SSSD_CONF" || true
 cmd_try chmod 600 "$SSSD_CONF" || true
 
@@ -4765,6 +4792,7 @@ if [[ -f "$PAM_SU_FILE" ]]; then
         else
             cmd_must mv -f "$tmp_su" "$PAM_SU_FILE"
             cmd_must chmod 644 "$PAM_SU_FILE"
+            selinux_restore "$PAM_SU_FILE"
         fi
         log_info "✅ pam_sss binding injected into $PAM_SU_FILE (original preserved in ${su_backup:-unknown})"
     fi
@@ -5287,6 +5315,7 @@ if [[ $VISUDO_RC -eq 0 ]]; then
     else
         cmd_must mv -f "$tmp_sudo" "$SUDOERS_MAIN"
         cmd_must chmod 440 "$SUDOERS_MAIN"
+        selinux_restore "$SUDOERS_MAIN"
     fi
     log_info "✅ Sudoers includes normalized successfully"
 else
@@ -5468,6 +5497,7 @@ else
         else
             cmd_must mv -f "$tmp" "$f"
             cmd_must chmod 440 "$f"
+            selinux_restore "$f"
         fi
 
 		# Standardized log output format
