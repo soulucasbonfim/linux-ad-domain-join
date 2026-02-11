@@ -873,19 +873,6 @@ esac
 TMOUT=$timeout
 export TMOUT
 readonly TMOUT
-
-# Custom message (PT/EN) + clean logout (prevents Bash default auto-logout text)
-__LOCALE="\${LC_MESSAGES:-\${LANG:-}}"
-case "\$__LOCALE" in
-  pt_BR*|pt_PT*|pt_*)
-    __TMOUT_MSG="Sessão encerrada por inatividade (\${TMOUT}s)."
-    ;;
-  *)
-    __TMOUT_MSG="Session closed due to inactivity (\${TMOUT}s)."
-    ;;
-esac
-
-trap 'printf "\\n%s\\n" "\$__TMOUT_MSG" >&2; if shopt -q login_shell; then logout; else exit; fi' ALRM
 EOF
 
     log_info "✅ TMOUT enforced via $target (TMOUT=$timeout seconds)"
