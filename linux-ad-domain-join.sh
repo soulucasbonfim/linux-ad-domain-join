@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.1.0
+# Version:     3.1.1
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -1792,6 +1792,14 @@ get_major_version_id() {
     return 1
 }
 
+# Get a user-friendly hostname for display/logging (FQDN if possible, else short hostname, else "unknown")
+get_display_hostname() {
+    local fqdn
+    fqdn="$(hostname -f 2>/dev/null || true)"
+    [[ "$fqdn" =~ ^localhost(\.localdomain)?$ || -z "$fqdn" ]] && fqdn="$(hostname -s 2>/dev/null || echo 'unknown')"
+    echo "$fqdn"
+}
+
 # -------------------------------------------------------------------------
 # OS detection
 # -------------------------------------------------------------------------
@@ -1813,7 +1821,7 @@ OS_ARCH=$(uname -m)
 KERNEL_VER=$(uname -r)
 
 log_info "🧾 Starting linux-ad-domain-join.sh version $scriptVersion..."
-log_info "🌐 Hostname: $(hostname -f 2>/dev/null || hostname 2>/dev/null || true) | IP: $(hostname -I 2>/dev/null | awk '{print $1}' || true)"
+log_info "🌐 Hostname: $(get_display_hostname) | IP: $(hostname -I 2>/dev/null | awk '{print $1}' || true)"
 log_info "🧬 OS detected: $OS_NAME ($ID $OS_VERSION, kernel $KERNEL_VER, arch $OS_ARCH)"
 log_info "🧬 OS family: $OS_FAMILY, Package Manager: $PKG, SSH group: $SSH_G"
 
