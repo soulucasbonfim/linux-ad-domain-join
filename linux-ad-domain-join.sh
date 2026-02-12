@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.1.2
+# Version:     3.2
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -1825,6 +1825,109 @@ get_display_hostname() {
 }
 
 # -------------------------------------------------------------------------
+# Auto-discover the nearest Domain Controller via DNS SRV + ping latency
+# -------------------------------------------------------------------------
+# Uses the standard AD SRV record: _ldap._tcp.dc._msdcs.<domain>
+# (same mechanism Windows uses for DC Locator).
+# Discovery chain: dig → host → nslookup → adcli (fallback).
+# When multiple DCs are found, pings all in parallel and picks the fastest.
+# Prints the chosen DC FQDN to stdout. Returns 1 if discovery fails.
+# -------------------------------------------------------------------------
+discover_nearest_dc() {
+    local domain="${1:?Usage: discover_nearest_dc <domain>}"
+    local srv_record="_ldap._tcp.dc._msdcs.${domain,,}"
+    local candidates="" dc_arr=() best=""
+
+    # ── Discover candidates from DNS SRV ──
+    if [[ -z "$candidates" ]] && command -v dig >/dev/null 2>&1; then
+        candidates="$(dig +short +tcp SRV "$srv_record" 2>/dev/null \
+            | awk '{gsub(/\.$/,"",$4); print $4}' \
+            | awk '!seen[tolower($0)]++ {print}' \
+            | tr '\n' ' ')" || true
+    fi
+    if [[ -z "$candidates" ]] && command -v host >/dev/null 2>&1; then
+        candidates="$(host -t SRV "$srv_record" 2>/dev/null \
+            | awk '/SRV/ {gsub(/\.$/,"",$NF); print $NF}' \
+            | awk '!seen[tolower($0)]++ {print}' \
+            | tr '\n' ' ')" || true
+    fi
+    if [[ -z "$candidates" ]] && command -v nslookup >/dev/null 2>&1; then
+        candidates="$(nslookup -type=SRV "$srv_record" 2>/dev/null \
+            | awk '/service =/ {gsub(/\.$/,"",$NF); print $NF}' \
+            | awk '!seen[tolower($0)]++ {print}' \
+            | tr '\n' ' ')" || true
+    fi
+    if [[ -z "$candidates" ]] && command -v adcli >/dev/null 2>&1; then
+        candidates="$(adcli info "${domain,,}" 2>/dev/null \
+            | awk -F' = ' '/^domain-controllers/ {print $2}')" || true
+    fi
+
+    candidates="$(trim_ws "${candidates:-}")"
+    [[ -z "$candidates" ]] && return 1
+
+    read -ra dc_arr <<< "$candidates"
+
+    # ── Single DC — no ping needed ──
+    if (( ${#dc_arr[@]} == 1 )); then
+        echo "${dc_arr[0]}"
+        return 0
+    fi
+
+    # ── Multiple DCs — parallel ping, pick lowest latency ──
+    local ping_tmp _dc _dc_l _dc_ip _dc_avg _running=0
+    ping_tmp="$(mktemp /tmp/.dc-ping.XXXXXX 2>/dev/null)" || {
+        # mktemp failed — fall back to first candidate
+        echo "${dc_arr[0]}"
+        return 0
+    }
+
+    for _dc in "${dc_arr[@]}"; do
+        (
+            _dc_l="$(echo "$_dc" | tr '[:upper:]' '[:lower:]')"
+
+            # Resolve: getent → host → dig
+            _dc_ip=""
+            if command -v getent >/dev/null 2>&1; then
+                _dc_ip="$(getent hosts "$_dc" 2>/dev/null | awk '{print $1; exit}')" || true
+            fi
+            if [[ -z "$_dc_ip" ]] && command -v host >/dev/null 2>&1; then
+                _dc_ip="$(host -t A "$_dc" 2>/dev/null | awk '/has address/ {print $4; exit}')" || true
+            fi
+            if [[ -z "$_dc_ip" ]] && command -v dig >/dev/null 2>&1; then
+                _dc_ip="$(dig +short A "$_dc" 2>/dev/null | head -1)" || true
+            fi
+            [[ -z "$_dc_ip" ]] && return
+
+            _dc_avg="$(ping -c 1 -W 1 -q "$_dc_ip" 2>/dev/null \
+                | awk -F'/' '/^(rtt|round-trip)/ {printf "%.3f", $5}')" || true
+            [[ -n "$_dc_avg" && "$_dc_avg" != "0.000" ]] && \
+                echo "${_dc_avg}|${_dc_l}" >> "$ping_tmp"
+        ) &
+
+        _running=$(( _running + 1 ))
+        if (( _running >= 15 )); then
+            wait
+            _running=0
+        fi
+    done
+    wait
+
+    if [[ -s "$ping_tmp" ]]; then
+        best="$(sort -t'|' -k1,1 -g "$ping_tmp" | head -1 | cut -d'|' -f2)"
+    fi
+    rm -f "$ping_tmp"
+
+    if [[ -n "$best" ]]; then
+        echo "$best"
+        return 0
+    fi
+
+    # All pings failed — return first candidate
+    echo "${dc_arr[0]}"
+    return 0
+}
+
+# -------------------------------------------------------------------------
 # OS detection
 # -------------------------------------------------------------------------
 load_os_release
@@ -2164,7 +2267,16 @@ esac
 if $NONINTERACTIVE; then
     : "${DOMAIN:?DOMAIN required}"
     : "${OU:?OU required}"
-    : "${DC_SERVER:?DC_SERVER required}"
+    # DC_SERVER: auto-discover nearest if not provided
+    if [[ -z "${DC_SERVER:-}" ]]; then
+        log_info "🔍 DC_SERVER not set — running auto-discovery..."
+        DC_SERVER="$(discover_nearest_dc "$DOMAIN")" || true
+        if [[ -n "$DC_SERVER" ]]; then
+            log_info "✅ DC auto-discovered: ${DC_SERVER}"
+        else
+            log_error "DC_SERVER required (auto-discovery failed — pass DC_SERVER explicitly)" 1
+        fi
+    fi
 	: "${NTP_SERVER:?NTP_SERVER required}"
     : "${DOMAIN_USER:?DOMAIN_USER required}"
     : "${DOMAIN_PASS:?DOMAIN_PASS required}"
@@ -2248,8 +2360,18 @@ else
     OU="$(trim_ws "${OU:-}")"
     OU="${OU:-$default_OU}"
 
-    # DC Server (optional, default filled)
-    default_DC_SERVER="${DOMAIN_SHORT,,}-sp-ad01.${DOMAIN,,}"
+    # DC Server — auto-discover nearest via DNS SRV + ping latency
+    log_info "🔍 Discovering nearest Domain Controller..."
+    default_DC_SERVER="$(discover_nearest_dc "$DOMAIN")" || true
+
+    if [[ -n "$default_DC_SERVER" ]]; then
+        log_info "✅ Nearest DC: ${default_DC_SERVER}"
+    else
+        # Fallback: static pattern if discovery failed
+        default_DC_SERVER="${DOMAIN_SHORT,,}-ad01.${DOMAIN,,}"
+        log_info "ℹ DNS SRV discovery unavailable — using fallback: ${default_DC_SERVER}"
+    fi
+
     printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} DC server ${C_DIM}[default: ${default_DC_SERVER}]${C_RESET}: " "$(date '+%F %T')"
     read -r DC_SERVER
     DC_SERVER="$(trim_ws "${DC_SERVER:-}")"
