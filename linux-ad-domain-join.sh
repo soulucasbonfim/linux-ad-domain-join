@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.2
+# Version:     3.2.1
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -180,9 +180,9 @@ if locale -a 2>/dev/null | grep -qiE '^(C\.UTF-8|en_US\.UTF-8|pt_BR\.UTF-8)$'; t
     fi
 fi
 
-# =========================================================================
+# -------------------------------------------------------------------------
 # Terminal Initialization & Screen Clear (MAXIMUM COMPATIBILITY)
-# =========================================================================
+# -------------------------------------------------------------------------
 init_terminal_safe() {
     # Silently fail in non-interactive environments
     [[ -t 1 ]] || return 0
@@ -1953,127 +1953,6 @@ log_info "🧬 OS detected: $OS_NAME ($ID $OS_VERSION, kernel $KERNEL_VER, arch 
 log_info "🧬 OS family: $OS_FAMILY, Package Manager: $PKG, SSH group: $SSH_G"
 
 # -------------------------------------------------------------------------
-# Smart Internet Connectivity Detection (dynamic and autonomous)
-# -------------------------------------------------------------------------
-log_info "🌐 Detecting Internet connectivity intelligently"
-HAS_INTERNET=false
-CONNECT_DETAILS=()
-
-# Detect default route / gateway
-DEFAULT_ROUTE="$(ip route get 1.1.1.1 2>/dev/null | awk '/via/ {print $3; exit}' || true)"
-if [[ -n "$DEFAULT_ROUTE" ]]; then
-    CONNECT_DETAILS+=( "✅ Default route detected via gateway $DEFAULT_ROUTE" )
-else
-    CONNECT_DETAILS+=( "🛑 No default route - host likely isolated or LAN-only" )
-fi
-
-# Check DNS functionality (without relying on specific domains)
-DNS_SERVER="$(grep -m1 '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' || true)"
-if [[ -z "$DNS_SERVER" ]]; then
-    CONNECT_DETAILS+=( "⚠️ No DNS servers configured in /etc/resolv.conf" )
-else
-    if timeout 3 getent hosts example.com >/dev/null 2>&1; then
-        CONNECT_DETAILS+=( "✅ DNS resolution working (resolver: $DNS_SERVER)" )
-    else
-        CONNECT_DETAILS+=( "⚠️ DNS resolution failed using $DNS_SERVER" )
-    fi
-fi
-
-# Test outbound reachability (generic TCP probe)
-NET_TEST_HOSTS=( "1.1.1.1" "8.8.8.8" "9.9.9.9" )
-NET_OK=false
-for H in "${NET_TEST_HOSTS[@]}"; do
-    if timeout 2 bash -c "echo > /dev/tcp/$H/443" 2>/dev/null; then
-        CONNECT_DETAILS+=( "✅ TCP/443 reachable (host $H)" )
-        NET_OK=true
-        break
-    elif timeout 2 bash -c "echo > /dev/tcp/$H/80" 2>/dev/null; then
-        CONNECT_DETAILS+=( "✅ TCP/80 reachable (host $H)" )
-        NET_OK=true
-        break
-    fi
-done
-
-if ! $NET_OK; then
-    CONNECT_DETAILS+=( "🛑 No outbound TCP connectivity on ports 80/443" )
-fi
-
-# Decide final state
-if [[ -n "$DEFAULT_ROUTE" && "$NET_OK" == true ]]; then
-    HAS_INTERNET=true
-    CONNECT_DETAILS+=( "🌐 Internet connectivity confirmed" )
-else
-    HAS_INTERNET=false
-    CONNECT_DETAILS+=( "🚫 Internet unavailable (no route or no outbound access)" )
-fi
-
-# Logging connectivity summary
-log_info "📡 Connectivity diagnostic summary:"
-for line in "${CONNECT_DETAILS[@]}"; do
-    # Sanitize first, then colorize
-    line_sanitized="$(sanitize_log_msg <<< "$line")"
-    line_colored="$(colorize_tag "$line_sanitized")"
-    log_info "   ${line_colored}"
-done
-
-# -------------------------------------------------------------------------
-# [Self-Healing] Detect and repair RPM database corruption (RHEL-like only)
-# -------------------------------------------------------------------------
-if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release || -f /etc/rocky-release || -f /etc/almalinux-release ]]; then
-    if $VALIDATE_ONLY; then
-        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Skipping RPM database integrity/repair block (non-invasive mode)"
-    else
-        log_info "🧩 Checking RPM database integrity"
-
-        release_file=""
-        for f in /etc/redhat-release /etc/centos-release /etc/oracle-release /etc/rocky-release /etc/almalinux-release; do
-            [[ -f "$f" ]] && { release_file="$f"; break; }
-        done
-
-        if [[ -z "$release_file" ]]; then
-            log_info "ℹ No release file found for rpm check, skipping RPM DB verification"
-        elif $DRY_RUN; then
-            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would verify rpm ownership of $release_file and rebuild RPM DB if corrupted"
-        else
-            if ! rpm -qf "$release_file" &>/dev/null; then
-                log_info "⚙ RPM database appears corrupted - initiating recovery"
-
-                # Backup existing RPM database
-                # (backup_file does not support directories — use cp -a directly)
-                if [[ -d /var/lib/rpm ]]; then
-                    backup_path="/var/lib/rpm.bak.$(date +%F_%H-%M)"
-                    cp -a /var/lib/rpm "$backup_path" 2>/dev/null || true
-                    log_info "💾 Backup created at: $backup_path"
-                fi
-
-                # Ensure no package manager process is running before touching rpmdb locks
-                if pgrep -x yum >/dev/null 2>&1 || pgrep -x dnf >/dev/null 2>&1 || pgrep -x rpm >/dev/null 2>&1 || pgrep -x packagekitd >/dev/null 2>&1; then
-                    log_error "RPM database repair aborted: a package manager process is running (yum/dnf/rpm/packagekitd). Stop it and retry." 1
-                fi
-
-                # Remove potential stale locks (Berkeley DB and stale rpm lock file)
-                rm -f /var/lib/rpm/__db.* 2>/dev/null
-                rm -f /var/lib/rpm/.rpm.lock 2>/dev/null
-
-                # Attempt rebuild
-                if timeout 300 rpm --rebuilddb &>/dev/null; then
-                    log_info "✅ RPM database rebuilt successfully"
-                else
-                    log_error "Failed to rebuild RPM database. Please investigate manually at ${backup_path:-/var/lib/rpm.bak.*}" 8
-                fi
-
-                # Re-test after rebuild
-                if ! rpm -qf "$release_file" &>/dev/null; then
-                    log_error "RPM database still corrupted after rebuild. Aborting execution." 9
-                fi
-            else
-                log_info "✅ RPM database integrity verified"
-            fi
-        fi
-    fi
-fi
-
-# -------------------------------------------------------------------------
 # Auto-install missing dependencies (connectivity-aware)
 # -------------------------------------------------------------------------
 install_missing_deps() {
@@ -2149,8 +2028,6 @@ missing_cmds=()
 for cmd in "${tools[@]}"; do
     ! command -v "$cmd" &>/dev/null && missing_cmds+=( "$cmd" )
 done
-
-[[ ${#missing_cmds[@]} -gt 0 ]] && log_info "⚠ Missing tools (pre-install): ${missing_cmds[*]}"
 
 # -------------------------------------------------------------------------
 # Package list by distro (Samba-free, SSSD-based)
@@ -2229,37 +2106,160 @@ case "$PKG" in
         ;;
 esac
 
+HAS_INTERNET=false
 if (( ${#missing_pkgs[@]} > 0 )); then
+    [[ ${#missing_cmds[@]} -gt 0 ]] && log_info "⚠ Missing tools (pre-install): ${missing_cmds[*]}"
     log_info "🧩 Missing packages: ${missing_pkgs[*]}"
+
+    # -------------------------------------------------------------------------
+    # [Self-Healing] Detect and repair RPM database corruption
+    # (RHEL-like only — must run before attempting package install)
+    # -------------------------------------------------------------------------
+    if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release || -f /etc/rocky-release || -f /etc/almalinux-release ]]; then
+        if $VALIDATE_ONLY; then
+            log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Skipping RPM database integrity/repair block (non-invasive mode)"
+        else
+            log_info "🧩 Checking RPM database integrity"
+
+            release_file=""
+            for f in /etc/redhat-release /etc/centos-release /etc/oracle-release /etc/rocky-release /etc/almalinux-release; do
+                [[ -f "$f" ]] && { release_file="$f"; break; }
+            done
+
+            if [[ -z "$release_file" ]]; then
+                log_info "ℹ No release file found for rpm check, skipping RPM DB verification"
+            elif $DRY_RUN; then
+                log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would verify rpm ownership of $release_file and rebuild RPM DB if corrupted"
+            else
+                if ! rpm -qf "$release_file" &>/dev/null; then
+                    log_info "⚙ RPM database appears corrupted - initiating recovery"
+
+                    # Backup existing RPM database
+                    # (backup_file does not support directories — use cp -a directly)
+                    if [[ -d /var/lib/rpm ]]; then
+                        backup_path="/var/lib/rpm.bak.$(date +%F_%H-%M)"
+                        cp -a /var/lib/rpm "$backup_path" 2>/dev/null || true
+                        log_info "💾 Backup created at: $backup_path"
+                    fi
+
+                    # Ensure no package manager process is running before touching rpmdb locks
+                    if pgrep -x yum >/dev/null 2>&1 || pgrep -x dnf >/dev/null 2>&1 || pgrep -x rpm >/dev/null 2>&1 || pgrep -x packagekitd >/dev/null 2>&1; then
+                        log_error "RPM database repair aborted: a package manager process is running (yum/dnf/rpm/packagekitd). Stop it and retry." 1
+                    fi
+
+                    # Remove potential stale locks (Berkeley DB and stale rpm lock file)
+                    rm -f /var/lib/rpm/__db.* 2>/dev/null
+                    rm -f /var/lib/rpm/.rpm.lock 2>/dev/null
+
+                    # Attempt rebuild
+                    if timeout 300 rpm --rebuilddb &>/dev/null; then
+                        log_info "✅ RPM database rebuilt successfully"
+                    else
+                        log_error "Failed to rebuild RPM database. Please investigate manually at ${backup_path:-/var/lib/rpm.bak.*}" 8
+                    fi
+
+                    # Re-test after rebuild
+                    if ! rpm -qf "$release_file" &>/dev/null; then
+                        log_error "RPM database still corrupted after rebuild. Aborting execution." 9
+                    fi
+                else
+                    log_info "✅ RPM database integrity verified"
+                fi
+            fi
+        fi
+    fi
+
+    # -------------------------------------------------------------------------
+    # Internet connectivity check (only needed for package install)
+    # -------------------------------------------------------------------------
+    log_info "🌐 Checking Internet connectivity for package installation"
+    HAS_INTERNET=false
+    CONNECT_DETAILS=()
+
+    # Detect default route / gateway
+    DEFAULT_ROUTE="$(ip route get 1.1.1.1 2>/dev/null | awk '/via/ {print $3; exit}' || true)"
+    if [[ -n "$DEFAULT_ROUTE" ]]; then
+        CONNECT_DETAILS+=( "✅ Default route detected via gateway $DEFAULT_ROUTE" )
+    else
+        CONNECT_DETAILS+=( "🛑 No default route - host likely isolated or LAN-only" )
+    fi
+
+    # Check DNS functionality (without relying on specific domains)
+    DNS_SERVER="$(grep -m1 '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' || true)"
+    if [[ -z "$DNS_SERVER" ]]; then
+        CONNECT_DETAILS+=( "⚠️ No DNS servers configured in /etc/resolv.conf" )
+    else
+        if timeout 3 getent hosts example.com >/dev/null 2>&1; then
+            CONNECT_DETAILS+=( "✅ DNS resolution working (resolver: $DNS_SERVER)" )
+        else
+            CONNECT_DETAILS+=( "⚠️ DNS resolution failed using $DNS_SERVER" )
+        fi
+    fi
+
+    # Test outbound reachability (generic TCP probe)
+    NET_TEST_HOSTS=( "1.1.1.1" "8.8.8.8" "9.9.9.9" )
+    NET_OK=false
+    for H in "${NET_TEST_HOSTS[@]}"; do
+        if timeout 2 bash -c "echo > /dev/tcp/$H/443" 2>/dev/null; then
+            CONNECT_DETAILS+=( "✅ TCP/443 reachable (host $H)" )
+            NET_OK=true
+            break
+        elif timeout 2 bash -c "echo > /dev/tcp/$H/80" 2>/dev/null; then
+            CONNECT_DETAILS+=( "✅ TCP/80 reachable (host $H)" )
+            NET_OK=true
+            break
+        fi
+    done
+
+    if ! $NET_OK; then
+        CONNECT_DETAILS+=( "🛑 No outbound TCP connectivity on ports 80/443" )
+    fi
+
+    # Decide final state
+    if [[ -n "$DEFAULT_ROUTE" && "$NET_OK" == true ]]; then
+        HAS_INTERNET=true
+        CONNECT_DETAILS+=( "🌐 Internet connectivity confirmed" )
+    else
+        HAS_INTERNET=false
+        CONNECT_DETAILS+=( "🚫 Internet unavailable (no route or no outbound access)" )
+    fi
+
+    # Logging connectivity summary
+    log_info "📡 Connectivity diagnostic summary:"
+    for line in "${CONNECT_DETAILS[@]}"; do
+        line_sanitized="$(sanitize_log_msg <<< "$line")"
+        line_colored="$(colorize_tag "$line_sanitized")"
+        log_info "   ${line_colored}"
+    done
+
+    # -------------------------------------------------------------------------
+    # Install missing packages
+    # -------------------------------------------------------------------------
     install_missing_deps "${missing_pkgs[@]}"
+
+    # -------------------------------------------------------------------------
+    # Post-install: validate that required commands are now available
+    # -------------------------------------------------------------------------
+    for cmd in realm adcli kinit kdestroy timedatectl systemctl \
+               sed grep tput timeout hostname cp chmod tee \
+               ldapsearch ldapmodify chronyc; do
+        check_cmd "$cmd"
+    done
+
+    case "$OS_FAMILY" in
+        debian) check_cmd pam-auth-update ;;
+        rhel)
+            if (( RHEL_MAJOR < 8 )); then
+                check_cmd authconfig
+            else
+                check_cmd authselect
+            fi
+            ;;
+        suse) check_cmd pam-config ;;
+    esac
 else
-    log_info "✅ All required packages are installed"
+    log_info "✅ All required packages and tools are present — skipping connectivity check"
 fi
-
-# -------------------------------------------------------------------------
-# Validate that required commands are now available
-# -------------------------------------------------------------------------
-for cmd in realm adcli kinit kdestroy timedatectl systemctl \
-           sed grep tput timeout hostname cp chmod tee \
-           ldapsearch ldapmodify chronyc; do
-  check_cmd "$cmd"
-done
-
-case "$OS_FAMILY" in
-	debian)
-		check_cmd pam-auth-update
-		;;
-	rhel)
-		if (( RHEL_MAJOR < 8 )); then
-			check_cmd authconfig
-		else
-			check_cmd authselect
-		fi
-		;;
-	suse)
-		check_cmd pam-config
-		;;
-esac
 
 # -------------------------------------------------------------------------
 # Collect domain join inputs
@@ -5670,9 +5670,9 @@ log_info "💡 Performing post-validation summary checks"
 REALM_JOINED=$(safe_realm_list | awk '/^[^ ]/ {print $1}' | head -n1)
 
 if command -v systemctl >/dev/null 2>&1; then
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # SSSD service status (systemd)
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
     if systemctl list-unit-files "sssd.service" 2>/dev/null | grep -q 'sssd\.service'; then
         SSSD_STATUS=$(systemctl is-active sssd 2>/dev/null || echo "inactive")
     else
@@ -5680,9 +5680,9 @@ if command -v systemctl >/dev/null 2>&1; then
     fi
     [[ -z "$SSSD_STATUS" ]] && SSSD_STATUS="inactive"
 
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # SSH service status (handle ssh vs sshd naming)
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
     if systemctl list-unit-files "ssh.service" 2>/dev/null | grep -q 'ssh\.service'; then
         SSH_STATUS=$(systemctl is-active ssh 2>/dev/null || echo "inactive")
     elif systemctl list-unit-files "sshd.service" 2>/dev/null | grep -q 'sshd\.service'; then
@@ -5693,9 +5693,9 @@ if command -v systemctl >/dev/null 2>&1; then
     fi
     [[ -z "$SSH_STATUS" ]] && SSH_STATUS="inactive"
 else
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
     # Fallback for distros without systemd
-    # ---------------------------------------------------------------
+    # -------------------------------------------------------------------------
     pgrep sssd >/dev/null 2>&1 && SSSD_STATUS="active" || SSSD_STATUS="inactive"
     pgrep sshd >/dev/null 2>&1 && SSH_STATUS="active"  || SSH_STATUS="inactive"
 fi
