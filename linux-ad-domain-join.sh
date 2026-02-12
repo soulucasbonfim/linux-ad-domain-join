@@ -640,6 +640,16 @@ safe_mktemp() {
 # Restore SELinux security context after file creation/move.
 # No-op on systems without SELinux. Accepts same args as restorecon.
 selinux_restore() {
+    local path="${1:-}"
+
+    # Best Practice: Do not attempt to restore context on ephemeral/temporary files.
+    # These files inherit the correct context (e.g., tmp_t) from their parent directory
+    # upon creation. Running restorecon on random filenames in /tmp fails because
+    # there is no matching policy rule for them in the system file_contexts database.
+    if [[ "$path" == /tmp/* || "$path" == /var/tmp/* || "$path" == /dev/shm/* || "$path" == /run/* ]]; then
+        return 0
+    fi
+
     command -v restorecon >/dev/null 2>&1 && restorecon "$@" 2>/dev/null || true
 }
 
@@ -4143,19 +4153,28 @@ else
     fi
 fi
 
-# Wait for synchronization (only if chrony is running) ----
-# Success criteria (portable):
-#   - chronyc sources shows a selected source (*), OR
-#   - chronyc tracking shows Reference ID != 00000000 and Stratum is a number.
+# -------------------------------------------------------------------------
+# Wait for NTP synchronization (time-jump aware)
+# -------------------------------------------------------------------------
+# Uses /proc/uptime (monotonic) instead of date +%s (wall clock) to avoid
+# incorrect elapsed time when chrony steps the system clock during sync.
+# Budget is shared between waitsync (if available) and manual polling.
+# -------------------------------------------------------------------------
 synced=false
-start_time="$(date +%s)"
+_ntp_budget=45
+
+# Monotonic clock reader: /proc/uptime is immune to wall-clock jumps
+_uptime_secs() { awk '{printf "%d\n",$1}' /proc/uptime 2>/dev/null || echo "${SECONDS:-0}"; }
+
+_mono_start="$(_uptime_secs)"
+_mono_deadline=$(( _mono_start + _ntp_budget ))
 
 if $VALIDATE_ONLY; then
     log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Skipping active sync wait"
 elif $_chrony_running; then
-    log_info "🕒 Waiting for NTP synchronization (up to 45s)"
+    log_info "🕒 Waiting for NTP synchronization (up to ${_ntp_budget}s)"
 
-    # If chronyc has 'waitsync', prefer it (cleaner on newer chrony).
+    # Prefer chronyc waitsync if available (cleaner on newer chrony)
     has_waitsync=false
     if chronyc -h 2>/dev/null | grep -qi 'waitsync'; then
         has_waitsync=true
@@ -4164,16 +4183,24 @@ elif $_chrony_running; then
     fi
 
     if $has_waitsync; then
-        # Use timeout with SIGKILL fallback for stubborn processes
-        if timeout --signal=KILL 0 true >/dev/null 2>&1; then
-            cmd_try timeout --signal=KILL 50 timeout 45 chronyc -a waitsync 45 0.5 >/dev/null 2>&1 || true
-        else
-            cmd_try timeout 45 chronyc -a waitsync 45 0.5 >/dev/null 2>&1 || true
+        _remaining=$(( _mono_deadline - $(_uptime_secs) ))
+        if (( _remaining > 0 )); then
+            if timeout --signal=KILL 0 true >/dev/null 2>&1; then
+                cmd_try timeout --signal=KILL $((_remaining + 5)) timeout "$_remaining" \
+                    chronyc -a waitsync "$_remaining" 0.5 >/dev/null 2>&1 || true
+            else
+                cmd_try timeout "$_remaining" \
+                    chronyc -a waitsync "$_remaining" 0.5 >/dev/null 2>&1 || true
+            fi
         fi
     fi
 
-    # Manual polling (works everywhere)
-    for i in $(seq 1 45); do
+    # Manual polling for remaining budget (works on all chrony versions)
+    while :; do
+        _mono_now="$(_uptime_secs)"
+        _elapsed=$(( _mono_now - _mono_start ))
+        (( _mono_now >= _mono_deadline )) && break
+
         # 1) sources selected marker (*)
         if chronyc sources -n 2>/dev/null | grep -qE '^[\^\=\#\?][[:space:]]*\*'; then
             synced=true
@@ -4194,24 +4221,26 @@ elif $_chrony_running; then
             break
         fi
 
-        # Progress line (stderr, sanitized)
-        printf "\r${C_DIM}[%s]${C_RESET} ${C_BLUE}[i]${C_RESET} Waiting for NTP sync... ${C_CYAN}(%2ds/%2ds)${C_RESET}" "$(date '+%F %T')" "$i" "45" >&2
+        printf "\r${C_DIM}[%s]${C_RESET} ${C_BLUE}[i]${C_RESET} Waiting for NTP sync... ${C_CYAN}(%2ds/%2ds)${C_RESET}" \
+            "$(date '+%F %T')" "$_elapsed" "$_ntp_budget" >&2
         sleep 1
     done
     printf "\r\033[K" >&2
 fi
 
 if [[ "$synced" != true && "$_chrony_running" == true ]]; then
-    log_info "⚠️ NTP not synchronized yet after 45s (server: $NTP_SERVER)."
+    log_info "⚠️ NTP not synchronized yet after ${_ntp_budget}s (server: $NTP_SERVER)."
     log_info "ℹ Debug hints:"
     log_info "   - Check: chronyc sources -v"
     log_info "   - Check: chronyc tracking"
     log_info "   - Check logs: journalctl -u ${chrony_service} (systemd) OR /var/log/chrony/*"
 elif [[ "$synced" == true ]]; then
-    end_time="$(date +%s)"
-    elapsed=$(( end_time - start_time ))
-    log_info "ℹ Time sync confirmed in ${elapsed}s - proceeding with Kerberos operations"
+    _mono_end="$(_uptime_secs)"
+    _elapsed=$(( _mono_end - _mono_start ))
+    log_info "ℹ Time sync confirmed in ${_elapsed}s - proceeding with Kerberos operations"
 fi
+
+unset _chrony_running _ntp_budget _mono_start _mono_deadline _mono_now _mono_end _elapsed _remaining
 
 # -------------------------------------------------------------------------
 # Obtain Kerberos ticket for domain operations
