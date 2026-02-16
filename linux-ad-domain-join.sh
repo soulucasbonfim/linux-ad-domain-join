@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.2.1
+# Version:     3.2.3
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -39,9 +39,20 @@
 # Options:
 #   --dry-run         Simulate all actions without applying changes
 #   --yes, -y         Non-interactive mode (requires DOMAIN, OU, DC_SERVER,
-#                     DOMAIN_USER, DOMAIN_PASS, GLOBAL_ADMIN_GROUPS as env vars)
+#                     DOMAIN_USER, DOMAIN_PASS,
+#                     SESSION_TIMEOUT_SECONDS, PERMIT_ROOT_LOGIN as env vars)
+#                     Optional env vars: PASSWORD_AUTHENTICATION (default: yes),
+#                     NTP_SERVER (default: ntp.<domain>),
+#                     ADM_GROUP, ADM_GROUP_ALL, SSH_GROUP, SSH_GROUP_ALL,
+#                     SEC_GROUP, SEC_GROUP_ALL, SUPER_GROUP, SUPER_GROUP_ALL
 #   --verbose, -v     Enable full command output and debugging traces
 #   --validate-only   Validate configuration and prerequisites without making changes
+#
+#   Security note (non-interactive mode):
+#     DOMAIN_PASS passed via env persists in /proc/<pid>/environ for the
+#     script lifetime (Linux kernel limitation). For hardened environments,
+#     consider injecting the password from a tmpfs file:
+#       DOMAIN_PASS="$(< /run/secrets/ad-pass)" ./linux-ad-domain-join.sh -y
 #
 # -------------------------------------------------------------------------------------------------
 # Requirements:
@@ -506,6 +517,16 @@ NONINTERACTIVE="${NONINTERACTIVE:-false}"
 VERBOSE="${VERBOSE:-false}"
 VALIDATE_ONLY="${VALIDATE_ONLY:-false}"
 LDAP_TIMEOUT="${LDAP_TIMEOUT:-30}"
+# Validate LDAP_TIMEOUT is a positive integer (reject suffixes, floats, negatives)
+if ! [[ "$LDAP_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    log_info "⚠ LDAP_TIMEOUT='$LDAP_TIMEOUT' is not a valid positive integer — defaulting to 30"
+    LDAP_TIMEOUT=30
+fi
+JOIN_TIMEOUT="${JOIN_TIMEOUT:-120}"
+if ! [[ "$JOIN_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    log_info "⚠ JOIN_TIMEOUT='$JOIN_TIMEOUT' is not a valid positive integer — defaulting to 120"
+    JOIN_TIMEOUT=120
+fi
 KRB5_KEYTAB="${KRB5_KEYTAB:-/etc/krb5.keytab}"
 
 # -------------------------------------------------------------------------
@@ -527,18 +548,34 @@ fi
 # Build timestamped log filename
 LOG_FILE="${LOG_DIR}/${LOG_TIMESTAMP}_${LOG_HOSTNAME}.log"
 
-# Ensure log directory exists (best-effort) + ensure log is writable
+# Ensure log directory exists with restrictive permissions
+# Harden /tmp paths against pre-existing symlinks (defense-in-depth)
+if [[ "$LOG_DIR" == /tmp/* || "$LOG_DIR" == /var/tmp/* ]]; then
+    if [[ -L "$LOG_DIR" ]]; then
+        log_info "⚠ LOG_DIR is a symlink ($LOG_DIR) — refusing to use it"
+        rm -f "$LOG_DIR" 2>/dev/null || true
+    fi
+fi
 mkdir -p "$LOG_DIR" 2>/dev/null || true
+chmod 750 "$LOG_DIR" 2>/dev/null || true
 if ! : >>"$LOG_FILE" 2>/dev/null; then
     # Fallback if /var/log is not writable
     LOG_DIR="/tmp/linux-ad-domain-join"
     LOG_FILE="${LOG_DIR}/${LOG_TIMESTAMP}_${LOG_HOSTNAME}.log"
     mkdir -p "$LOG_DIR" 2>/dev/null || true
+    chmod 750 "$LOG_DIR" 2>/dev/null || true
     : >>"$LOG_FILE" 2>/dev/null || { echo "[$(date '+%F %T')] [ERROR] Cannot write LOG_FILE=$LOG_FILE" >&2; exit 1; }
 fi
+# Restrict log file permissions (contains AD topology metadata)
+chmod 640 "$LOG_FILE" 2>/dev/null || true
 
 # Prune old log files (keep last 30 logs)
 LOG_RETENTION="${LOG_RETENTION:-30}"
+# Validate LOG_RETENTION is a positive integer (prevent arithmetic errors on bad env input)
+if ! [[ "$LOG_RETENTION" =~ ^[1-9][0-9]*$ ]]; then
+    log_info "⚠ LOG_RETENTION='$LOG_RETENTION' is not a valid positive integer — defaulting to 30"
+    LOG_RETENTION=30
+fi
 _prune_old_logs() {
     local log_dir="$1" keep="$2"
     [[ -d "$log_dir" ]] || return 0
@@ -566,13 +603,15 @@ LOCK_MODE=""
 
 if command -v flock >/dev/null 2>&1; then
     # Use an fd-based lock (auto-released on process exit).
-    exec 200>"$LOCK_FILE"
-    if ! flock -n 200; then
+    # Open with O_CLOEXEC via Bash {fd} syntax to prevent FD leak to child processes
+    # (e.g., nohup setsid for D-Bus restart would otherwise hold the lock indefinitely)
+    exec {_lock_fd}>"$LOCK_FILE"
+    if ! flock -n "$_lock_fd"; then
         echo "[$(date '+%F %T')] [ERROR] Another instance is already running (lock: $LOCK_FILE)" >&2
         exit 16
     fi
     # Store PID for troubleshooting (best-effort).
-    printf '%s\n' "$$" 1>&200 2>/dev/null || true
+    printf '%s\n' "$$" 1>&"$_lock_fd" 2>/dev/null || true
     LOCK_MODE="flock"
 else
     # Portable fallback: atomic mkdir lock with stale detection
@@ -587,9 +626,13 @@ else
         # Stale lock: previous run crashed without cleanup
         echo "[$(date '+%F %T')] [WARN] Removing stale lock from PID ${_lock_pid:-unknown} (lock: $LOCK_DIR_FALLBACK)" >&2
         rm -rf "$LOCK_DIR_FALLBACK" 2>/dev/null || true
+        # Atomic re-acquisition; sleep+retry reduces TOCTOU window
         if ! mkdir "$LOCK_DIR_FALLBACK" 2>/dev/null; then
-            echo "[$(date '+%F %T')] [ERROR] Failed to acquire lock after stale cleanup (lock: $LOCK_DIR_FALLBACK)" >&2
-            exit 16
+            sleep 0.2
+            if ! mkdir "$LOCK_DIR_FALLBACK" 2>/dev/null; then
+                echo "[$(date '+%F %T')] [ERROR] Failed to acquire lock after stale cleanup (lock: $LOCK_DIR_FALLBACK)" >&2
+                exit 16
+            fi
         fi
     fi
     printf '%s\n' "$$" >"${LOCK_DIR_FALLBACK}/pid" 2>/dev/null || true
@@ -619,9 +662,14 @@ log_info "💾 Log file: $LOG_FILE"
 BACKUP_RUN_ID="$(date +%Y%m%d_%H%M%S)_$(hostname -s)_$$"
 BACKUP_DIR="${BACKUP_ROOT}/${BACKUP_RUN_ID}"
 
+# -------------------------------------------------------------------------
+# Utility: Convert string to lowercase (for case-insensitive comparisons)
+# -------------------------------------------------------------------------
 to_lower() { echo "$1" | tr '[:upper:]' '[:lower:]'; }
 
-# Trim leading/trailing whitespace (pure bash, xargs-safe)
+# -------------------------------------------------------------------------
+# Trim leading/trailing whitespace and common list markers from command output lines.
+# -------------------------------------------------------------------------
 trim_ws() {
     local v="$1"
     v="${v#"${v%%[![:space:]]*}"}"
@@ -629,30 +677,45 @@ trim_ws() {
     printf '%s' "$v"
 }
 
-# Standardized mktemp wrapper: validates result, consistent errors, works with set -eu
+# -------------------------------------------------------------------------
+# Safe mktemp wrapper with enhanced error handling and logging context.
+# -------------------------------------------------------------------------
 safe_mktemp() {
-    local tmpfile template="${1:-}"
-    tmpfile="$(mktemp "$@" 2>&1)" || log_error "mktemp failed${template:+ (template: $template)}" 1
+    local tmpfile template="${*:-<default>}"
+    tmpfile="$(mktemp "$@" 2>&1)" || log_error "mktemp failed (template: $template)" 1
     [[ -z "$tmpfile" ]] && log_error "mktemp returned empty path" 1
     printf '%s' "$tmpfile"
 }
 
 # Restore SELinux security context after file creation/move.
 # No-op on systems without SELinux. Accepts same args as restorecon.
+# Ephemeral paths (/tmp, /var/tmp, /dev/shm, /run) are silently skipped
+# because they inherit correct context from their parent directory and
+# have no matching policy rule in the system file_contexts database.
 selinux_restore() {
-    local path="${1:-}"
+    local -a filtered=()
+    local arg
 
-    # Best Practice: Do not attempt to restore context on ephemeral/temporary files.
-    # These files inherit the correct context (e.g., tmp_t) from their parent directory
-    # upon creation. Running restorecon on random filenames in /tmp fails because
-    # there is no matching policy rule for them in the system file_contexts database.
-    if [[ "$path" == /tmp/* || "$path" == /var/tmp/* || "$path" == /dev/shm/* || "$path" == /run/* ]]; then
-        return 0
-    fi
+    for arg in "$@"; do
+        # Pass flags through unchanged (-R, -F, etc.)
+        if [[ "$arg" == -* ]]; then
+            filtered+=("$arg")
+            continue
+        fi
+        # Skip ephemeral paths (no policy rule exists for random tmpfiles)
+        [[ "$arg" == /tmp/* || "$arg" == /var/tmp/* || "$arg" == /dev/shm/* || "$arg" == /run/* ]] && continue
+        filtered+=("$arg")
+    done
 
-    command -v restorecon >/dev/null 2>&1 && restorecon "$@" 2>/dev/null || true
+    # Nothing to restore after filtering (all args were temp paths or flags-only)
+    (( ${#filtered[@]} == 0 )) && return 0
+
+    command -v restorecon >/dev/null 2>&1 && restorecon "${filtered[@]}" 2>/dev/null || true
 }
 
+# -------------------------------------------------------------------------
+# Trim leading/trailing whitespace and common list markers (e.g., '-', '*', '•') from command output lines.
+# -------------------------------------------------------------------------
 trim_line() {
     # shellcheck disable=SC2086  # SED_EXT must be expanded as a flag (-E/-r)
     sed $SED_EXT \
@@ -662,7 +725,9 @@ trim_line() {
         -e '/[Cc]url error/ s/[[:space:]]\[[^]]*][[:space:]]*$//'
 }
 
-# Service mgmt wrapper: systemctl -> service -> /etc/init.d/ (auto-detects; supports start/stop/restart/enable/disable/status)
+# -------------------------------------------------------------------------
+# Unified service control function: abstracts over systemctl, service/chkconfig, and direct init.d scripts.
+# -------------------------------------------------------------------------
 service_control() {
     local svc_name="$1"
     local action="$2"
@@ -748,7 +813,9 @@ service_control() {
     log_error "Cannot manage service $svc_name: no systemctl, service, or init.d script found" 1
 }
 
-# Init timestamped backup dir (0700, one per run, suppressed in VALIDATE_ONLY/DRY_RUN)
+# -------------------------------------------------------------------------
+# Initialize backup directory for the current run. Respects VALIDATE_ONLY and DRY_RUN modes with appropriate logging.
+# -------------------------------------------------------------------------
 init_backup_dir() {
     if $VALIDATE_ONLY; then
         log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Backup directory creation suppressed: $BACKUP_DIR"
@@ -765,7 +832,9 @@ init_backup_dir() {
     log_info "💾 Backup directory: $BACKUP_DIR"
 }
 
-# Prune old backups (keep N newest, best-effort, safe under set -eEuo)
+# -------------------------------------------------------------------------
+# Backup pruning: keep only the last N backup runs (directories) in BACKUP_ROOT, sorted by modification time (newest first).
+# -------------------------------------------------------------------------
 backup_prune_old_runs() {
     local keep="${1:-20}"
 
@@ -799,24 +868,33 @@ backup_prune_old_runs() {
     rm -f "$tmp_list"
 }
 
-# initialize backup directory
+# -------------------------------------------------------------------------
+# Backup a file with a unique name in the current run's backup directory, preserving permissions and SELinux context.
+# -------------------------------------------------------------------------
 init_backup_dir
 
-# delete old backups, keep only last N runs
+# -------------------------------------------------------------------------
+# Prune old backup runs (keep last 20 by default) - best-effort, safe under set -eEuo
+# -------------------------------------------------------------------------
 backup_prune_old_runs 20
 
 # -------------------------------------------------------------------------
-# Session timeout inputs (SSH + Shell)
+# Validate that a value is an unsigned integer (no suffixes, decimals, negatives)
 # -------------------------------------------------------------------------
-
 is_uint() { [[ "${1:-}" =~ ^[0-9]+$ ]]; }
 
+# -------------------------------------------------------------------------
+# Validate that a value is an unsigned integer within a specified range (inclusive).
+# -------------------------------------------------------------------------
 require_uint_range() {
     local name="$1" val="$2" min="$3" max="$4"
     is_uint "$val" || log_error "$name must be an integer (seconds). Got: '$val'" 1
     (( val >= min && val <= max )) || log_error "$name must be between $min and $max seconds. Got: $val" 1
 }
 
+# -------------------------------------------------------------------------
+# Normalize various yes/no inputs to "yes" or "no" (case-insensitive, supports multiple languages and common variants)
+# -------------------------------------------------------------------------
 normalize_yes_no() {
     local v
     v="$(to_lower "${1:-}")"
@@ -830,7 +908,9 @@ normalize_yes_no() {
     esac
 }
 
-# Remove/disable TMOUT duplicates inside /etc/profile.d to avoid conflicts
+# -------------------------------------------------------------------------
+# TMOUT management: disable existing TMOUT lines in /etc/profile.d/*.sh and apply new profile with specified timeout.
+# -------------------------------------------------------------------------
 disable_tmout_in_profile_d() {
     local f bk
 
@@ -839,6 +919,8 @@ disable_tmout_in_profile_d() {
         return 0
     fi
 
+    local _prev_nullglob=false
+    shopt -q nullglob && _prev_nullglob=true
     shopt -s nullglob
 
     for f in /etc/profile.d/*.sh; do
@@ -864,9 +946,12 @@ disable_tmout_in_profile_d() {
         log_info "🧹 Disabled existing TMOUT lines in $f"
     done
 
-    shopt -u nullglob
+    $_prev_nullglob || shopt -u nullglob
 }
 
+# -------------------------------------------------------------------------
+# Apply TMOUT profile with the specified timeout value, ensuring idempotency and SELinux context restoration.
+# -------------------------------------------------------------------------
 apply_tmout_profile() {
     local timeout="$1"
     local target="/etc/profile.d/99-session-timeout.sh"
@@ -897,6 +982,9 @@ EOF
     log_info "✅ TMOUT enforced via $target (TMOUT=$timeout seconds)"
 }
 
+# -------------------------------------------------------------------------
+# SSHD config management: set directive with deduplication (preserve Match blocks)
+# -------------------------------------------------------------------------
 sshd_set_directive_dedup() {
     # Ensures the directive is set once in the global section (before any Match blocks),
     # while preserving any Match-specific overrides. Preserves perms/owner.
@@ -937,6 +1025,11 @@ sshd_set_directive_dedup() {
     selinux_restore "$file"
 }
 
+# -------------------------------------------------------------------------
+# Validates the given sshd_config file using `sshd -t -f <file>`.
+# If validation fails, attempts to restore from backup and exits with an error. 
+# In DRY_RUN mode, only logs the intended validation command without executing it.
+# -------------------------------------------------------------------------
 validate_sshd_config_or_die() {
     local file="$1"
 
@@ -990,6 +1083,9 @@ validate_sshd_config_or_die() {
     fi
 }
 
+# -------------------------------------------------------------------------
+# Detects if any of the given service unit names exist on the system (systemd), returning the first match. Checks both systemctl and direct file existence to cover masked/static units.
+# -------------------------------------------------------------------------
 detect_service_unit() {
     local u
     command -v systemctl >/dev/null 2>&1 || { echo ""; return 1; }
@@ -1008,7 +1104,9 @@ detect_service_unit() {
     return 1
 }
 
-# Extract the first real command (ignores env wrapper, flags, and VAR=VAL)
+# -------------------------------------------------------------------------
+# Extracts the first non-wrapper binary from a command line, ignoring common wrappers (env, sudo, timeout, etc.) and their options.
+# -------------------------------------------------------------------------
 first_bin_from_cmd() {
     local arg
     local timeout_skip_next_nonflag=false
@@ -1051,7 +1149,9 @@ first_bin_from_cmd() {
     return 1
 }
 
-# Package manager error parser
+# -------------------------------------------------------------------------
+# Parses common package manager error messages from a log file and provides user-friendly explanations and troubleshooting tips.
+# -------------------------------------------------------------------------
 parse_pkg_error() {
     local log="$1" bin="$2"
 
@@ -1126,6 +1226,9 @@ parse_pkg_error() {
     return 1
 }
 
+# -------------------------------------------------------------------------
+# Utility to print commands with proper quoting for readability in logs and dry-run output.
+# -------------------------------------------------------------------------
 print_cmd_quoted() {
     local a out=()
     for a in "$@"; do
@@ -1134,6 +1237,9 @@ print_cmd_quoted() {
     printf '%s' "${out[*]}"
 }
 
+# -------------------------------------------------------------------------
+# Check if a command exists in PATH or at a given path. Used for validating commands before execution.
+# -------------------------------------------------------------------------
 _cmd_bin_exists() {
     # Accepts either "name" or "/path/name"
     local b="$1"
@@ -1145,6 +1251,9 @@ _cmd_bin_exists() {
     fi
 }
 
+# -------------------------------------------------------------------------
+# Extract target files from sed -i arguments for immutable attribute handling.
+# -------------------------------------------------------------------------
 _cmd_run_capture() {
     # Internal: runs a command (array), captures stdout+stderr into tmpfile, returns RC.
     # Usage: _cmd_run_capture <tmp_out_path> <cmd...>
@@ -1156,6 +1265,9 @@ _cmd_run_capture() {
     return $?
 }
 
+# -------------------------------------------------------------------------
+# Command classification for VALIDATE_ONLY mode (non-invasive dry-run)
+# -------------------------------------------------------------------------
 is_mutating_cmd() {
     # Determines if a command can modify the system. If yes, it will be suppressed in VALIDATE_ONLY mode.
     local first_bin="$1"; shift
@@ -1222,6 +1334,9 @@ is_mutating_cmd() {
     return 1
 }
 
+# -------------------------------------------------------------------------
+# Command execution wrapper with validation, dry-run, and classified error logging
+# -------------------------------------------------------------------------
 cmd_run() {
     # Usage: cmd_run <cmd> [args...]
     # Non-fatal: returns command RC. Logs failures (classified for pkg managers).
@@ -1296,13 +1411,21 @@ cmd_run() {
 
 # -------------------------------------------------------------------------
 # Strict-mode safe execution layer
-# - cmd_run/cmd_run_in: keep as-is (they return RC)
-# - cmd_try/cmd_try_in: NEVER propagate non-zero to the shell (safe under set -e)
-# - cmd_must/cmd_must_in: fatal wrappers based on CMD_LAST_RC
+# - cmd_run/cmd_run_in: raw execution, returns actual RC
+# - cmd_try:    returns actual RC; caller decides fate:
+#                 cmd_try <cmd> || true  → tolerate failure
+#                 cmd_try <cmd>          → fatal under set -e (ERR trap fires)
+# - cmd_try_in: always returns 0 (designed for use via cmd_must_in only)
+# - cmd_must/cmd_must_in: fatal wrappers; capture RC first, then exit with
+#                         descriptive message (avoids ERR trap preempting log output)
 # -------------------------------------------------------------------------
 
+# Global variable to hold last command RC for cmd_try/cmd_try_in (since cmd_must/cmd_must_in need to capture it before exiting)
 CMD_LAST_RC=0
 
+# -------------------------------------------------------------------------
+# Strict-mode safe execution layer with context-aware error logging
+# -------------------------------------------------------------------------
 cmd_try() {
     local rc=0
     local had_errexit=false
@@ -1321,14 +1444,16 @@ cmd_try() {
 
     $had_errexit && set -e
 
-    if [[ -n "$_prev_err_trap" ]]; then
-        eval "$_prev_err_trap"
-    fi
+    # Restore ERR trap by re-declaring directly (avoids eval)
+    trap "$ERROR_TRAP_CMD" ERR
 
     CMD_LAST_RC=$rc
     return "$rc"
 }
 
+# -------------------------------------------------------------------------
+# Fatal wrapper for cmd_try: logs error with context and exits if command failed
+# -------------------------------------------------------------------------
 cmd_must() {
     # Must not leak non-zero from cmd_try under `set -e`, otherwise ERR trap fires
     # before we can emit a descriptive message.
@@ -1341,6 +1466,9 @@ cmd_must() {
     return 0
 }
 
+# -------------------------------------------------------------------------
+# Strict-mode safe execution with stdin redirection (designed for use in cmd_must_in)
+# -------------------------------------------------------------------------
 cmd_run_in() {
     # Usage: cmd_run_in <stdin_file> <cmd> [args...]
     # Non-fatal: returns command RC.
@@ -1404,6 +1532,9 @@ cmd_run_in() {
     return "$rc"
 }
 
+# -------------------------------------------------------------------------
+# Strict-mode safe execution layer with context-aware error logging (designed for use in cmd_must_in)
+# -------------------------------------------------------------------------
 cmd_try_in() {
     # Usage: cmd_try_in <stdin_file> <cmd> [args...]
     local rc=0
@@ -1423,14 +1554,16 @@ cmd_try_in() {
 
     $had_errexit && set -e
 
-    if [[ -n "$_prev_err_trap" ]]; then
-        eval "$_prev_err_trap"
-    fi
+    # Restore ERR trap by re-declaring directly (avoids eval)
+    trap "$ERROR_TRAP_CMD" ERR
 
     CMD_LAST_RC=$rc
     return 0
 }
 
+# -------------------------------------------------------------------------
+# Fatal wrapper for cmd_try_in: logs error with context and exits if command failed
+# -------------------------------------------------------------------------
 cmd_must_in() {
     # Usage: cmd_must_in <stdin_file> <cmd> [args...]
     cmd_try_in "$@"
@@ -1438,6 +1571,9 @@ cmd_must_in() {
     return 0
 }
 
+# -------------------------------------------------------------------------
+# Utility: check if required command exists, else log error and exit
+# -------------------------------------------------------------------------
 check_cmd() {
     command -v "$1" >/dev/null 2>&1 || log_error "Required command '$1' not found" 1
 }
@@ -1470,7 +1606,7 @@ safe_realm_list() {
 }
 
 # -------------------------------------------------------------------------
-# File manipulation helpers
+# Idempotent file backup with path traversal protection and flexible output (stdout or variable)
 # -------------------------------------------------------------------------
 backup_file() {
     # Usage:
@@ -1515,6 +1651,8 @@ backup_file() {
         log_info "${C_YELLOW}[DRY-RUN]${C_RESET} 💾 Would backup '$path' -> '$bak'" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
+        else
+            printf '%s\n' "$bak"
         fi
         return 0
     fi
@@ -1526,6 +1664,8 @@ backup_file() {
         log_info "ℹ Backup already exists for this run: $bak" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
+        else
+            printf '%s\n' "$bak"
         fi
         return 0
     fi
@@ -1535,6 +1675,8 @@ backup_file() {
         log_info "ℹ Backup skipped (file not found): '$path' -> (planned) '$bak'" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
+        else
+            printf '%s\n' "$bak"
         fi
         return 0
     fi
@@ -1547,9 +1689,14 @@ backup_file() {
 
     if [[ -n "$__outvar" ]]; then
         printf -v "$__outvar" '%s' "$bak"
+    else
+        printf '%s\n' "$bak"
     fi
 }
 
+# -------------------------------------------------------------------------
+# Writes content from stdin to a file with specified mode, creating parent dirs as needed (idempotent if content/mode unchanged)
+# -------------------------------------------------------------------------
 write_file() {
     local mode="$1"
     local path="$2"
@@ -1571,7 +1718,20 @@ write_file() {
     [[ -d "$parent_dir" ]] || mkdir -p "$parent_dir" || log_error "Failed to create parent directory: $parent_dir" 31
 
     _file_ensure_mutable "$path"
-    install -m "$mode" -o root -g root -D /dev/stdin "$path"
+
+    # Atomic write: stage to temp file, then rename into place
+    # (rename(2) is atomic on POSIX filesystems, preventing truncated configs)
+    local _wf_tmp
+    _wf_tmp="$(mktemp "${path}.XXXXXX")" || log_error "write_file: mktemp failed for $path" 1
+    install -m "$mode" -o root -g root /dev/stdin "$_wf_tmp" || {
+        rm -f "$_wf_tmp"
+        log_error "write_file: install failed for $path" 1
+    }
+    mv -f "$_wf_tmp" "$path" || {
+        rm -f "$_wf_tmp"
+        log_error "write_file: mv failed for $path" 1
+    }
+
     _file_restore_attr "$path"
 
     # Restore SELinux context if applicable (install via /dev/stdin
@@ -1579,6 +1739,9 @@ write_file() {
     selinux_restore "$path"
 }
 
+# -------------------------------------------------------------------------
+# Append a line to a file (non-idempotent, may create duplicates if run multiple times)
+# -------------------------------------------------------------------------
 append_line() {
     # Usage: append_line <path> <line>
     local path="$1"
@@ -1599,12 +1762,18 @@ append_line() {
     _file_restore_attr "$path"
 }
 
+# -------------------------------------------------------------------------
+# Writes a single line to a file, replacing existing content (idempotent if line is unchanged)
+# -------------------------------------------------------------------------
 write_line_file() {
     # Usage: write_line_file <mode> <path> <single_line>
     local mode="$1" path="$2" line="$3"
     printf '%s\n' "$line" | write_file "$mode" "$path"
 }
 
+# -------------------------------------------------------------------------
+# Append a line to a file only if an exact match doesn't already exist (idempotent)
+# -------------------------------------------------------------------------
 append_line_unique() {
     # Usage: append_line_unique <path> <exact_line>
     local path="$1" line="$2"
@@ -1613,14 +1782,13 @@ append_line_unique() {
 }
 
 # -------------------------------------------------------------------------
-# Immutable attribute (chattr +i) - auto-handling infrastructure
+# Check if chattr/lsattr are available (returns 0 if both are present, 1 if either is missing)
 # -------------------------------------------------------------------------
-# Associative array tracking files whose immutable bit was removed.
-# Key = file path, Value = "1". Restored automatically by file ops or on exit.
-declare -A _IMMUTABLE_TRACKER=()
-
 _chattr_available() { command -v lsattr >/dev/null 2>&1 && command -v chattr >/dev/null 2>&1; }
 
+# -------------------------------------------------------------------------
+# Check if a file has the immutable bit set (returns 0 if immutable, 1 if not or on error)
+# -------------------------------------------------------------------------
 _file_has_immutable() {
     local f="$1"
     _chattr_available || return 1
@@ -1632,7 +1800,11 @@ _file_has_immutable() {
     return 1
 }
 
-# Transparently remove immutable bit before a file operation (idempotent)
+# -------------------------------------------------------------------------
+# Ensure a file is mutable by temporarily removing the immutable bit if set (idempotent)
+# -------------------------------------------------------------------------
+declare -A _IMMUTABLE_TRACKER=()
+
 _file_ensure_mutable() {
     local f="$1"
     [[ -e "$f" ]] || return 0
@@ -1645,7 +1817,9 @@ _file_ensure_mutable() {
     return 0
 }
 
-# Restore immutable bit for a single file (idempotent)
+# -------------------------------------------------------------------------
+# Restore immutable bit after file operation if we had removed it (idempotent)
+# -------------------------------------------------------------------------
 _file_restore_attr() {
     local f="$1"
     [[ "${_IMMUTABLE_TRACKER[$f]:-}" == "1" ]] || return 0
@@ -1656,7 +1830,9 @@ _file_restore_attr() {
     unset '_IMMUTABLE_TRACKER[$f]'
 }
 
-# Restore all tracked immutable bits (called from cleanup trap)
+# -------------------------------------------------------------------------
+# Restore immutable bits for all tracked files (called on exit)
+# -------------------------------------------------------------------------
 _file_restore_all_attrs() {
     local f
     for f in "${!_IMMUTABLE_TRACKER[@]}"; do
@@ -1664,7 +1840,9 @@ _file_restore_all_attrs() {
     done
 }
 
-# Extract target file(s) from a sed -i command's argument list
+# -------------------------------------------------------------------------
+# Sed target file extractor (handles -i with/without suffix, multiple files, and mixed options)
+# -------------------------------------------------------------------------
 _extract_sed_target_files() {
     local -a args=("$@")
     local -a files=()
@@ -1709,6 +1887,9 @@ detect_netcat_bin() {
     fi
 }
 
+# -------------------------------------------------------------------------
+# Checks if a TCP port is open on a given host within a timeout, using netcat if available, else bash /dev/tcp
+# -------------------------------------------------------------------------
 tcp_port_open() {
     # Usage: tcp_port_open <host> <port> <timeout_seconds>
     local host="$1" port="$2" t="${3:-3}"
@@ -1727,6 +1908,22 @@ tcp_port_open() {
 
     # Final fallback: bash /dev/tcp
     timeout "$t" bash -c "echo > /dev/tcp/${host}/${port}" >/dev/null 2>&1
+}
+
+# -------------------------------------------------------------------------
+# LDAP URI selector: prefers LDAPS if port 636 is open, else falls back to LDAP with STARTTLS
+# -------------------------------------------------------------------------
+_select_ldap_uri() {
+    local server="$1"
+
+    # Prefer LDAPS — encrypted at transport layer, no STARTTLS negotiation needed
+    if tcp_port_open "$server" 636 3; then
+        echo "ldaps://${server}"
+        return 0
+    fi
+
+    # Fallback to plain LDAP URI (STARTTLS negotiated at call site via -ZZ flag)
+    echo "ldap://${server}"
 }
 
 # -------------------------------------------------------------------------
@@ -1787,23 +1984,6 @@ load_os_release() {
     fi
 
     log_error "Unable to detect OS release metadata (missing os-release and legacy release files)." 1
-}
-
-validate_allowgroups_tokens() {
-    local raw="${1:-}"
-    local bad=()
-
-    [[ -z "$raw" || "$raw" == "(none)" ]] && return 0
-
-    # Space-separated tokens
-    for g in $raw; do
-        # sshd AllowGroups and typical POSIX/SSSD names
-        [[ "$g" =~ ^[A-Za-z0-9._-]+$ ]] || bad+=("$g")
-    done
-
-    if (( ${#bad[@]} > 0 )); then
-        log_error "GLOBAL_ADMIN_GROUPS contains invalid token(s): ${bad[*]}. Use AD sAMAccountName (no spaces; allowed: A-Z a-z 0-9 . _ -)." 1
-    fi
 }
 
 get_major_version_id() {
@@ -1900,8 +2080,14 @@ discover_nearest_dc() {
 
             _dc_avg="$(ping -c 1 -W 1 -q "$_dc_ip" 2>/dev/null \
                 | awk -F'/' '/^(rtt|round-trip)/ {printf "%.3f", $5}')" || true
-            [[ -n "$_dc_avg" && "$_dc_avg" != "0.000" ]] && \
-                echo "${_dc_avg}|${_dc_l}" >> "$ping_tmp"
+            if [[ -n "$_dc_avg" && "$_dc_avg" != "0.000" ]]; then
+                # Use flock for atomic append (prevents interleaved writes from parallel subshells)
+                if command -v flock >/dev/null 2>&1; then
+                    flock "$ping_tmp" -c "echo '${_dc_avg}|${_dc_l}' >> \"$ping_tmp\""
+                else
+                    echo "${_dc_avg}|${_dc_l}" >> "$ping_tmp"
+                fi
+            fi
         ) &
 
         _running=$(( _running + 1 ))
@@ -2277,10 +2463,9 @@ if $NONINTERACTIVE; then
             log_error "DC_SERVER required (auto-discovery failed — pass DC_SERVER explicitly)" 1
         fi
     fi
-	: "${NTP_SERVER:?NTP_SERVER required}"
+    : "${NTP_SERVER:=ntp.${DOMAIN,,}}"
     : "${DOMAIN_USER:?DOMAIN_USER required}"
     : "${DOMAIN_PASS:?DOMAIN_PASS required}"
-	: "${GLOBAL_ADMIN_GROUPS:?GLOBAL_ADMIN_GROUPS required}"
     : "${SESSION_TIMEOUT_SECONDS:?SESSION_TIMEOUT_SECONDS required (seconds)}"
     : "${PERMIT_ROOT_LOGIN:?PERMIT_ROOT_LOGIN required (yes|no)}"
 
@@ -2296,7 +2481,6 @@ if $NONINTERACTIVE; then
     SUPER_ALL="${SUPER_GROUP_ALL:-grp-super-all-linux-servers}"
 
     # Normalize and validate inputs
-    validate_allowgroups_tokens "$GLOBAL_ADMIN_GROUPS"
     require_uint_range "SESSION_TIMEOUT_SECONDS" "$SESSION_TIMEOUT_SECONDS" 30 86400
     PERMIT_ROOT_LOGIN="$(normalize_yes_no "$PERMIT_ROOT_LOGIN")"
     [[ -n "$PERMIT_ROOT_LOGIN" ]] || log_error "PERMIT_ROOT_LOGIN must be yes or no" 1
@@ -2413,16 +2597,6 @@ else
         [[ -n "$DOMAIN_PASS" ]] && break
         printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Password cannot be empty.\n" "$(date '+%F %T')"
     done
-
-	# Set Global Admin group(s) for SSH AllowGroups
-    printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Define the global admin group(s) allowed SSH access (space-separated):\n" "$(date '+%F %T')" >&2
-    printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Global admin group(s): " "$(date '+%F %T')" >&2
-    read -r GLOBAL_ADMIN_GROUPS
-    GLOBAL_ADMIN_GROUPS="$(trim_ws "$GLOBAL_ADMIN_GROUPS")"
-
-    # handle optional input gracefully
-    [[ -z "$GLOBAL_ADMIN_GROUPS" ]] && GLOBAL_ADMIN_GROUPS="(none)"
-    validate_allowgroups_tokens "$GLOBAL_ADMIN_GROUPS"
 
     # Session timeout (SSH + Shell) in seconds
     default_SESSION_TIMEOUT_SECONDS=900
@@ -2573,11 +2747,6 @@ else
 fi
 print_divider
 
-# Only log if GLOBAL_ADMIN_GROUPS is defined and not "(none)"
-if [ -n "$GLOBAL_ADMIN_GROUPS" ] && [ "$GLOBAL_ADMIN_GROUPS" != "(none)" ]; then
-    log_info "🔐 Using global admin group(s) for SSH access: $GLOBAL_ADMIN_GROUPS"
-fi
-
 # Prepare environment
 DOMAIN_LOWER="${DOMAIN,,}"
 DOMAIN_UPPER="${DOMAIN^^}"
@@ -2595,6 +2764,27 @@ HOST_SHORT_U=$(echo "$HOST_SHORT" | tr '[:lower:]' '[:upper:]')
 HOST_SHORT_U_ESCAPED=$(ldap_escape_filter "$HOST_SHORT_U")
 
 MACHINE_PRINCIPAL="${HOST_SHORT_U}\$@${REALM}"
+
+# Select best LDAP transport (LDAPS > STARTTLS > plain GSSAPI Sign&Seal)
+LDAP_URI="$(_select_ldap_uri "$LDAP_SERVER")"
+# NOTE: LDAP_TLS_FLAG is intentionally unquoted at all call sites.
+# When empty, it must vanish (not pass "" as an argument to ldapsearch/ldapmodify).
+# Same convention as SED_EXT. Do not add quotes.
+LDAP_TLS_FLAG=""
+
+# Check if LDAPS is available (port 636) - this is the most secure option (encryption + integrity)
+if [[ "$LDAP_URI" == "ldaps://"* ]]; then
+    log_info "🔐 LDAPS (TCP/636) available — using encrypted transport"
+else
+    # Attempt STARTTLS on plain LDAP (TCP/389)
+    # Uses a lightweight base-scope query to test TLS negotiation without credentials
+    if timeout 5 ldapsearch -x -H "$LDAP_URI" -ZZ -b "" -s base namingContexts >/dev/null 2>&1; then
+        LDAP_TLS_FLAG="-ZZ"
+        log_info "✅ LDAP STARTTLS negotiated successfully — enforcing encrypted channel"
+    else
+        log_info "⚠️ LDAP STARTTLS unavailable — using GSSAPI Sign&Seal only (no transport encryption)"
+    fi
+fi
 
 # -------------------------------------------------------------------------
 # Hostname and FQDN Consistency Validation (/etc/hostname, /etc/hosts)
@@ -2661,17 +2851,16 @@ PRIMARY_IP_RE="${PRIMARY_IP//./\\.}"
 
 $VERBOSE && log_info "ℹ Primary IP selected: ${PRIMARY_IP} (iface: ${PRIMARY_IFACE:-unknown})"
 
-
-# Check for active web services (port 80 or 443)
+# Detect socket listing tool (array to avoid word-splitting, consistent with script patterns)
+NETSTAT_CMD=()
 if command -v ss >/dev/null 2>&1; then
-    NETSTAT_CMD="ss -tulpen"
+    NETSTAT_CMD=( ss -tulpen )
 elif command -v netstat >/dev/null 2>&1; then
-    NETSTAT_CMD="netstat -tulpen"
-else
-    NETSTAT_CMD=""
+    NETSTAT_CMD=( netstat -tulpen )
 fi
 
-if [[ -n "$NETSTAT_CMD" ]] && $NETSTAT_CMD 2>/dev/null | grep -qE ':(80|443)\b'; then
+# Check for active web services (port 80 or 443)
+if (( ${#NETSTAT_CMD[@]} > 0 )) && "${NETSTAT_CMD[@]}" 2>/dev/null | grep -qE ':(80|443)\b'; then
     log_info "🌐 Detected active web service (port 80/443 in use)"
 fi
 
@@ -3172,14 +3361,24 @@ create_secret_passfile() {
         base="/dev/shm"               # POSIX shared memory tmpfs
     else
         base="/tmp"                   # Legacy fallback (may be disk-backed)
+        log_info "⚠️ WARNING: Password file will be created in /tmp (potentially disk-backed). Consider mounting tmpfs."
     fi
 
     # Create temp file with secure permissions (0600) atomically via umask
     # No separate chmod needed - umask 077 ensures correct permissions at creation
     PASS_FILE="$(mktemp "${base}/.adjoin.pass.XXXXXX")" || log_error "Failed to create temporary password file" 1
 
-    # Store password as a single line (no trailing newline).
-    # OpenLDAP -y reads the entire file as password; newline/CR would be treated as part of the secret.
+    # Store password WITHOUT trailing newline (printf '%s', not echo).
+    #
+    # Why no newline:
+    #   - ldapsearch/ldapmodify -y: reads entire file as password; \n becomes part of the secret
+    #   - kinit (MIT krb5):         reads via fgets() or read()-to-EOF; works with or without \n
+    #   - kinit (Heimdal):          UI_inputdata() reads to EOF; works with or without \n
+    #   - adcli --stdin-password:   read()-to-EOF, strips trailing \n; works with or without \n
+    #
+    # The ldapsearch -y constraint is the most restrictive and dictates the format.
+    # All other consumers accept EOF-terminated input without issues.
+    # Tested on: MIT krb5 1.17-1.21, Heimdal 7.x, adcli 0.8-0.9, OpenLDAP 2.4-2.6
     if [[ "${DOMAIN_PASS:-}" == *$'\n'* || "${DOMAIN_PASS:-}" == *$'\r'* ]]; then
         log_error "DOMAIN_PASS contains newline/CR characters; refusing because ldapsearch -y would treat them as part of the password." 1
     fi
@@ -3201,7 +3400,7 @@ cleanup_secrets() {
     # Restore immutable bits on any files we unlocked
     _file_restore_all_attrs 2>/dev/null || true
 
-    # Best-effort secure delete
+    # Best-effort secure delete of password file
     if [[ -n "${PASS_FILE:-}" && -f "${PASS_FILE:-}" ]]; then
         if command -v shred >/dev/null 2>&1; then
             shred -u -z -n 3 "$PASS_FILE" 2>/dev/null || rm -f "$PASS_FILE"
@@ -3211,6 +3410,11 @@ cleanup_secrets() {
             rm -f "$PASS_FILE"
         fi
     fi
+
+    # Cleanup intermediate temp files (best-effort, non-sensitive)
+    for _tf in "${KRB_TRACE:-}" "${KRB_LOG:-}" "${JOIN_LOG:-}" "${TMP_LDIF:-}"; do
+        [[ -n "$_tf" && -f "$_tf" ]] && rm -f "$_tf" 2>/dev/null || true
+    done
 
     # Release mkdir-based lock (if flock is unavailable).
     if [[ "${LOCK_MODE:-}" == "mkdir" && -n "${LOCK_DIR_FALLBACK:-}" ]]; then
@@ -3222,6 +3426,14 @@ cleanup_secrets() {
     # Just in case someone reintroduced it
     unset DOMAIN_PASS
 }
+
+# Pre-declare temp file variables referenced by cleanup_secrets trap.
+# Actual values are assigned later when the files are created.
+KRB_TRACE="" KRB_LOG="" JOIN_LOG="" TMP_LDIF=""
+
+# Deferred D-Bus restart flag (set during oddjob remediation, executed at script end)
+_DBUS_RESTART_DEFERRED=false
+_DBUS_RESTART_UNIT=""
 
 # Install traps only once
 trap cleanup_secrets EXIT HUP INT TERM
@@ -3291,9 +3503,8 @@ log_info "🔍 Checking OU: $OU"
 
 LDAP_OUT="$(
     set +e +o pipefail
-    timeout "$LDAP_TIMEOUT" ldapsearch -x -LLL -o ldif-wrap=no \
-        -H "ldap://${LDAP_SERVER}" \
-        -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
+    timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
+        $LDAP_TLS_FLAG -H "$LDAP_URI" \
         -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1
 )" && LDAP_CODE=0 || LDAP_CODE=$?
 
@@ -3305,9 +3516,8 @@ if [[ $LDAP_CODE -ne 0 || -z "$LDAP_OUT" ]]; then
     # Test fallback OU also under safe mode
     LDAP_OUT="$(
         set +e +o pipefail
-        timeout "$LDAP_TIMEOUT" ldapsearch -x -LLL -o ldif-wrap=no \
-            -H "ldap://${LDAP_SERVER}" \
-            -D "${DOMAIN_USER}@${DOMAIN}" -y "$PASS_FILE" \
+        timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
+            $LDAP_TLS_FLAG -H "$LDAP_URI" \
             -b "$OU" "(|(objectClass=organizationalUnit)(objectClass=container))" 2>&1
     )" && LDAP_CODE=0 || LDAP_CODE=$?
 
@@ -3382,7 +3592,6 @@ fi
 log_info "🔧 Ensuring /etc/krb5.conf consistency for realm $REALM"
 
 KRB_CONF="/etc/krb5.conf"
-REALM_UPPER="${REALM^^}"
 
 # Backup existing krb5.conf if present
 if [[ -f "$KRB_CONF" ]]; then
@@ -3392,18 +3601,27 @@ fi
 # If DC_SERVER is not set, attempt SRV autodiscovery
 if [[ -z "$DC_SERVER" ]]; then
     log_info "ℹ DC_SERVER variable empty - attempting autodiscovery via SRV records"
-    DC_SERVER=$(dig +short _ldap._tcp."$DOMAIN" SRV | awk '{print $4}' | head -n1)
+    DC_SERVER="$(discover_nearest_dc "$DOMAIN")" || true
     [[ -z "$DC_SERVER" ]] && log_error "Unable to autodiscover domain controller for $DOMAIN" 11
 fi
 
 # -------------------------------------------------------------------------
 # Dynamic Kerberos configuration (krb5.conf) generation
 # -------------------------------------------------------------------------
-if dig +short _kerberos._tcp."$DOMAIN" SRV | grep -qE '^[0-9]'; then
+# Check for Kerberos SRV records using available DNS tools (dig > host > nslookup)
+_krb_srv_found=false
+if command -v dig >/dev/null 2>&1; then
+    dig +short _kerberos._tcp."$DOMAIN" SRV 2>/dev/null | grep -qE '^[0-9]' && _krb_srv_found=true
+elif command -v host >/dev/null 2>&1; then
+    host -t SRV _kerberos._tcp."$DOMAIN" 2>/dev/null | grep -q 'SRV' && _krb_srv_found=true
+elif command -v nslookup >/dev/null 2>&1; then
+    nslookup -type=SRV _kerberos._tcp."$DOMAIN" 2>/dev/null | grep -q 'service' && _krb_srv_found=true
+fi
+if $_krb_srv_found; then
     log_info "🌐 SRV records found for $DOMAIN - enabling DNS-based KDC discovery"
     write_file 0644 "$KRB_CONF" <<EOF
 [libdefaults]
-    default_realm = $REALM_UPPER
+    default_realm = $REALM
     dns_lookup_realm = true
     dns_lookup_kdc = true
     ticket_lifetime = 24h
@@ -3411,19 +3629,19 @@ if dig +short _kerberos._tcp."$DOMAIN" SRV | grep -qE '^[0-9]'; then
     rdns = false
 
 [realms]
-    $REALM_UPPER = {
+    $REALM = {
         default_domain = ${DOMAIN_LOWER}
     }
 
 [domain_realm]
-    .${DOMAIN_LOWER} = ${REALM_UPPER}
-    ${DOMAIN_LOWER} = ${REALM_UPPER}
+    .${DOMAIN_LOWER} = ${REALM}
+    ${DOMAIN_LOWER} = ${REALM}
 EOF
 else
     log_info "⚠️ No SRV records found for $DOMAIN - using static KDC configuration ($DC_SERVER)"
     write_file 0644 "$KRB_CONF" <<EOF
 [libdefaults]
-    default_realm = $REALM_UPPER
+    default_realm = $REALM
     dns_lookup_realm = false
     dns_lookup_kdc = false
     ticket_lifetime = 24h
@@ -3431,21 +3649,21 @@ else
     rdns = false
 
 [realms]
-    $REALM_UPPER = {
+    $REALM = {
         kdc = $DC_SERVER
         admin_server = $DC_SERVER
         default_domain = ${DOMAIN_LOWER}
     }
 
 [domain_realm]
-    .${DOMAIN_LOWER} = ${REALM_UPPER}
-    ${DOMAIN_LOWER} = ${REALM_UPPER}
+    .${DOMAIN_LOWER} = ${REALM}
+    ${DOMAIN_LOWER} = ${REALM}
 EOF
 fi
 
 # Apply standard permissions
 cmd_must chmod 644 "$KRB_CONF"
-log_info "✅ /etc/krb5.conf regenerated for realm $REALM_UPPER"
+log_info "✅ /etc/krb5.conf regenerated for realm $REALM"
 
 # -------------------------------------------------------------------------
 # Enable SSSD and PAM mkhomedir (per-distro native)
@@ -3463,7 +3681,7 @@ case $OS_FAMILY in
 		else
 			# RHEL/OL 8+ -> authselect
 			cmd_must authselect select sssd with-mkhomedir --force
-			cmd_must systemctl enable --now oddjobd
+			cmd_must service_control oddjobd enable-now
 		fi
 	;;
 	suse)
@@ -3591,23 +3809,22 @@ EOF
         if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
             log_info "✅ oddjob mkhomedir D-Bus service operational after ReloadConfig"
         else
-            log_info "🔄 Restarting $DBUS_SERVICE silently (detached) as last resort"
-            if $VALIDATE_ONLY; then
-                log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Suppressed restart of $DBUS_SERVICE (non-invasive mode)"
-            elif $DRY_RUN; then
-                log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would restart $DBUS_SERVICE (detached) to heal oddjob D-Bus registration"
-            else
-                # Run detached restart to survive D-Bus drop when executing over SSH
-                nohup setsid bash -c "systemctl restart '$DBUS_SERVICE' >/dev/null 2>&1 < /dev/null" >/dev/null 2>&1 &
-                disown || true
-                sleep 3
-            fi
+            # Defer D-Bus restart to end of script (after all critical config is committed).
+            # Restarting D-Bus mid-execution risks SSH session disruption on some distros,
+            # and can cause lentidão/degradation if NOT restarted at all.
+            # The deferred approach ensures the system is fully configured before any
+            # session-impacting restart occurs.
+            log_info "ℹ D-Bus restart required for oddjob — deferring to end of script"
+            log_info "ℹ oddjob mkhomedir may not be fully operational until D-Bus is restarted"
+            _DBUS_RESTART_DEFERRED=true
+            _DBUS_RESTART_UNIT="$DBUS_SERVICE"
 
-            # After D-Bus restart, re-test
-            if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply / com.redhat.oddjob_mkhomedir.Hello &>/dev/null; then
-                log_info "✅ oddjob mkhomedir D-Bus service operational after D-Bus restart"
-            else
-                log_info "⚠️ D-Bus Hello still denied - common on RHEL/OL 7 (AccessDenied not fatal)"
+            if $VALIDATE_ONLY; then
+                log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would defer restart of $DBUS_SERVICE to end of script"
+                _DBUS_RESTART_DEFERRED=false
+            elif $DRY_RUN; then
+                log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would defer restart of $DBUS_SERVICE to end of script"
+                _DBUS_RESTART_DEFERRED=false
             fi
         fi
     fi
@@ -4385,7 +4602,7 @@ if $VERBOSE; then
 
     LDAP_RAW="$(
         set +e +o pipefail
-        timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
+        timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no $LDAP_TLS_FLAG -H "$LDAP_URI" \
           -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U_ESCAPED}\$)" distinguishedName 2>&1
     )" && LDAP_CODE=0 || LDAP_CODE=$?
 
@@ -4402,7 +4619,7 @@ log_info "🔍 Checking if computer object exists in AD"
 # Perform search allowing non-fatal exit codes (e.g. not found)
 LDAP_OUT="$(
     set +e +o pipefail
-    timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
+    timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no $LDAP_TLS_FLAG -H "$LDAP_URI" \
       -b "$BASE_DN" "(sAMAccountName=${HOST_SHORT_U_ESCAPED}\$)" distinguishedName 2>/dev/null
 )" && LDAP_CODE=0 || LDAP_CODE=$?
 
@@ -4436,21 +4653,18 @@ EOF
         if $DRY_RUN; then
             log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would move computer object via ldapmodify"
         else
-            # Save/restore ERR trap (consistent with trust validation block pattern)
-            _saved_move_trap="$(trap -p ERR)" || true
+            # Temporarily relax strict mode for LDAP move (may fail with permission denied)
             trap - ERR
             set +e
             if $VERBOSE; then
-                ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF"
+                timeout "$LDAP_TIMEOUT" ldapmodify -Y GSSAPI $LDAP_TLS_FLAG -H "$LDAP_URI" -f "$TMP_LDIF"
                 LDAP_MOVE_CODE=$?
             else
-                ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1
+                timeout "$LDAP_TIMEOUT" ldapmodify -Y GSSAPI $LDAP_TLS_FLAG -H "$LDAP_URI" -f "$TMP_LDIF" >/dev/null 2>&1
                 LDAP_MOVE_CODE=$?
             fi
             set -e
-            if [[ -n "$_saved_move_trap" ]]; then
-                eval "$_saved_move_trap"
-            fi
+            trap "$ERROR_TRAP_CMD" ERR
         fi
 
         rm -f "$TMP_LDIF"
@@ -4511,7 +4725,7 @@ JOIN_LOG=$(safe_mktemp)
 if $DRY_RUN; then
     log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would join domain via adcli (execution suppressed)."
     true
-elif timeout 90s adcli join \
+elif timeout "${JOIN_TIMEOUT}s" adcli join \
     --verbose \
     --domain="$DOMAIN" \
     --domain-realm="$REALM" \
@@ -4546,6 +4760,7 @@ elif timeout 90s adcli join \
     if [[ -f "$KRB5_KEYTAB" ]]; then
         cmd_must chmod 600 "$KRB5_KEYTAB"
         cmd_must chown root:root "$KRB5_KEYTAB"
+        selinux_restore "$KRB5_KEYTAB"
         log_info "🔒 Keytab permissions hardened (600, root:root)"
     fi
 
@@ -4581,7 +4796,7 @@ EOF
         # Retry with backoff to tolerate AD replication delay
         _desc_ok=false
         for _desc_attempt in 1 2 3; do
-            if ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" -f "$TMP_LDIF" >/dev/null 2>&1; then
+            if timeout "$LDAP_TIMEOUT" ldapmodify -Y GSSAPI $LDAP_TLS_FLAG -H "$LDAP_URI" -f "$TMP_LDIF" >/dev/null 2>&1; then
                 log_info "✅ Description updated successfully in AD"
                 _desc_ok=true
                 break
@@ -4605,7 +4820,7 @@ for _kvno_attempt in 1 2 3; do
     MSDS_KVNO="$(
         set +e +o pipefail
         timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no \
-            -H "ldap://${LDAP_SERVER}" \
+            $LDAP_TLS_FLAG -H "$LDAP_URI" \
             -b "CN=${HOST_SHORT_U},${OU}" msDS-KeyVersionNumber 2>/dev/null | \
             awk '/^msDS-KeyVersionNumber:/ {print $2}' | head -n1
     )" || true
@@ -4635,11 +4850,7 @@ log_info "ℹ Obtaining Kerberos ticket for synchronization"
 kinit "${DOMAIN_USER}@${REALM}" <"$PASS_FILE" >/dev/null 2>&1 || \
     log_error "Failed to obtain Kerberos ticket for ${DOMAIN_USER}@${REALM}" 2
 
-# Save current trap/shell state before trust validation block
-_saved_err_trap="$(trap -p ERR)" || true
-_had_errexit=false; [[ $- == *e* ]] && _had_errexit=true
-_had_pipefail=false; [[ :$SHELLOPTS: == *:pipefail:* ]] && _had_pipefail=true
-
+# Temporarily relax strict mode for trust validation block
 trap - ERR
 set +e +o pipefail
 
@@ -4647,7 +4858,7 @@ set +e +o pipefail
 # Validate machine Kerberos keytab (domain trust check)
 # -------------------------------------------------------------------------
 TRUST_STATUS="⚠️ Trust check failed"
-PRINCIPAL="$(hostname -s | tr '[:lower:]' '[:upper:]')\$@${REALM_UPPER}"
+PRINCIPAL="${HOST_SHORT_U}\$@${REALM}"
 KRB_LOG=$(safe_mktemp)
 START_MS="$(now_ms)"
 
@@ -4701,13 +4912,9 @@ fi
 kdestroy -q 2>/dev/null || true
 rm -f "$KRB_LOG" 2>/dev/null || true
 
-# Restore shell state after trust validation block
-$_had_errexit && set -e
-$_had_pipefail && set -o pipefail
-if [[ -n "$_saved_err_trap" ]]; then
-    eval "$_saved_err_trap"
-fi
-unset _saved_err_trap _had_errexit _had_pipefail
+# Restore strict mode after trust validation block
+set -e -o pipefail
+trap "$ERROR_TRAP_CMD" ERR
 
 # -------------------------------------------------------------------------
 # Validate and re-enable computer object if disabled in AD
@@ -4715,7 +4922,7 @@ unset _saved_err_trap _had_errexit _had_pipefail
 log_info "🔧 Checking if computer object is disabled in AD..."
 
 # Query userAccountControl via GSSAPI (machine trust)
-UAC_RAW=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no -H "ldap://${LDAP_SERVER}" \
+UAC_RAW=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no $LDAP_TLS_FLAG -H "$LDAP_URI" \
     -b "CN=${HOST_SHORT_U},${OU}" userAccountControl \
     2>$($VERBOSE && echo /dev/stderr || echo /dev/null) | \
     awk '/^userAccountControl:/ {print $2}' || true)
@@ -4745,14 +4952,14 @@ else
             else
                 _reenable_rc=0
                 if $VERBOSE; then
-                    ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" <<EOF || _reenable_rc=$?
+                    timeout "$LDAP_TIMEOUT" ldapmodify -Y GSSAPI $LDAP_TLS_FLAG -H "$LDAP_URI" <<EOF || _reenable_rc=$?
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: userAccountControl
 userAccountControl: $NEW_UAC
 EOF
                 else
-                    ldapmodify -Y GSSAPI -H "ldap://${LDAP_SERVER}" >/dev/null 2>&1 <<EOF || _reenable_rc=$?
+                    timeout "$LDAP_TIMEOUT" ldapmodify -Y GSSAPI $LDAP_TLS_FLAG -H "$LDAP_URI" >/dev/null 2>&1 <<EOF || _reenable_rc=$?
 dn: CN=${HOST_SHORT_U},${OU}
 changetype: modify
 replace: userAccountControl
@@ -4831,13 +5038,15 @@ auth_provider = ad
 access_provider = simple
 chpass_provider = ad
 
+# Restrict local login to authorized AD groups only
+simple_allow_groups = $ADM, $ADM_ALL, $SEC, $SEC_ALL, $SUPER, $SUPER_ALL, $GRP_SSH, $GRP_SSH_ALL
 
 # -------------------------------------------------------------------------
 # Active Directory and Kerberos parameters
 # -------------------------------------------------------------------------
 ad_domain = $DOMAIN_LOWER
 ad_hostname = $HOST_FQDN
-krb5_realm = $REALM_UPPER
+krb5_realm = $REALM
 krb5_keytab = $KRB5_KEYTAB
 realmd_tags = manages-system joined-with-adcli
 
@@ -4993,10 +5202,10 @@ EOF
 fi
 
 log_info "🔧 Enabling SSSD"
-cmd_must systemctl enable sssd
+cmd_must service_control sssd enable
 
 log_info "🔄 Restarting SSSD"
-cmd_must systemctl restart sssd
+cmd_must service_control sssd restart
 
 # -------------------------------------------------------------------------
 # Restarts systemd-logind to refresh PAM and D-Bus session handling
@@ -5068,11 +5277,8 @@ else
     backup_file "$SSH_CFG"
 fi
 
-# Build AllowGroups safely (skip empty or '(none)')
+# Build AllowGroups (AD groups + system defaults)
 ALLOW_GROUPS="$GRP_SSH $GRP_SSH_ALL $SSH_G root"
-if [[ -n "$GLOBAL_ADMIN_GROUPS" && "$GLOBAL_ADMIN_GROUPS" != "(none)" ]]; then
-    ALLOW_GROUPS="$ALLOW_GROUPS $GLOBAL_ADMIN_GROUPS"
-fi
 
 # Normalize multiple spaces and trim ends
 ALLOW_GROUPS="$(trim_ws "$ALLOW_GROUPS")"
@@ -5566,8 +5772,8 @@ else
 	log_info "⚙️ Updating rules"
 
     for f in "${FILES[@]}"; do
-		declare -a patched=()
-		declare -a compliant=()
+		patched=()
+		compliant=()
 
 		tmp="$(safe_mktemp "/tmp/$(basename "$f").XXXXXX")"
         : >"$tmp"
@@ -5576,7 +5782,7 @@ else
 			original="$line"
 			handled=false
 
-			for grp in "${TARGET_GROUPS[@]:-}"; do
+			for grp in "${TARGET_GROUPS[@]}"; do
 				good_all="%${grp} ALL=(ALL:ALL) ALL, !ROOT_SHELLS"
 				good_npw="%${grp} ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS"
 
@@ -5700,9 +5906,12 @@ else
     pgrep sshd >/dev/null 2>&1 && SSH_STATUS="active"  || SSH_STATUS="inactive"
 fi
 
-# Normalize empty or unexpected values
-[[ -z "$TRUST_STATUS" ]] && TRUST_STATUS="⚠️ Unknown"
-[[ -z "$REALM_JOINED" ]] && REALM_JOINED="⚠️ Not detected"
+# Normalize empty or unexpected values (safe under set -u)
+: "${TRUST_STATUS:=⚠️ Unknown}"
+: "${DC_TRUST_SERVER:=n/a}"
+: "${TRUST_ELAPSED:=n/a}"
+: "${TRUST_RTT:=n/a}"
+: "${REALM_JOINED:=⚠️ Not detected}"
 
 # Summary output
 print_divider
@@ -5735,6 +5944,31 @@ printf "${C_CYAN}%-25s${C_RESET} %s\n" "SSSD Service:" "${SSSD_COLOR}${SSSD_STAT
 printf "${C_CYAN}%-25s${C_RESET} %s\n" "SSH Service:" "${SSH_COLOR}${SSH_STATUS}${C_RESET}"
 print_divider
 
+# -------------------------------------------------------------------------
+# Deferred D-Bus restart (post-configuration, all critical work committed)
+# -------------------------------------------------------------------------
+# This runs AFTER sudoers, SSH, SSSD, PAM, and all other configs are applied.
+# Even if the D-Bus restart briefly disrupts the session (Ansible scenario),
+# the system is already fully configured and will be operational after recovery.
+# -------------------------------------------------------------------------
+if [[ "${_DBUS_RESTART_DEFERRED:-false}" == "true" && -n "${_DBUS_RESTART_UNIT:-}" ]]; then
+    log_info "🔄 Executing deferred D-Bus restart ($_DBUS_RESTART_UNIT)"
+
+    if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" ]]; then
+        log_info "ℹ Running over SSH — session may briefly stall during D-Bus restart"
+    fi
+
+    # Use nohup+setsid to survive potential session disruption
+    nohup setsid bash -c "
+        sleep 1
+        systemctl restart '${_DBUS_RESTART_UNIT}' >/dev/null 2>&1
+        systemctl restart oddjobd >/dev/null 2>&1
+    " </dev/null >/dev/null 2>&1 &
+    disown 2>/dev/null || true
+
+    log_info "✅ D-Bus restart dispatched (detached, will complete after script exit)"
+fi
+
 # Insert short pause and newline without spawning a subshell
 sleep 0.05
 echo
@@ -5742,5 +5976,14 @@ echo
 # Force sync and restore terminal
 sync
 stty sane 2>/dev/null || true
+
+# Flush tee pipelines: close stdout to signal EOF to tee, wait for completion.
+# Keep stderr open for cleanup trap errors (cleanup_secrets may log warnings).
+exec 1>&-
+wait 2>/dev/null || true
+
+# NOTE: stderr is intentionally left open until after exit 0
+# so the EXIT trap (cleanup_secrets) can still log to the console.
+# The kernel closes fd 2 automatically on process termination.
 
 exit 0
