@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.2.3
+# Version:     3.2.4
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -319,20 +319,14 @@ read_sanitized() {
 # -------------------------------------------------------------------------
 print_divider() {
     local cols
-
-    # Terminal width detection with multiple fallbacks
     cols=$(tput cols 2>/dev/null) || \
     cols=$(stty size 2>/dev/null | awk '{print $2}') || \
     cols=""
-
-    # Safety threshold — also catches non-numeric values
     [[ "$cols" =~ ^[0-9]+$ && "$cols" -ge 20 ]] || cols=80
-
-    # Divider generation + sync (flush tee pipeline)
     sync
-    printf '%s' "$C_DIM"
-    printf '%*s\n' "$cols" '' | tr ' ' '-' >&2
-    printf '%s' "$C_RESET"
+    local line
+    line=$(printf '%*s' "$cols" '' | tr ' ' '-')
+    printf '%s%s%s\n' "$C_DIM" "$line" "$C_RESET" >&2
 }
 
 # -------------------------------------------------------------------------
@@ -1606,14 +1600,15 @@ safe_realm_list() {
 }
 
 # -------------------------------------------------------------------------
-# Idempotent file backup with path traversal protection and flexible output (stdout or variable)
+# Idempotent file backup with path traversal protection and flexible output
 # -------------------------------------------------------------------------
 backup_file() {
     # Usage:
-    #   backup_file /path/file            -> prints backup path to stdout (ONLY)
-    #   backup_file /path/file outvar     -> sets variable 'outvar' with backup path (no stdout)
+    #   backup_file /path/file            -> performs backup (silent)
+    #   backup_file /path/file outvar     -> performs backup + sets variable 'outvar' with backup path
     #
     # Behavior: idempotent per run (one backup per file path).
+    # All log output goes to stderr. No stdout emission.
     local path="${1:-}"
     local __outvar="${2:-}"
 
@@ -1641,8 +1636,6 @@ backup_file() {
         log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} 💾 Would backup '$path' -> '$bak' (suppressed)" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
-        else
-            printf '%s\n' "$bak"
         fi
         return 0
     fi
@@ -1651,8 +1644,6 @@ backup_file() {
         log_info "${C_YELLOW}[DRY-RUN]${C_RESET} 💾 Would backup '$path' -> '$bak'" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
-        else
-            printf '%s\n' "$bak"
         fi
         return 0
     fi
@@ -1664,8 +1655,6 @@ backup_file() {
         log_info "ℹ Backup already exists for this run: $bak" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
-        else
-            printf '%s\n' "$bak"
         fi
         return 0
     fi
@@ -1675,8 +1664,6 @@ backup_file() {
         log_info "ℹ Backup skipped (file not found): '$path' -> (planned) '$bak'" >&2
         if [[ -n "$__outvar" ]]; then
             printf -v "$__outvar" '%s' "$bak"
-        else
-            printf '%s\n' "$bak"
         fi
         return 0
     fi
@@ -1689,8 +1676,6 @@ backup_file() {
 
     if [[ -n "$__outvar" ]]; then
         printf -v "$__outvar" '%s' "$bak"
-    else
-        printf '%s\n' "$bak"
     fi
 }
 
@@ -3460,7 +3445,6 @@ trap "$ERROR_TRAP_CMD" ERR
 
 # analyze both return code AND trace contents
 if (( KINIT_CODE == 0 )) && ! grep -qiE 'CLIENT_LOCKED_OUT|revoked|disabled|locked out|denied|expired' "$KRB_TRACE"; then
-    kdestroy -q 2>/dev/null || true
     log_info "✅ Credentials verified successfully"
 else
     if grep -qiE 'CLIENT_LOCKED_OUT|client.*locked out|credentials have been revoked|Client account disabled|STATUS_ACCOUNT_LOCKED_OUT' "$KRB_TRACE"; then
@@ -4909,7 +4893,6 @@ if [[ "${VERBOSE:-false}" == "true" ]]; then
 fi
 
 # Cleanup
-kdestroy -q 2>/dev/null || true
 rm -f "$KRB_LOG" 2>/dev/null || true
 
 # Restore strict mode after trust validation block
