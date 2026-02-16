@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.2.4
+# Version:     3.2.5
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -1896,22 +1896,6 @@ tcp_port_open() {
 }
 
 # -------------------------------------------------------------------------
-# LDAP URI selector: prefers LDAPS if port 636 is open, else falls back to LDAP with STARTTLS
-# -------------------------------------------------------------------------
-_select_ldap_uri() {
-    local server="$1"
-
-    # Prefer LDAPS — encrypted at transport layer, no STARTTLS negotiation needed
-    if tcp_port_open "$server" 636 3; then
-        echo "ldaps://${server}"
-        return 0
-    fi
-
-    # Fallback to plain LDAP URI (STARTTLS negotiated at call site via -ZZ flag)
-    echo "ldap://${server}"
-}
-
-# -------------------------------------------------------------------------
 # OS metadata loader (os-release with legacy fallbacks)
 # - Prefers /etc/os-release, then /usr/lib/os-release
 # - Falls back to common legacy release files if os-release is missing
@@ -2750,25 +2734,29 @@ HOST_SHORT_U_ESCAPED=$(ldap_escape_filter "$HOST_SHORT_U")
 
 MACHINE_PRINCIPAL="${HOST_SHORT_U}\$@${REALM}"
 
-# Select best LDAP transport (LDAPS > STARTTLS > plain GSSAPI Sign&Seal)
-LDAP_URI="$(_select_ldap_uri "$LDAP_SERVER")"
-# NOTE: LDAP_TLS_FLAG is intentionally unquoted at all call sites.
-# When empty, it must vanish (not pass "" as an argument to ldapsearch/ldapmodify).
-# Same convention as SED_EXT. Do not add quotes.
+# All LDAP operations in this script use GSSAPI authentication (-Y GSSAPI).
+# GSSAPI provides its own encryption layer (Sign&Seal, SSF:256), making LDAPS
+# redundant and potentially incompatible (known channel binding conflicts with
+# GSSAPI over LDAPS on many AD/OpenLDAP configurations).
+#
+# Transport selection:
+#   1. Always use ldap:// (TCP/389) for GSSAPI operations
+#   2. GSSAPI Sign&Seal provides encryption + integrity (equivalent to TLS)
+#   3. Optionally layer STARTTLS for defense-in-depth (if available)
+LDAP_URI="ldap://${LDAP_SERVER}"
 LDAP_TLS_FLAG=""
 
-# Check if LDAPS is available (port 636) - this is the most secure option (encryption + integrity)
-if [[ "$LDAP_URI" == "ldaps://"* ]]; then
-    log_info "🔐 LDAPS (TCP/636) available — using encrypted transport"
+# Check LDAPS availability (informational — not used with GSSAPI)
+if tcp_port_open "$LDAP_SERVER" 636 3; then
+    log_info "ℹ LDAPS (TCP/636) available but not used — GSSAPI Sign&Seal provides encryption (SSF:256)"
+fi
+
+# Attempt STARTTLS as optional defense-in-depth layer on top of GSSAPI
+if timeout 5 ldapsearch -x -H "$LDAP_URI" -ZZ -b "" -s base namingContexts >/dev/null 2>&1; then
+    LDAP_TLS_FLAG="-ZZ"
+    log_info "✅ LDAP STARTTLS available — layered on top of GSSAPI for defense-in-depth"
 else
-    # Attempt STARTTLS on plain LDAP (TCP/389)
-    # Uses a lightweight base-scope query to test TLS negotiation without credentials
-    if timeout 5 ldapsearch -x -H "$LDAP_URI" -ZZ -b "" -s base namingContexts >/dev/null 2>&1; then
-        LDAP_TLS_FLAG="-ZZ"
-        log_info "✅ LDAP STARTTLS negotiated successfully — enforcing encrypted channel"
-    else
-        log_info "⚠️ LDAP STARTTLS unavailable — using GSSAPI Sign&Seal only (no transport encryption)"
-    fi
+    log_info "✅ Using GSSAPI Sign&Seal encryption (SSF:256) — transport is secure"
 fi
 
 # -------------------------------------------------------------------------
