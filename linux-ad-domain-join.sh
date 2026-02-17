@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.2.9
+# Version:     3.3.0
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2625,10 +2625,16 @@ else
 	}' <<< "$DOMAIN")
 
     default_OU="CN=Computers,${DOMAIN_DN}"
-    printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} OU ${C_DIM}[default: ${default_OU}]${C_RESET}: " "$(date '+%F %T')"
-    read -r OU
-    OU="$(trim_ws "${OU:-}")"
-    OU="${OU:-$default_OU}"
+    while true; do
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} OU ${C_DIM}[default: ${default_OU}]${C_RESET}: " "$(date '+%F %T')"
+        read -r OU
+        OU="$(trim_ws "${OU:-}")"
+        OU="${OU:-$default_OU}"
+        if validate_ldap_dn "$OU"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid OU format. Expected: OU=Name,DC=domain,DC=tld\n" "$(date '+%F %T')"
+    done
 
     # DC Server - auto-discover nearest via DNS SRV + ping latency
     log_info "🔍 Discovering nearest Domain Controller..."
@@ -2642,17 +2648,29 @@ else
         log_info "ℹ DNS SRV discovery unavailable - using fallback: ${default_DC_SERVER}"
     fi
 
-    printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} DC server ${C_DIM}[default: ${default_DC_SERVER}]${C_RESET}: " "$(date '+%F %T')"
-    read -r DC_SERVER
-    DC_SERVER="$(trim_ws "${DC_SERVER:-}")"
-    DC_SERVER="${DC_SERVER:-$default_DC_SERVER}"
+    while true; do
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} DC server ${C_DIM}[default: ${default_DC_SERVER}]${C_RESET}: " "$(date '+%F %T')"
+        read -r DC_SERVER
+        DC_SERVER="$(trim_ws "${DC_SERVER:-}")"
+        DC_SERVER="${DC_SERVER:-$default_DC_SERVER}"
+        if validate_host_or_ip "$DC_SERVER"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid hostname or IP. Please retry.\n" "$(date '+%F %T')"
+    done
 
 	# NTP Server (optional, default filled)
     default_NTP_SERVER="ntp.${DOMAIN,,}"
-    printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} NTP server ${C_DIM}[default: ${default_NTP_SERVER}]${C_RESET}: " "$(date '+%F %T')"
-    read -r NTP_SERVER
-    NTP_SERVER="$(trim_ws "${NTP_SERVER:-}")"
-    NTP_SERVER="${NTP_SERVER:-$default_NTP_SERVER}"
+    while true; do
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} NTP server ${C_DIM}[default: ${default_NTP_SERVER}]${C_RESET}: " "$(date '+%F %T')"
+        read -r NTP_SERVER
+        NTP_SERVER="$(trim_ws "${NTP_SERVER:-}")"
+        NTP_SERVER="${NTP_SERVER:-$default_NTP_SERVER}"
+        if validate_host_or_ip "$NTP_SERVER"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid hostname or IP. Please retry.\n" "$(date '+%F %T')"
+    done
 
     # Require Join User with validation
     while true; do
