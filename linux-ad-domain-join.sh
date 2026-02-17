@@ -5135,7 +5135,7 @@ log_info "🔧 Checking if computer object is disabled in AD..."
 
 # Query userAccountControl via GSSAPI (machine trust)
 # Pre-resolve stderr destination (cleaner than inline subshell expansion)
-local _uac_stderr="/dev/null"
+_uac_stderr="/dev/null"
 $VERBOSE && _uac_stderr="/dev/stderr"
 
 UAC_RAW=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no $LDAP_TLS_FLAG -H "$LDAP_URI" \
