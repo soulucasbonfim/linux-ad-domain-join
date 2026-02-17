@@ -2653,7 +2653,7 @@ else
         read -r DC_SERVER
         DC_SERVER="$(trim_ws "${DC_SERVER:-}")"
         DC_SERVER="${DC_SERVER:-$default_DC_SERVER}"
-        if validate_host_or_ip "$DC_SERVER"; then
+        if validate_host_or_ip "$DC_SERVER" && [[ "$DC_SERVER" == *.* ]]; then
             break
         fi
         printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid hostname or IP. Please retry.\n" "$(date '+%F %T')"
@@ -2666,10 +2666,11 @@ else
         read -r NTP_SERVER
         NTP_SERVER="$(trim_ws "${NTP_SERVER:-}")"
         NTP_SERVER="${NTP_SERVER:-$default_NTP_SERVER}"
-        if validate_host_or_ip "$NTP_SERVER"; then
+        # Require FQDN or IP (short hostnames may not resolve without search domain)
+        if validate_host_or_ip "$NTP_SERVER" && [[ "$NTP_SERVER" == *.* ]]; then
             break
         fi
-        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid hostname or IP. Please retry.\n" "$(date '+%F %T')"
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid NTP server. Use FQDN (e.g., ntp.domain.com) or IP.\n" "$(date '+%F %T')"
     done
 
     # Require Join User with validation
