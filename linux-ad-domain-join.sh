@@ -3163,7 +3163,7 @@ log_info "🔧 Configuring DNS persistence for Active Directory"
 # Detect network management system and configure DNS accordingly
 _dns_configured=false
 DC_DNS_IP="${DC_DNS_IP:-$DC_V4}"  # Use DC IP as DNS server (if not explicitly set)
-[[ -z "$DC_DNS_IP" ]] && DC_DNS_IP="$(getent ahostsv4 "$DC_SERVER" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+[[ -z "$DC_DNS_IP" ]] && DC_DNS_IP="$(getent ahostsv4 "$DC_SERVER" 2>/dev/null | awk 'NR==1{print $1; exit}')" || true
 
 if [[ -z "$DC_DNS_IP" ]]; then
     log_info "⚠ Could not determine DC IP address for DNS configuration"
