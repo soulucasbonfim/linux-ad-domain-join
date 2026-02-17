@@ -4769,14 +4769,16 @@ if [[ -n "$CURRENT_DN" ]]; then
     # Strips whitespace around '=' and ',' and lowercases both strings.
     # This prevents unnecessary ldapmodify modrdn when the AD returns a DN that
     # differs only in casing or spacing (e.g., "OU=Servers" vs "OU=servers").
-    _dn_normalize() {
-        printf '%s' "$1" \
+    _current_dn_norm="$(
+        printf '%s' "$CURRENT_DN" \
             | sed -E 's/[[:space:]]*,[[:space:]]*/,/g; s/[[:space:]]*=[[:space:]]*/=/g' \
             | tr '[:upper:]' '[:lower:]'
-    }
-    local _current_dn_norm _expected_dn_norm
-    _current_dn_norm="$(_dn_normalize "$CURRENT_DN")"
-    _expected_dn_norm="$(_dn_normalize "$EXPECTED_DN")"
+    )"
+    _expected_dn_norm="$(
+        printf '%s' "$EXPECTED_DN" \
+            | sed -E 's/[[:space:]]*,[[:space:]]*/,/g; s/[[:space:]]*=[[:space:]]*/=/g' \
+            | tr '[:upper:]' '[:lower:]'
+    )"
 
     if [[ "$_current_dn_norm" == "$_expected_dn_norm" ]]; then
         $VERBOSE && log_info "ℹ️ Computer object is already in the correct OU"
