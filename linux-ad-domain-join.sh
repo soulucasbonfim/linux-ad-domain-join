@@ -3689,11 +3689,14 @@ if [[ -n "$REALM_JOINED" ]]; then
         kdestroy -q 2>/dev/null || true
         log_info "✅ Kerberos trust is intact (keytab is valid)"
         if ! $NONINTERACTIVE; then
-          read_sanitized "⚠️ Joined locally with valid trust. Rejoin anyway? [y/N]: " REPLY
-            if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
-                log_info "🚪 Exiting without rejoin"
-                exit 0
-            fi
+            while true; do
+                read_sanitized "⚠️ Joined locally with valid trust. Rejoin anyway? [y/N]: " REPLY
+                case "${REPLY,,}" in
+                    y|yes) break ;;
+                    n|no|"") log_info "🚪 Exiting without rejoin"; exit 0 ;;
+                    *) printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid option. Type 'y' or 'n'.\n" "$(date '+%F %T')" ;;
+                esac
+            done
         else
             log_info "ℹ Non-interactive: proceeding with forced rejoin"
         fi
