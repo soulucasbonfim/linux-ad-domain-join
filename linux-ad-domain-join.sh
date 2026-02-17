@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.3.3
+# Version:     3.3.4
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -928,20 +928,21 @@ backup_prune_old_runs() {
     local tmp_list
     tmp_list="$(safe_mktemp)" || return 0
 
-    # List subdirs by mtime (newest first). No failure if empty.
-    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@ %p\n' 2>/dev/null \
-      | sort -nr >"$tmp_list" || true
+    # NUL-delimited find to safely handle paths with spaces (consistent with _prune_old_logs)
+    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\0' 2>/dev/null \
+      | sort -z -t$'\t' -k1,1rn >"$tmp_list" || true
 
     local total
-    total="$(wc -l <"$tmp_list" 2>/dev/null || echo 0)"
+    total="$(tr -cd '\0' < "$tmp_list" | wc -c 2>/dev/null || echo 0)"
     [[ "$total" =~ ^[0-9]+$ ]] || total=0
 
     if (( total > keep )); then
-        tail -n +"$((keep+1))" "$tmp_list" | awk '{print $2}' | while IFS= read -r d || [[ -n "$d" ]]; do
-            if [[ -n "$d" ]]; then
-                rm -rf -- "$d" 2>/dev/null || true
-            fi
-        done
+        # Skip first 'keep' entries (newest), delete the rest
+        local _skip=0
+        while IFS=$'\t' read -r -d '' _ts d; do
+            (( ++_skip <= keep )) && continue
+            [[ -n "$d" ]] && rm -rf -- "$d" 2>/dev/null || true
+        done < "$tmp_list"
     fi
 
     rm -f "$tmp_list"
@@ -1408,6 +1409,29 @@ is_mutating_cmd() {
         mkdir|rmdir|touch)
             return 0
             ;;
+        apt|apt-get|aptitude)
+            return 0
+            ;;
+        dnf|yum)
+            return 0
+            ;;
+        zypper)
+            return 0
+            ;;
+        dpkg)
+            for a in "${args[@]}"; do
+                case "$a" in
+                    -i|--install|-r|--remove|-P|--purge|--configure|--unpack) return 0 ;;
+                esac
+            done
+            ;;
+        rpm)
+            for a in "${args[@]}"; do
+                case "$a" in
+                    -i|-U|-F|-e|--install|--upgrade|--freshen|--erase) return 0 ;;
+                esac
+            done
+            ;;
     esac
 
     return 1
@@ -1508,12 +1532,8 @@ CMD_LAST_RC=0
 cmd_try() {
     local rc=0
     local had_errexit=false
-    local _prev_err_trap=""
 
     [[ $- == *e* ]] && had_errexit=true
-
-    # Capture current ERR trap verbatim (not just existence)
-    _prev_err_trap="$(trap -p ERR)" || true
 
     trap - ERR
     set +e
@@ -1523,7 +1543,7 @@ cmd_try() {
 
     $had_errexit && set -e
 
-    # Restore ERR trap by re-declaring directly (avoids eval)
+    # Restore the global ERR trap (always ERROR_TRAP_CMD in this script)
     trap "$ERROR_TRAP_CMD" ERR
 
     CMD_LAST_RC=$rc
@@ -1618,12 +1638,8 @@ cmd_try_in() {
     # Usage: cmd_try_in <stdin_file> <cmd> [args...]
     local rc=0
     local had_errexit=false
-    local _prev_err_trap=""
 
     [[ $- == *e* ]] && had_errexit=true
-
-    # Capture current ERR trap verbatim (consistent with cmd_try)
-    _prev_err_trap="$(trap -p ERR)" || true
 
     trap - ERR
     set +e
@@ -3224,7 +3240,8 @@ else
                     [[ -n "$_current_search" ]] && _new_search="$DOMAIN $_current_search"
                     nmcli con mod "$_nm_conn" ipv4.dns-search "$_new_search" 2>/dev/null || true
                 fi
-                # Prevent DHCP from overwriting DNS (ignore-auto-dns)
+                # Prevent DHCP from overwriting AD DNS (required for stable Kerberos/LDAP resolution).
+                # If DC IP changes (DR scenario), re-run this script or update via nmcli manually.
                 nmcli con mod "$_nm_conn" ipv4.ignore-auto-dns yes 2>/dev/null || true
                 # Apply changes (suppress stdout to keep log clean)
                 nmcli con up "$_nm_conn" >/dev/null 2>&1 || true
@@ -3583,8 +3600,26 @@ KRB_TRACE="" KRB_LOG="" JOIN_LOG="" TMP_LDIF=""
 _DBUS_RESTART_DEFERRED=false
 _DBUS_RESTART_UNIT=""
 
-# Install traps only once
-trap cleanup_secrets EXIT HUP INT TERM
+# Deterministic signal handler: cleanup + exit with signal-appropriate code.
+# Separating signal traps from EXIT ensures the script cannot continue
+# execution after Ctrl+C or SIGTERM, regardless of where the signal lands.
+terminate_on_signal() {
+    local sig="${1:-TERM}"
+    # Prevent recursive trap invocation
+    trap - EXIT HUP INT TERM
+    cleanup_secrets
+    case "$sig" in
+        HUP)  exit 129 ;;
+        INT)  exit 130 ;;
+        TERM) exit 143 ;;
+        *)    exit 1   ;;
+    esac
+}
+
+trap cleanup_secrets EXIT
+trap 'terminate_on_signal HUP'  HUP
+trap 'terminate_on_signal INT'  INT
+trap 'terminate_on_signal TERM' TERM
 
 # Create secret file now (DOMAIN_PASS must exist at this moment)
 create_secret_passfile
@@ -5099,9 +5134,13 @@ trap "$ERROR_TRAP_CMD" ERR
 log_info "🔧 Checking if computer object is disabled in AD..."
 
 # Query userAccountControl via GSSAPI (machine trust)
+# Pre-resolve stderr destination (cleaner than inline subshell expansion)
+local _uac_stderr="/dev/null"
+$VERBOSE && _uac_stderr="/dev/stderr"
+
 UAC_RAW=$(timeout "$LDAP_TIMEOUT" ldapsearch -Y GSSAPI -LLL -o ldif-wrap=no $LDAP_TLS_FLAG -H "$LDAP_URI" \
     -b "CN=${HOST_SHORT_U},${OU}" userAccountControl \
-    2>$($VERBOSE && echo /dev/stderr || echo /dev/null) | \
+    2>"$_uac_stderr" | \
     awk '/^userAccountControl:/ {print $2}' || true)
 
 if [[ -z "$UAC_RAW" ]]; then
@@ -6169,8 +6208,9 @@ else
 				# Escape regex metacharacters in group name for safe pattern matching
 				grp_escaped="$(regex_escape_ere "$grp")"
 
-				pat_all="^%${grp_escaped}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+ALL$"
-				pat_npw="^%${grp_escaped}[[:space:]]+ALL=\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]+ALL$"
+				# Allow optional spaces around '=' as sudoers syntax permits (e.g., ALL = (ALL))
+				pat_all="^%${grp_escaped}[[:space:]]+ALL[[:space:]]*=[[:space:]]*\(ALL(:ALL)?\)[[:space:]]+ALL$"
+				pat_npw="^%${grp_escaped}[[:space:]]+ALL[[:space:]]*=[[:space:]]*\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]+ALL$"
 
 				# Already compliant
 				if [[ "$line" == "$good_all" || "$line" == "$good_npw" ]]; then
