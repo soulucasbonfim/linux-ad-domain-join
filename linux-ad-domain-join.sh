@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.2.7
+# Version:     3.2.8
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2892,7 +2892,9 @@ PRIMARY_IP=""
 PRIMARY_IFACE=""
 
 # Strategy 0: Source IP used to reach DC (most reliable: guarantees AD connectivity, handles multi-homed)
-DC_V4="$(getent ahostsv4 "$DC_SERVER" 2>/dev/null | awk 'NR==1{print $1; exit}')"
+# Resolve DC to IPv4 for source-IP detection. May fail if DC has no A record
+# or if getent is unavailable — handled by fallback strategies below.
+DC_V4="$(getent ahostsv4 "$DC_SERVER" 2>/dev/null | awk 'NR==1{print $1; exit}')" || true
 
 # Fallback: if getent fails, attempt resolution via dig/host
 if [[ -z "$DC_V4" || ! "$DC_V4" =~ ^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
