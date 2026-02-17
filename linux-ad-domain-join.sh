@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.3.1
+# Version:     3.3.2
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2656,7 +2656,7 @@ else
         if validate_host_or_ip "$DC_SERVER" && [[ "$DC_SERVER" == *.* ]]; then
             break
         fi
-        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid hostname or IP. Please retry.\n" "$(date '+%F %T')"
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid DC server. Use FQDN (e.g., dc01.domain.com) or IP.\n" "$(date '+%F %T')"
     done
 
 	# NTP Server (optional, default filled)
