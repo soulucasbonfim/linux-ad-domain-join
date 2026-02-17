@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.2.5
+# Version:     3.2.6
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -122,13 +122,15 @@ scriptVersion="$(grep -m1 "^# Version:" "${BASH_SOURCE[0]:-$0}" 2>/dev/null | cu
 # Strict mode: fail fast, track errors, prevent unset vars, propagate pipe failures
 set -Eeuo pipefail
 
-# Ignore SIGPIPE (broken pipe) — prevents silent death when output is piped
+# Ignore SIGPIPE (broken pipe) - prevents silent death when output is piped
 trap '' PIPE 2>/dev/null || true
 
 # Safe IFS: prevent word splitting issues (space-only IFS for controlled behavior)
 IFS=$' \t\n'
 
-# Require Bash 4+ (associative arrays, mapfile).
+# Require Bash 4+ (associative arrays, mapfile, printf -v).
+# NOTE: Bash 4.0 is the minimum - features like 'local -n' (nameref, Bash 4.3+)
+# are intentionally avoided throughout this script for maximum compatibility.
 if [[ -z "${BASH_VERSINFO[0]:-}" || "${BASH_VERSINFO[0]}" -lt 4 ]]; then
     echo "[$(date '+%F %T')] [ERROR] Bash 4+ required. Current: ${BASH_VERSION:-unknown}" >&2
     exit 1
@@ -298,20 +300,29 @@ log_error() {
 # -------------------------------------------------------------------------
 # Read wrapper with safe emoji sanitization
 # -------------------------------------------------------------------------
+# NOTE: Uses 'printf -v' (Bash 3.1+) instead of 'local -n' / nameref (Bash 4.3+)
+# to maintain compatibility with Bash 4.0-4.2 (e.g., RHEL 7.0-7.3).
+# This is an intentional design choice - do not refactor to use 'local -n'.
+# -------------------------------------------------------------------------
 read_sanitized() {
-    local prompt sanitized var_name ts
+    local prompt sanitized var_name ts _rs_input
     prompt="${1:-}"
     var_name="${2:-}"
-    
+
     [[ -z "$var_name" ]] && log_error "read_sanitized: missing var_name" 1
-    
+
+    # Validate variable name to prevent injection via printf -v
+    # (only alphanumeric and underscore, must start with letter or underscore)
+    [[ "$var_name" =~ ^[a-zA-Z_][a-zA-Z0-9_]*$ ]] || \
+        log_error "read_sanitized: invalid variable name '$var_name'" 1
+
     ts="${C_DIM}[$(date '+%F %T')]${C_RESET}"
     sanitized="$(sanitize_log_msg <<< "$prompt")"
     sanitized="$(colorize_tag "$sanitized")"
-    
-    # Use declare -n for safe reference under set -u
-    local -n __var_ref="$var_name"
-    read -rp "${ts} ${sanitized}" __var_ref
+
+    # Read into local, then assign to caller's variable via printf -v (Bash 4.0+ safe)
+    read -rp "${ts} ${sanitized}" _rs_input
+    printf -v "$var_name" '%s' "$_rs_input"
 }
 
 # -------------------------------------------------------------------------
@@ -448,6 +459,68 @@ validate_username() {
 }
 
 # -------------------------------------------------------------------------
+# Validate host or IPv4/IPv6 endpoint (used for DC_SERVER, NTP_SERVER).
+# -------------------------------------------------------------------------
+# Accepts: FQDN, short hostname, IPv4, and basic IPv6.
+# Rejects: control characters, newlines, whitespace, shell metacharacters.
+# This is an intentional security gate for non-interactive inputs.
+# -------------------------------------------------------------------------
+validate_host_or_ip() {
+    local value="${1:-}"
+    [[ -n "$value" ]] || return 1
+    [[ "$value" == *$'\n'* || "$value" == *$'\r'* || "$value" == *$'\t'* ]] && return 1
+
+    # IPv4 format check (strict octet range 0-255)
+    if [[ "$value" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        local o1 o2 o3 o4
+        IFS='.' read -r o1 o2 o3 o4 <<< "$value"
+        local o
+        for o in "$o1" "$o2" "$o3" "$o4"; do
+            (( o >= 0 && o <= 255 )) || return 1
+        done
+        return 0
+    fi
+
+    # Basic IPv6 check (hex groups separated by colons, optional :: compression)
+    if [[ "$value" =~ ^[0-9a-fA-F:]+$ && "$value" == *:* ]]; then
+        return 0
+    fi
+
+    # DNS hostname/FQDN check (RFC 1123: labels, alphanumeric+hyphen, max 253 chars)
+    (( ${#value} > 253 )) && return 1
+    [[ "$value" =~ ^[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$ ]] || return 1
+    return 0
+}
+
+# -------------------------------------------------------------------------
+# Validate LDAP Distinguished Name shape (used for OU parameter).
+# -------------------------------------------------------------------------
+# Checks: non-empty, no newlines/CR (LDIF injection), max 1024 chars,
+# at least 2 RDN components, each matching KEY=VALUE format.
+# NOTE: Does not handle escaped commas in RDN values (e.g., CN=User\, Name).
+# This is acceptable because the OU parameter never contains escaped commas.
+# -------------------------------------------------------------------------
+validate_ldap_dn() {
+    local dn="${1:-}"
+    [[ -n "$dn" ]] || return 1
+    [[ "$dn" == *$'\n'* || "$dn" == *$'\r'* ]] && return 1
+    (( ${#dn} <= 1024 )) || return 1
+
+    local -a _rdns
+    IFS=',' read -r -a _rdns <<< "$dn"
+    (( ${#_rdns[@]} >= 2 )) || return 1
+
+    local rdn
+    for rdn in "${_rdns[@]}"; do
+        # Trim leading/trailing whitespace from each RDN
+        rdn="${rdn#"${rdn%%[![:space:]]*}"}"
+        rdn="${rdn%"${rdn##*[![:space:]]}"}"
+        [[ "$rdn" =~ ^[A-Za-z][A-Za-z0-9-]*=.+$ ]] || return 1
+    done
+    return 0
+}
+
+# -------------------------------------------------------------------------
 # Global error trap - catches any unexpected command failure
 # -------------------------------------------------------------------------
 ERROR_TRAP_CMD='log_error "Unexpected error at line $LINENO in \"$BASH_COMMAND\"" $?'
@@ -513,12 +586,12 @@ VALIDATE_ONLY="${VALIDATE_ONLY:-false}"
 LDAP_TIMEOUT="${LDAP_TIMEOUT:-30}"
 # Validate LDAP_TIMEOUT is a positive integer (reject suffixes, floats, negatives)
 if ! [[ "$LDAP_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
-    log_info "⚠ LDAP_TIMEOUT='$LDAP_TIMEOUT' is not a valid positive integer — defaulting to 30"
+    log_info "⚠ LDAP_TIMEOUT='$LDAP_TIMEOUT' is not a valid positive integer - defaulting to 30"
     LDAP_TIMEOUT=30
 fi
 JOIN_TIMEOUT="${JOIN_TIMEOUT:-120}"
 if ! [[ "$JOIN_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
-    log_info "⚠ JOIN_TIMEOUT='$JOIN_TIMEOUT' is not a valid positive integer — defaulting to 120"
+    log_info "⚠ JOIN_TIMEOUT='$JOIN_TIMEOUT' is not a valid positive integer - defaulting to 120"
     JOIN_TIMEOUT=120
 fi
 KRB5_KEYTAB="${KRB5_KEYTAB:-/etc/krb5.keytab}"
@@ -546,7 +619,7 @@ LOG_FILE="${LOG_DIR}/${LOG_TIMESTAMP}_${LOG_HOSTNAME}.log"
 # Harden /tmp paths against pre-existing symlinks (defense-in-depth)
 if [[ "$LOG_DIR" == /tmp/* || "$LOG_DIR" == /var/tmp/* ]]; then
     if [[ -L "$LOG_DIR" ]]; then
-        log_info "⚠ LOG_DIR is a symlink ($LOG_DIR) — refusing to use it"
+        log_info "⚠ LOG_DIR is a symlink ($LOG_DIR) - refusing to use it"
         rm -f "$LOG_DIR" 2>/dev/null || true
     fi
 fi
@@ -567,7 +640,7 @@ chmod 640 "$LOG_FILE" 2>/dev/null || true
 LOG_RETENTION="${LOG_RETENTION:-30}"
 # Validate LOG_RETENTION is a positive integer (prevent arithmetic errors on bad env input)
 if ! [[ "$LOG_RETENTION" =~ ^[1-9][0-9]*$ ]]; then
-    log_info "⚠ LOG_RETENTION='$LOG_RETENTION' is not a valid positive integer — defaulting to 30"
+    log_info "⚠ LOG_RETENTION='$LOG_RETENTION' is not a valid positive integer - defaulting to 30"
     LOG_RETENTION=30
 fi
 _prune_old_logs() {
@@ -633,12 +706,24 @@ else
     LOCK_MODE="mkdir"
 fi
 
-# Redirect stdout/stderr to log; mirror to console only if tee exists
+# -------------------------------------------------------------------------
+# Redirect stdout/stderr to log file while mirroring to console via tee.
+# -------------------------------------------------------------------------
 if command -v tee >/dev/null 2>&1; then
     : >"$LOG_FILE" 2>/dev/null || true
-    exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
-    # Brief pause to let tee process substitutions initialize
-    sleep 0.1
+
+    # Prefer line-buffered tee to prevent interleaved writes from dual process substitutions
+    if command -v stdbuf >/dev/null 2>&1; then
+        exec > >(stdbuf -oL tee -a "$LOG_FILE") 2> >(stdbuf -oL tee -a "$LOG_FILE" >&2)
+    else
+        exec > >(tee -a "$LOG_FILE") 2> >(tee -a "$LOG_FILE" >&2)
+    fi
+
+    # Brief pause to let tee process substitutions initialize.
+    # On heavily loaded systems (CI/CD, cloud VMs with I/O throttling),
+    # the subprocesses may take longer to start - 0.2s covers most cases.
+    sleep 0.2
+
     # Verify log pipeline is functional (catches disk-full / permission issues early)
     if ! echo "[$(date '+%F %T')] [i] Log pipeline initialized" >>"$LOG_FILE" 2>/dev/null; then
         echo "[$(date '+%F %T')] [!] Warning: LOG_FILE may not be writable ($LOG_FILE)" >&2
@@ -1879,6 +1964,15 @@ tcp_port_open() {
     # Usage: tcp_port_open <host> <port> <timeout_seconds>
     local host="$1" port="$2" t="${3:-3}"
     local ncbin
+
+    # Input validation (defense-in-depth against injection in /dev/tcp fallback).
+    # Accept FQDN, short hostname, IPv4, and bracketed IPv6 literals.
+    # This is an intentional security gate - do not remove.
+    [[ -n "$host" ]] || return 1
+    [[ "$host" =~ ^[A-Za-z0-9._:-]+$ ]] || return 1
+    [[ "$port" =~ ^[0-9]{1,5}$ ]] || return 1
+    (( port >= 1 && port <= 65535 )) || return 1
+
     ncbin="$(detect_netcat_bin)"
 
     if [[ -n "$ncbin" ]]; then
@@ -1891,8 +1985,9 @@ tcp_port_open() {
         fi
     fi
 
-    # Final fallback: bash /dev/tcp
-    timeout "$t" bash -c "echo > /dev/tcp/${host}/${port}" >/dev/null 2>&1
+    # Fallback: bash /dev/tcp. Variables passed as positional args (not interpolated
+    # in command string) to prevent injection. Same pattern as flock in DC discovery.
+    timeout "$t" bash -c 'echo > "/dev/tcp/$1/$2"' _ "$host" "$port" >/dev/null 2>&1
 }
 
 # -------------------------------------------------------------------------
@@ -2016,16 +2111,16 @@ discover_nearest_dc() {
 
     read -ra dc_arr <<< "$candidates"
 
-    # ── Single DC — no ping needed ──
+    # ── Single DC - no ping needed ──
     if (( ${#dc_arr[@]} == 1 )); then
         echo "${dc_arr[0]}"
         return 0
     fi
 
-    # ── Multiple DCs — parallel ping, pick lowest latency ──
+    # ── Multiple DCs - parallel ping, pick lowest latency ──
     local ping_tmp _dc _dc_l _dc_ip _dc_avg _running=0
     ping_tmp="$(mktemp /tmp/.dc-ping.XXXXXX 2>/dev/null)" || {
-        # mktemp failed — fall back to first candidate
+        # mktemp failed - fall back to first candidate
         echo "${dc_arr[0]}"
         return 0
     }
@@ -2050,11 +2145,14 @@ discover_nearest_dc() {
             _dc_avg="$(ping -c 1 -W 1 -q "$_dc_ip" 2>/dev/null \
                 | awk -F'/' '/^(rtt|round-trip)/ {printf "%.3f", $5}')" || true
             if [[ -n "$_dc_avg" && "$_dc_avg" != "0.000" ]]; then
-                # Use flock for atomic append (prevents interleaved writes from parallel subshells)
+                # Use flock for atomic append (prevents interleaved writes from parallel subshells).
+                # Variables are passed as positional args to bash -c (not interpolated in the
+                # command string) to prevent injection from crafted DNS hostnames.
+                # This is an intentional security pattern - do not refactor to use inline expansion.
                 if command -v flock >/dev/null 2>&1; then
-                    flock "$ping_tmp" -c "echo '${_dc_avg}|${_dc_l}' >> \"$ping_tmp\""
+                    flock "$ping_tmp" bash -c 'printf "%s\n" "$1" >> "$2"' _ "${_dc_avg}|${_dc_l}" "$ping_tmp"
                 else
-                    echo "${_dc_avg}|${_dc_l}" >> "$ping_tmp"
+                    printf '%s\n' "${_dc_avg}|${_dc_l}" >> "$ping_tmp"
                 fi
             fi
         ) &
@@ -2077,7 +2175,7 @@ discover_nearest_dc() {
         return 0
     fi
 
-    # All pings failed — return first candidate
+    # All pings failed - return first candidate
     echo "${dc_arr[0]}"
     return 0
 }
@@ -2157,7 +2255,10 @@ install_missing_deps() {
 # -------------------------------------------------------------------------
 # List required tools
 # -------------------------------------------------------------------------
-tools=( realm adcli kinit kdestroy timedatectl systemctl sed grep tput timeout hostname cp chmod tee ldapsearch ldapmodify chronyc host dig ip pgrep install )
+tools=( realm adcli kinit kdestroy systemctl sed grep tput timeout hostname cp chmod tee ldapsearch ldapmodify chronyc host dig ip pgrep install )
+
+# timedatectl is optional - script has chrony config fallback for NTP setup
+command -v timedatectl >/dev/null 2>&1 && tools+=( timedatectl )
 
 # Add PAM config tool based on OS family
 case "$OS_FAMILY" in
@@ -2268,7 +2369,7 @@ if (( ${#missing_pkgs[@]} > 0 )); then
 
     # -------------------------------------------------------------------------
     # [Self-Healing] Detect and repair RPM database corruption
-    # (RHEL-like only — must run before attempting package install)
+    # (RHEL-like only - must run before attempting package install)
     # -------------------------------------------------------------------------
     if [[ -f /etc/redhat-release || -f /etc/centos-release || -f /etc/oracle-release || -f /etc/rocky-release || -f /etc/almalinux-release ]]; then
         if $VALIDATE_ONLY; then
@@ -2290,7 +2391,7 @@ if (( ${#missing_pkgs[@]} > 0 )); then
                     log_info "⚙ RPM database appears corrupted - initiating recovery"
 
                     # Backup existing RPM database
-                    # (backup_file does not support directories — use cp -a directly)
+                    # (backup_file does not support directories - use cp -a directly)
                     if [[ -d /var/lib/rpm ]]; then
                         backup_path="/var/lib/rpm.bak.$(date +%F_%H-%M)"
                         cp -a /var/lib/rpm "$backup_path" 2>/dev/null || true
@@ -2302,7 +2403,9 @@ if (( ${#missing_pkgs[@]} > 0 )); then
                         log_error "RPM database repair aborted: a package manager process is running (yum/dnf/rpm/packagekitd). Stop it and retry." 1
                     fi
 
-                    # Remove potential stale locks (Berkeley DB and stale rpm lock file)
+                    # Remove potential stale locks (Berkeley DB and stale rpm lock file).
+                    # On RHEL 9+ (SQLite backend), __db.* files do not exist and this glob
+                    # is a harmless no-op. No conditional logic needed — rm -f handles it.
                     rm -f /var/lib/rpm/__db.* 2>/dev/null
                     rm -f /var/lib/rpm/.rpm.lock 2>/dev/null
 
@@ -2395,11 +2498,14 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     # -------------------------------------------------------------------------
     # Post-install: validate that required commands are now available
     # -------------------------------------------------------------------------
-    for cmd in realm adcli kinit kdestroy timedatectl systemctl \
+    for cmd in realm adcli kinit kdestroy systemctl \
                sed grep tput timeout hostname cp chmod tee \
                ldapsearch ldapmodify chronyc; do
         check_cmd "$cmd"
     done
+
+    # timedatectl: optional post-install (chrony config fallback exists for NTP setup)
+    command -v timedatectl >/dev/null 2>&1 || log_info "ℹ timedatectl not found - NTP will be configured via chrony config only"
 
     case "$OS_FAMILY" in
         debian) check_cmd pam-auth-update ;;
@@ -2413,7 +2519,7 @@ if (( ${#missing_pkgs[@]} > 0 )); then
         suse) check_cmd pam-config ;;
     esac
 else
-    log_info "✅ All required packages and tools are present — skipping connectivity check"
+    log_info "✅ All required packages and tools are present - skipping connectivity check"
 fi
 
 # -------------------------------------------------------------------------
@@ -2422,14 +2528,20 @@ fi
 if $NONINTERACTIVE; then
     : "${DOMAIN:?DOMAIN required}"
     : "${OU:?OU required}"
+
+    # Validate core identity inputs early (fail fast before network operations).
+    # These checks mirror the interactive flow validations.
+    validate_domain_name "$DOMAIN" || log_error "Invalid DOMAIN format: $DOMAIN" 1
+    validate_ldap_dn "$OU"         || log_error "Invalid OU DN format: $OU" 1
+
     # DC_SERVER: auto-discover nearest if not provided
     if [[ -z "${DC_SERVER:-}" ]]; then
-        log_info "🔍 DC_SERVER not set — running auto-discovery..."
+        log_info "🔍 DC_SERVER not set - running auto-discovery..."
         DC_SERVER="$(discover_nearest_dc "$DOMAIN")" || true
         if [[ -n "$DC_SERVER" ]]; then
             log_info "✅ DC auto-discovered: ${DC_SERVER}"
         else
-            log_error "DC_SERVER required (auto-discovery failed — pass DC_SERVER explicitly)" 1
+            log_error "DC_SERVER required (auto-discovery failed - pass DC_SERVER explicitly)" 1
         fi
     fi
     : "${NTP_SERVER:=ntp.${DOMAIN,,}}"
@@ -2437,6 +2549,11 @@ if $NONINTERACTIVE; then
     : "${DOMAIN_PASS:?DOMAIN_PASS required}"
     : "${SESSION_TIMEOUT_SECONDS:?SESSION_TIMEOUT_SECONDS required (seconds)}"
     : "${PERMIT_ROOT_LOGIN:?PERMIT_ROOT_LOGIN required (yes|no)}"
+
+    # Validate endpoint and user inputs (prevents late failures in kinit/ldapmodify)
+    validate_host_or_ip "$DC_SERVER"  || log_error "Invalid DC_SERVER value: $DC_SERVER" 1
+    validate_host_or_ip "$NTP_SERVER" || log_error "Invalid NTP_SERVER value: $NTP_SERVER" 1
+    validate_username "$DOMAIN_USER"  || log_error "Invalid DOMAIN_USER format: $DOMAIN_USER" 1
 
     # Administrative groups (optional with smart defaults)
     HOST_L=$(to_lower "$(hostname -s)")
@@ -2513,7 +2630,7 @@ else
     OU="$(trim_ws "${OU:-}")"
     OU="${OU:-$default_OU}"
 
-    # DC Server — auto-discover nearest via DNS SRV + ping latency
+    # DC Server - auto-discover nearest via DNS SRV + ping latency
     log_info "🔍 Discovering nearest Domain Controller..."
     default_DC_SERVER="$(discover_nearest_dc "$DOMAIN")" || true
 
@@ -2522,7 +2639,7 @@ else
     else
         # Fallback: static pattern if discovery failed
         default_DC_SERVER="${DOMAIN_SHORT,,}-ad01.${DOMAIN,,}"
-        log_info "ℹ DNS SRV discovery unavailable — using fallback: ${default_DC_SERVER}"
+        log_info "ℹ DNS SRV discovery unavailable - using fallback: ${default_DC_SERVER}"
     fi
 
     printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} DC server ${C_DIM}[default: ${default_DC_SERVER}]${C_RESET}: " "$(date '+%F %T')"
@@ -2746,17 +2863,17 @@ MACHINE_PRINCIPAL="${HOST_SHORT_U}\$@${REALM}"
 LDAP_URI="ldap://${LDAP_SERVER}"
 LDAP_TLS_FLAG=""
 
-# Check LDAPS availability (informational — not used with GSSAPI)
+# Check LDAPS availability (informational - not used with GSSAPI)
 if tcp_port_open "$LDAP_SERVER" 636 3; then
-    log_info "ℹ LDAPS (TCP/636) available but not used — GSSAPI Sign&Seal provides encryption (SSF:256)"
+    log_info "ℹ LDAPS (TCP/636) available but not used - GSSAPI Sign&Seal provides encryption (SSF:256)"
 fi
 
 # Attempt STARTTLS as optional defense-in-depth layer on top of GSSAPI
 if timeout 5 ldapsearch -x -H "$LDAP_URI" -ZZ -b "" -s base namingContexts >/dev/null 2>&1; then
     LDAP_TLS_FLAG="-ZZ"
-    log_info "✅ LDAP STARTTLS available — layered on top of GSSAPI for defense-in-depth"
+    log_info "✅ LDAP STARTTLS available - layered on top of GSSAPI for defense-in-depth"
 else
-    log_info "✅ Using GSSAPI Sign&Seal encryption (SSF:256) — transport is secure"
+    log_info "✅ Using GSSAPI Sign&Seal encryption (SSF:256) - transport is secure"
 fi
 
 # -------------------------------------------------------------------------
@@ -3370,6 +3487,41 @@ create_secret_passfile() {
 }
 
 cleanup_secrets() {
+    local _exit_code=$?
+
+    # -------------------------------------------------------------------------
+    # Deferred D-Bus restart (only on successful exit)
+    # -------------------------------------------------------------------------
+    # Dispatched FIRST in the EXIT trap, before file cleanup, because:
+    #   1. All configs (sudoers, SSH, SSSD, PAM) are already committed at this point
+    #   2. The detached process (nohup+setsid) survives the script exit
+    #   3. Prevents session sluggishness observed on some distros when D-Bus
+    #      is not restarted after oddjob registration changes
+    #   4. Running in EXIT trap guarantees execution regardless of script flow
+    #
+    # Variable is passed via environment export (not interpolated in bash -c)
+    # to prevent shell injection. This is an intentional security pattern.
+    # -------------------------------------------------------------------------
+    if (( _exit_code == 0 )) && \
+       [[ "${_DBUS_RESTART_DEFERRED:-false}" == "true" && -n "${_DBUS_RESTART_UNIT:-}" ]]; then
+        log_info "🔄 Executing deferred D-Bus restart ($_DBUS_RESTART_UNIT)" 2>/dev/null || true
+
+        if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" ]]; then
+            log_info "ℹ Running over SSH - session may briefly stall during D-Bus restart" 2>/dev/null || true
+        fi
+
+        # Export unit name as env var; single-quoted bash -c prevents shell expansion
+        _DBUS_UNIT_EXPORT="$_DBUS_RESTART_UNIT" \
+        nohup setsid bash -c '
+            sleep 1
+            systemctl restart "$_DBUS_UNIT_EXPORT" >/dev/null 2>&1
+            systemctl restart oddjobd >/dev/null 2>&1
+        ' </dev/null >/dev/null 2>&1 &
+        disown 2>/dev/null || true
+
+        log_info "✅ D-Bus restart dispatched (detached, will complete after script exit)" 2>/dev/null || true
+    fi
+
     # Restore immutable bits on any files we unlocked
     _file_restore_all_attrs 2>/dev/null || true
 
@@ -3390,8 +3542,10 @@ cleanup_secrets() {
     done
 
     # Release mkdir-based lock (if flock is unavailable).
+    # :? expansion is defense-in-depth — prevents rm -rf on empty string even if
+    # the -n guard above is accidentally removed in future maintenance.
     if [[ "${LOCK_MODE:-}" == "mkdir" && -n "${LOCK_DIR_FALLBACK:-}" ]]; then
-        rm -rf "${LOCK_DIR_FALLBACK}" 2>/dev/null || true
+        rm -rf "${LOCK_DIR_FALLBACK:?}" 2>/dev/null || true
     fi
 
     unset PASS_FILE
@@ -3404,7 +3558,7 @@ cleanup_secrets() {
 # Actual values are assigned later when the files are created.
 KRB_TRACE="" KRB_LOG="" JOIN_LOG="" TMP_LDIF=""
 
-# Deferred D-Bus restart flag (set during oddjob remediation, executed at script end)
+# Deferred D-Bus restart flag (set during oddjob remediation, executed in cleanup_secrets EXIT trap)
 _DBUS_RESTART_DEFERRED=false
 _DBUS_RESTART_UNIT=""
 
@@ -3427,7 +3581,10 @@ set +e
 KRB5_TRACE="$KRB_TRACE" kinit "$DOMAIN_USER@$REALM" <"$PASS_FILE" >/dev/null 2>&1
 KINIT_CODE=$?
 
-set -e
+
+# Restore strict mode (symmetric with set -Eeuo pipefail at script initialization)
+set -Eeuo pipefail
+
 # Restore ERR trap safely
 trap "$ERROR_TRAP_CMD" ERR
 
@@ -3680,7 +3837,13 @@ if [[ "$OS_FAMILY" =~ ^(rhel)$ ]]; then
 
     cmd_try mkdir -p "$(dirname "$DBUS_SVC")" "$(dirname "$ODDJOB_XML")"
 
-    # Create or repair the D-Bus service activation file
+    # Create or repair the D-Bus service activation file.
+    # NOTE: This writes to /usr/share/dbus-1/ which is vendor-managed territory.
+    # This is an intentional last-resort fallback — the file is only created when
+    # missing (package corruption, minimal install). Future 'yum update oddjob' will
+    # overwrite this with the official vendor version, which is the desired outcome.
+    # Do not replace this with package reinstall logic — DNS/repos may be unavailable
+    # at this point in the domain join process.
     if [[ ! -f "$DBUS_SVC" ]]; then
         log_info "🔧 Restoring D-Bus service file: $DBUS_SVC"
         write_file 0644 "$DBUS_SVC" <<'EOF'
@@ -3786,7 +3949,7 @@ EOF
             # and can cause lentidão/degradation if NOT restarted at all.
             # The deferred approach ensures the system is fully configured before any
             # session-impacting restart occurs.
-            log_info "ℹ D-Bus restart required for oddjob — deferring to end of script"
+            log_info "ℹ D-Bus restart required for oddjob - deferring to end of script"
             log_info "ℹ oddjob mkhomedir may not be fully operational until D-Bus is restarted"
             _DBUS_RESTART_DEFERRED=true
             _DBUS_RESTART_UNIT="$DBUS_SERVICE"
@@ -3983,7 +4146,7 @@ for key in passwd shadow group services netgroup; do
 
     [ -f "$NSS_EDIT" ] || : >"$NSS_EDIT"
 
-    # Normalize whitespace (work file) — use cmd_must only on the real file
+    # Normalize whitespace (work file) - use cmd_must only on the real file
     if [[ "$NSS_EDIT" == "$NSS_FILE" ]]; then
         cmd_must sed -i 's/[[:space:]]\{2,\}/ /g; s/[[:space:]]\+$//' "$NSS_EDIT"
     else
@@ -4459,7 +4622,7 @@ else
     fi
 
     if ! $_chrony_running; then
-        log_info "⚠️ Chrony service failed to start — skipping NTP sync wait"
+        log_info "⚠️ Chrony service failed to start - skipping NTP sync wait"
         log_info "ℹ Debug: systemctl status ${chrony_service} / journalctl -xeu ${chrony_service}"
     fi
 fi
@@ -4602,7 +4765,20 @@ $VERBOSE && echo "$LDAP_OUT"
 if [[ -n "$CURRENT_DN" ]]; then
     EXPECTED_DN="CN=${HOST_SHORT_U},${OU}"
 
-    if [[ "$CURRENT_DN" == "$EXPECTED_DN" ]]; then
+    # Normalize DNs for idempotent comparison (LDAP DNs are case-insensitive per RFC 4514).
+    # Strips whitespace around '=' and ',' and lowercases both strings.
+    # This prevents unnecessary ldapmodify modrdn when the AD returns a DN that
+    # differs only in casing or spacing (e.g., "OU=Servers" vs "OU=servers").
+    _dn_normalize() {
+        printf '%s' "$1" \
+            | sed -E 's/[[:space:]]*,[[:space:]]*/,/g; s/[[:space:]]*=[[:space:]]*/=/g' \
+            | tr '[:upper:]' '[:lower:]'
+    }
+    local _current_dn_norm _expected_dn_norm
+    _current_dn_norm="$(_dn_normalize "$CURRENT_DN")"
+    _expected_dn_norm="$(_dn_normalize "$EXPECTED_DN")"
+
+    if [[ "$_current_dn_norm" == "$_expected_dn_norm" ]]; then
         $VERBOSE && log_info "ℹ️ Computer object is already in the correct OU"
     else
         log_info "♻️ Computer object is currently in OU: $CURRENT_DN"
@@ -4635,7 +4811,8 @@ EOF
                 timeout "$LDAP_TIMEOUT" ldapmodify -Y GSSAPI $LDAP_TLS_FLAG -H "$LDAP_URI" -f "$TMP_LDIF" >/dev/null 2>&1
                 LDAP_MOVE_CODE=$?
             fi
-            set -e
+            # Restore strict mode
+            set -Eeuo pipefail
             trap "$ERROR_TRAP_CMD" ERR
         fi
 
@@ -4883,8 +5060,11 @@ fi
 # Cleanup
 rm -f "$KRB_LOG" 2>/dev/null || true
 
-# Restore strict mode after trust validation block
-set -e -o pipefail
+# Restore strict mode after trust validation block.
+# Symmetric with 'set -Eeuo pipefail' at script initialization.
+# -E (errtrace) and -u (nounset) are never disabled, but are included here
+# for explicit symmetry and to prevent accidental omission in future edits.
+set -Eeuo pipefail
 trap "$ERROR_TRAP_CMD" ERR
 
 # -------------------------------------------------------------------------
@@ -5291,8 +5471,8 @@ fi
 # -------------------------------------------------------------------------
 SUDOERS_MAIN="/etc/sudoers"
 SUDOERS_DIR="/etc/sudoers.d"
-SUDOERS_AD="${SUDOERS_DIR}/10-ad-linux-privilege-model"
 BLOCK_FILE="${SUDOERS_DIR}/00-block-root-shell"
+SUDOERS_AD="${SUDOERS_DIR}/10-ad-linux-privilege-model"
 
 # Ensure target directory exists
 log_info "🛡️ Configuring sudoers directory: $SUDOERS_DIR"
@@ -5313,48 +5493,128 @@ write_file 0440 "$BLOCK_FILE" <<'EOF'
 # administrators.
 #
 # IMPORTANT:
-# - This file contains global rules only. No AD groups are configured here.
-# - Do NOT place operational or security group privileges in this file.
+# - This file contains global DENY aliases only.
+# - No AD groups are configured here.
 # - All AD group privileges are defined in: 10-ad-linux-privilege-model
+#
+# DENY ALIASES DEFINED HERE:
+#   ROOT_SHELLS        - Direct shell spawning (bash, sh, dash, zsh, su, env)
+#   PRIV_ESC           - Interpreters that can exec shell (python, perl, etc.)
+#   SEC_SUDOERS_WRITE  - Direct writes to sudoers (sed -i, tee)
+#   SEC_CREDENTIALS    - Root password management (passwd root)
 # ========================================================================
 
 
 # ------------------------------------------------------------------------
-# ROOT_SHELLS
-# Command Alias: Denies any attempt to spawn an interactive root shell.
-# This includes direct shells (bash, sh, dash, zsh) and indirect shells
-# via /usr/bin/env or similar environment tricks.
+# ROOT_SHELLS - Block direct root shell access
 #
-# This alias is used with:
+# Denies any attempt to spawn an interactive root shell.
+# This includes direct shells (bash, sh, dash, zsh), indirect shells
+# via /usr/bin/env (including -S and -- variants), custom-built shells
+# in /usr/local/bin/, and util-linux 'script' (which spawns root shells).
+#
+# Usage in privilege rules:
 #       !ROOT_SHELLS
-# in the AD group privilege definitions.
+#
+# NOTE: This blocks 'sudo bash' and 'sudo su', but does NOT prevent
+# shell escape from within privileged editors (vim :!bash, nano Ctrl+T).
+# Editor-based escapes are mitigated by using sudoedit (see privilege model).
 # ------------------------------------------------------------------------
 Cmnd_Alias ROOT_SHELLS = \
-    /bin/su, /usr/bin/su, \
-    /bin/bash, /usr/bin/bash, \
-    /bin/sh, /usr/bin/sh, \
-    /bin/dash, /usr/bin/dash, \
-    /bin/zsh, /usr/bin/zsh, \
+    /bin/su, /usr/bin/su, /usr/local/bin/su, \
+    /bin/bash, /usr/bin/bash, /usr/local/bin/bash, \
+    /bin/sh, /usr/bin/sh, /usr/local/bin/sh, \
+    /bin/dash, /usr/bin/dash, /usr/local/bin/dash, \
+    /bin/zsh, /usr/bin/zsh, /usr/local/bin/zsh, \
     /usr/bin/env bash, \
     /usr/bin/env bash -i, \
     /usr/bin/env -i bash, \
+    /usr/bin/env -S bash, \
+    /usr/bin/env -- bash, \
     /usr/bin/env bash -c *, \
     /usr/bin/env -i bash -c *, \
     /usr/bin/env sh, \
     /usr/bin/env -i sh, \
+    /usr/bin/env -S sh, \
+    /usr/bin/env -- sh, \
     /usr/bin/env -i bash -i, \
     /usr/bin/env dash, \
     /usr/bin/env -i dash, \
+    /usr/bin/env -- dash, \
     /usr/bin/env zsh, \
-    /usr/bin/env -i zsh
+    /usr/bin/env -i zsh, \
+    /usr/bin/env -- zsh, \
+    /usr/bin/script, /bin/script, /usr/local/bin/script
+
 
 # ------------------------------------------------------------------------
-# Optional Alias (not active by default)
-# Used for blocking common privilege-escalation capable interpreters.
-# Uncomment and enforce in 10-ad-linux-privilege-model if required.
+# PRIV_ESC - Block privilege-escalation capable interpreters
 #
-# Cmnd_Alias PRIV_ESC = /usr/bin/python*, /usr/bin/perl*, /usr/bin/lua*, /usr/bin/ruby*
+# These interpreters can execute arbitrary system commands:
+#   sudo python3 -c 'import os; os.system("/bin/bash")'
+#   sudo perl -e 'exec "/bin/bash"'
+#   sudo ruby -e 'exec "/bin/bash"'
+#
+# Blocking these prevents indirect root shell access via interpreters.
+# Scripts using these languages should be executed as scripts
+# (sudo ./script.py), not via direct interpreter invocation.
+# The shebang is resolved by the kernel (execve), not by sudo.
+#
+# NOTE: Operational tools like find, awk, tar, less, man are intentionally
+# NOT blocked here - they are required for system administration.
+# The residual risk from these tools is accepted and compensated with
+# audit logging (auditd).
+#
+# Usage in privilege rules:
+#       !PRIV_ESC
 # ------------------------------------------------------------------------
+Cmnd_Alias PRIV_ESC = \
+    /usr/bin/python*, /bin/python*, \
+    /usr/bin/perl*, /bin/perl*, \
+    /usr/bin/ruby*, /bin/ruby*, \
+    /usr/bin/lua*, /bin/lua*, \
+    /usr/bin/expect, /bin/expect, \
+    /usr/bin/gdb, /bin/gdb, \
+    /usr/bin/strace, /bin/strace, \
+    /usr/bin/ltrace, /bin/ltrace
+
+
+# ------------------------------------------------------------------------
+# SEC_SUDOERS_WRITE - Block direct writes to sudoers files
+#
+# Prevents modification of sudoers files via sed -i or tee.
+# These tools can silently alter privilege rules:
+#
+#   sed -i 's/!ROOT_SHELLS//' /etc/sudoers.d/10-ad-linux-privilege-model
+#   echo 'user ALL=(ALL) NOPASSWD: ALL' | tee /etc/sudoers.d/backdoor
+#
+# Safe alternative: use visudo (validates syntax before committing).
+#
+# This alias is applied as a DENY to ALL roles (SEC, ADM, SUPER).
+# It is NOT included in any allow list - it is only used with !
+#
+# Usage in privilege rules:
+#       !SEC_SUDOERS_WRITE
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_SUDOERS_WRITE = \
+    /bin/sed -i* /etc/sudoers*, \
+    /usr/bin/sed -i* /etc/sudoers*, \
+    /usr/bin/tee /etc/sudoers*, \
+    /usr/bin/tee -a /etc/sudoers*
+
+
+# ------------------------------------------------------------------------
+# SEC_CREDENTIALS - Root password management
+#
+# Only SUPER administrators may reset the root password.
+# This alias is used as a DENY for SEC and ADM roles.
+# SUPER inherits access via ALL without this deny.
+#
+# Usage in privilege rules:
+#       !SEC_CREDENTIALS    (applied to SEC and ADM)
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_CREDENTIALS = \
+    /usr/bin/passwd root
 EOF
 
 if $DRY_RUN; then
@@ -5385,31 +5645,113 @@ write_file 0440 "$SUDOERS_AD" <<EOF
 #   - SECURITY administrators (SEC):
 #       * Govern authentication, authorization, identity and credentials
 #       * Execute only explicitly approved security commands
+#       * File editing via sudoedit (editor runs unprivileged)
 #       * Cannot obtain interactive root shell
+#       * Cannot reset root password
 #
 #   - OPERATIONAL administrators (ADM):
 #       * Operate the system and applications
 #       * Can manage services and software
 #       * Cannot alter security posture
 #       * Cannot obtain interactive root shell
+#       * Cannot reset root password
+#
+#   - FULL administrators (SUPER):
+#       * Union of ADM and SEC privileges
+#       * File editing via sudoedit (editor runs unprivileged)
+#       * Cannot obtain interactive root shell
+#       * CAN reset root password (only role with this privilege)
 #
 #
 # SCOPE CONTROL
 # -------------
 # Group scope (global vs host-level) is handled in Active Directory:
 #
-#   - %SEC_ALL / %ADM_ALL  -> global authority
-#   - %SEC     / %ADM      -> host-level authority
+#   - %SEC_ALL / %ADM_ALL / %SUPER_ALL  -> global authority
+#   - %SEC     / %ADM     / %SUPER      -> host-level authority
+#
+#
+# EDITOR SECURITY MODEL (sudoedit)
+# ---------------------------------
+# File editing uses 'sudoedit' (sudo -e) instead of 'sudo vim/nano'.
+#
+# Why: 'sudo vim /etc/file' runs the editor AS ROOT. The user can escape
+# to a root shell via :!bash (vim), Ctrl+T (nano), or similar features.
+# The !ROOT_SHELLS restriction does NOT prevent this because the shell
+# is spawned by the editor process (already running as root), not by sudo.
+#
+# How sudoedit works:
+#   1. sudo copies the target file to a temp file owned by the calling user
+#   2. Opens the user's editor WITHOUT root privileges (\$SUDO_EDITOR/\$EDITOR)
+#   3. After the editor exits, sudo copies the temp back as root
+#
+# Result: :!bash or Ctrl+T opens a shell as the USER, not root.
+#
+# Usage for SEC/SUPER administrators:
+#   sudoedit /etc/pam.d/sshd          (safe - editor is unprivileged)
+#   sudoedit /etc/sssd/sssd.conf      (safe - editor is unprivileged)
+#   sudoedit /etc/ssh/sshd_config     (safe - editor is unprivileged)
+#
+# The following are NOT available via sudo (shell escape vectors):
+#   sudo vim /etc/pam.d/sshd          (NOT PERMITTED - :!bash = root shell)
+#   sudo nano /etc/sssd/sssd.conf     (NOT PERMITTED - Ctrl+T = root shell)
+#
+# NOTE: vim and nano remain available for non-privileged file editing.
+# Only 'sudo vim/nano' on security files is restricted in this model.
+# Regular users editing their own files (without sudo) are not affected.
+#
+# To configure your preferred editor for sudoedit:
+#   export SUDO_EDITOR=vim    (in ~/.bashrc or /etc/profile.d/)
+#   export SUDO_EDITOR=nano   (if you prefer nano)
+#
+#
+# SUDOERS WRITE PROTECTION
+# -------------------------
+# Direct writes to /etc/sudoers* via sed -i and tee are BLOCKED for
+# all roles (SEC, ADM, SUPER) via !SEC_SUDOERS_WRITE.
+# This prevents:
+#   - Removal of !ROOT_SHELLS restrictions
+#   - Injection of backdoor sudoers rules
+# Use 'visudo' for sudoers editing (validates syntax before committing).
+#
+#
+# INTERPRETER RESTRICTION
+# ------------------------
+# Interpreters that can exec arbitrary commands (python, perl, ruby, lua,
+# expect, gdb, strace, ltrace) are blocked via !PRIV_ESC for all roles.
+# Scripts using these languages should be executed as scripts:
+#   sudo ./myscript.py       (OK - shebang resolved by kernel, not sudo)
+#   sudo python3 myscript.py (BLOCKED - direct interpreter invocation)
+#
+#
+# ROOT PASSWORD MANAGEMENT
+# -------------------------
+# Only SUPER can reset the root password (passwd root).
+# SEC and ADM are explicitly denied via !SEC_CREDENTIALS.
+#
+#
+# DENY ALIASES (defined in 00-block-root-shell)
+# -----------------------------------------------
+# The following deny aliases are applied per role:
+#
+#   ALL ROLES:
+#     !ROOT_SHELLS       - Direct shell access (bash, sh, su, env tricks)
+#     !PRIV_ESC          - Interpreters (python, perl, ruby, lua, etc.)
+#     !SEC_SUDOERS_WRITE - Direct writes to sudoers (sed -i, tee)
+#
+#   SEC and ADM only:
+#     !SEC_CREDENTIALS   - Root password management (passwd root)
 # ========================================================================
 
 
 # ------------------------------------------------------------------------
-# SUDOERS security management
+# SUDOERS management
+# Only visudo is permitted (syntax-validated editing).
+# NOTE: vim/nano removed - they run as root and allow shell escape.
+# Use visudo for sudoers, sudoedit for other security files.
 # ------------------------------------------------------------------------
 Cmnd_Alias SEC_SUDOERS = \\
     /usr/sbin/visudo, \\
-    /usr/bin/vim /etc/sudoers*, \\
-    /usr/bin/nano /etc/sudoers*, \\
     /bin/cp /etc/sudoers*, \\
     /bin/mv /etc/sudoers*, \\
     /usr/bin/chmod /etc/sudoers*, \\
@@ -5418,43 +5760,49 @@ Cmnd_Alias SEC_SUDOERS = \\
 
 # ------------------------------------------------------------------------
 # Security-critical authentication services
+# Includes both 'sshd' (RHEL/SUSE) and 'ssh' (Debian/Ubuntu) unit names
 # ------------------------------------------------------------------------
 Cmnd_Alias SEC_SECURITY_SERVICES = \\
     /usr/bin/systemctl restart sshd, \\
     /usr/bin/systemctl reload sshd, \\
+    /usr/bin/systemctl restart ssh, \\
+    /usr/bin/systemctl reload ssh, \\
     /usr/bin/systemctl restart systemd-logind, \\
     /usr/bin/systemctl daemon-reload
 
 
 # ------------------------------------------------------------------------
-# Credential management (root authority)
+# Inline editing on SSH configuration (permitted for SEC automation)
+# sed -i is a legitimate operational tool for adjusting SSH directives
+# in automation scripts and quick one-liner fixes.
+#
+# NOTE: sed -i on /etc/sudoers* is BLOCKED separately via
+# !SEC_SUDOERS_WRITE (defined in 00-block-root-shell).
+# Only SSH targets are permitted here.
 # ------------------------------------------------------------------------
-Cmnd_Alias SEC_CREDENTIALS = \\
-    /usr/bin/passwd root
+Cmnd_Alias SEC_INLINE_EDIT_SSH = \\
+    /bin/sed -i* /etc/ssh/*, \\
+    /usr/bin/sed -i* /etc/ssh/*
 
 
 # ------------------------------------------------------------------------
-# Block inline editors on security files (sed -i)
+# Pipe overwrite on SSH configuration (permitted for SEC automation)
+# tee is commonly used in automation to write config fragments.
+#
+# NOTE: tee on /etc/sudoers* is BLOCKED separately via
+# !SEC_SUDOERS_WRITE (defined in 00-block-root-shell).
+# Only SSH targets are permitted here.
 # ------------------------------------------------------------------------
-Cmnd_Alias SEC_INLINE_EDIT = \\
-    /bin/sed -i* /etc/sudoers*, \\
-    /bin/sed -i* /etc/ssh/*
-
-
-# ------------------------------------------------------------------------
-# Block overwrite via tee on security files
-# ------------------------------------------------------------------------
-Cmnd_Alias SEC_TEE = \\
-    /usr/bin/tee /etc/sudoers*, \\
+Cmnd_Alias SEC_TEE_SSH = \\
     /usr/bin/tee /etc/ssh/*
 
 
 # ------------------------------------------------------------------------
 # PAM authentication stack
+# Editing via sudoedit (editor runs unprivileged - no root shell escape)
 # ------------------------------------------------------------------------
 Cmnd_Alias SEC_PAM = \\
-    /usr/bin/vim /etc/pam.d/*, \\
-    /usr/bin/nano /etc/pam.d/*, \\
+    sudoedit /etc/pam.d/*, \\
     /bin/cp /etc/pam.d/*, \\
     /bin/mv /etc/pam.d/*, \\
     /usr/bin/chmod /etc/pam.d/*, \\
@@ -5463,14 +5811,14 @@ Cmnd_Alias SEC_PAM = \\
 
 # ------------------------------------------------------------------------
 # Identity and NSS (local users, groups, resolution)
+# Editing via sudoedit (editor runs unprivileged - no root shell escape)
 # ------------------------------------------------------------------------
 Cmnd_Alias SEC_IDENTITY = \\
-    /usr/bin/vim /etc/nsswitch.conf, \\
-    /usr/bin/nano /etc/nsswitch.conf, \\
-    /usr/bin/vim /etc/passwd, \\
-    /usr/bin/vim /etc/shadow, \\
-    /usr/bin/vim /etc/group, \\
-    /usr/bin/vim /etc/gshadow, \\
+    sudoedit /etc/nsswitch.conf, \\
+    sudoedit /etc/passwd, \\
+    sudoedit /etc/shadow, \\
+    sudoedit /etc/group, \\
+    sudoedit /etc/gshadow, \\
     /bin/cp /etc/passwd /etc/shadow /etc/group /etc/gshadow, \\
     /bin/mv /etc/passwd /etc/shadow /etc/group /etc/gshadow, \\
     /usr/bin/chmod /etc/passwd /etc/shadow /etc/group /etc/gshadow, \\
@@ -5479,10 +5827,10 @@ Cmnd_Alias SEC_IDENTITY = \\
 
 # ------------------------------------------------------------------------
 # SSSD / Active Directory integration
+# Editing via sudoedit (editor runs unprivileged - no root shell escape)
 # ------------------------------------------------------------------------
 Cmnd_Alias SEC_SSSD = \\
-    /usr/bin/vim /etc/sssd/sssd.conf, \\
-    /usr/bin/nano /etc/sssd/sssd.conf, \\
+    sudoedit /etc/sssd/sssd.conf, \\
     /bin/cp /etc/sssd/sssd.conf, \\
     /bin/mv /etc/sssd/sssd.conf, \\
     /usr/bin/chmod /etc/sssd/sssd.conf, \\
@@ -5491,10 +5839,10 @@ Cmnd_Alias SEC_SSSD = \\
 
 # ------------------------------------------------------------------------
 # Polkit privilege rules (modern privilege escalation layer)
+# Editing via sudoedit (editor runs unprivileged - no root shell escape)
 # ------------------------------------------------------------------------
 Cmnd_Alias SEC_POLKIT = \\
-    /usr/bin/vim /etc/polkit-1/*, \\
-    /usr/bin/nano /etc/polkit-1/*, \\
+    sudoedit /etc/polkit-1/*, \\
     /bin/cp /etc/polkit-1/*, \\
     /bin/mv /etc/polkit-1/*, \\
     /usr/bin/chmod /etc/polkit-1/*, \\
@@ -5502,39 +5850,65 @@ Cmnd_Alias SEC_POLKIT = \\
 
 
 # ------------------------------------------------------------------------
+# SSH configuration
+# Editing via sudoedit (editor runs unprivileged - no root shell escape)
+# cp/mv/chmod/chown for file management operations
+# ------------------------------------------------------------------------
+Cmnd_Alias SEC_SSH_CONFIG = \\
+    sudoedit /etc/ssh/sshd_config, \\
+    sudoedit /etc/ssh/sshd_config.d/*, \\
+    sudoedit /etc/ssh/ssh_config, \\
+    /bin/cp /etc/ssh/*, \\
+    /bin/mv /etc/ssh/*, \\
+    /usr/bin/chmod /etc/ssh/*, \\
+    /usr/bin/chown /etc/ssh/*
+
+
+# ------------------------------------------------------------------------
 # systemd overrides for security services
+# Editing via sudoedit (editor runs unprivileged - no root shell escape)
+# Includes both sshd (RHEL/SUSE) and ssh (Debian/Ubuntu) unit names
 # ------------------------------------------------------------------------
 Cmnd_Alias SEC_SYSTEMD_OVERRIDES = \\
-    /usr/bin/vim /etc/systemd/system/sshd.service*, \\
-    /usr/bin/nano /etc/systemd/system/sshd.service*, \\
+    sudoedit /etc/systemd/system/sshd.service*, \\
+    sudoedit /etc/systemd/system/ssh.service*, \\
     /bin/cp /etc/systemd/system/sshd.service*, \\
-    /bin/mv /etc/systemd/system/sshd.service*
+    /bin/cp /etc/systemd/system/ssh.service*, \\
+    /bin/mv /etc/systemd/system/sshd.service*, \\
+    /bin/mv /etc/systemd/system/ssh.service*
 
 
 # ------------------------------------------------------------------------
 # Optional: advanced PAM / security tuning
+# Editing via sudoedit (editor runs unprivileged - no root shell escape)
 # (Enable only if these controls are actively used)
 # ------------------------------------------------------------------------
 Cmnd_Alias SEC_SECURITY_MISC = \\
-    /usr/bin/vim /etc/security/*, \\
-    /usr/bin/nano /etc/security/*, \\
+    sudoedit /etc/security/*, \\
     /bin/cp /etc/security/*, \\
     /bin/mv /etc/security/*
 
 
 # ------------------------------------------------------------------------
-# Central Security Authority (single source of truth)
+# Central Security Authority - allowed operations (whitelist)
+# All permitted commands for the SEC role.
+#
+# NOTE: The following aliases are NOT here (they are DENY-only):
+#   - SEC_CREDENTIALS    (passwd root - SUPER only)
+#   - SEC_SUDOERS_WRITE  (sed -i / tee on sudoers)
+#   - ROOT_SHELLS        (direct shell access)
+#   - PRIV_ESC           (interpreters)
 # ------------------------------------------------------------------------
 Cmnd_Alias SEC_ALL_CMDS = \\
     SEC_SUDOERS, \\
     SEC_SECURITY_SERVICES, \\
-    SEC_CREDENTIALS, \\
-    SEC_INLINE_EDIT, \\
-    SEC_TEE, \\
+    SEC_INLINE_EDIT_SSH, \\
+    SEC_TEE_SSH, \\
     SEC_PAM, \\
     SEC_IDENTITY, \\
     SEC_SSSD, \\
     SEC_POLKIT, \\
+    SEC_SSH_CONFIG, \\
     SEC_SYSTEMD_OVERRIDES, \\
     SEC_SECURITY_MISC
 
@@ -5543,13 +5917,16 @@ Cmnd_Alias SEC_ALL_CMDS = \\
 # SECURITY ADMINISTRATORS (SEC)
 # ========================================================================
 # Scope:
-# - Security configuration only
-# - Authentication, authorization, identity and credentials
+# - Security configuration only (auth, authz, identity, credentials)
+# - File editing via sudoedit (editor runs unprivileged - no root escape)
 # - No operational administration
-# - No interactive root shell
+# - Cannot obtain interactive root shell
+# - Cannot invoke interpreters (python, perl, ruby, etc.)
+# - Cannot write directly to sudoers (use visudo)
+# - Cannot reset root password (SUPER only)
 # ========================================================================
-%$SEC_ALL ALL=(root) NOPASSWD: SEC_ALL_CMDS, !ROOT_SHELLS
-%$SEC     ALL=(root) NOPASSWD: SEC_ALL_CMDS, !ROOT_SHELLS
+%$SEC_ALL ALL=(root) NOPASSWD: SEC_ALL_CMDS, !ROOT_SHELLS, !PRIV_ESC, !SEC_SUDOERS_WRITE, !SEC_CREDENTIALS
+%$SEC     ALL=(root) NOPASSWD: SEC_ALL_CMDS, !ROOT_SHELLS, !PRIV_ESC, !SEC_SUDOERS_WRITE, !SEC_CREDENTIALS
 
 
 # ========================================================================
@@ -5557,28 +5934,34 @@ Cmnd_Alias SEC_ALL_CMDS = \\
 # ========================================================================
 # Scope:
 # - Full operational administration
-# - Explicitly excluded from security posture changes
-# - No interactive root shell
+# - Explicitly excluded from security posture changes (!SEC_ALL_CMDS)
+# - Cannot obtain interactive root shell
+# - Cannot invoke interpreters (python, perl, ruby, etc.)
+# - Cannot write directly to sudoers (use visudo)
+# - Cannot reset root password (SUPER only)
 # ========================================================================
-%$ADM_ALL ALL=(root) NOPASSWD: ALL, !SEC_ALL_CMDS, !ROOT_SHELLS
-%$ADM     ALL=(root) NOPASSWD: ALL, !SEC_ALL_CMDS, !ROOT_SHELLS
+%$ADM_ALL ALL=(root) NOPASSWD: ALL, !SEC_ALL_CMDS, !ROOT_SHELLS, !PRIV_ESC, !SEC_SUDOERS_WRITE, !SEC_CREDENTIALS
+%$ADM     ALL=(root) NOPASSWD: ALL, !SEC_ALL_CMDS, !ROOT_SHELLS, !PRIV_ESC, !SEC_SUDOERS_WRITE, !SEC_CREDENTIALS
 
 
 # ========================================================================
 # FULL ADMINISTRATORS (SUPER)
 # ========================================================================
 # Scope:
-# - Full operational administration
-# - Full security administration
+# - Full operational + security administration
 # - Union of ADM and SEC privileges
-# - No interactive root shell
+# - File editing via sudoedit (editor runs unprivileged - no root escape)
+# - Cannot obtain interactive root shell
+# - Cannot invoke interpreters (python, perl, ruby, etc.)
+# - Cannot write directly to sudoers (defense-in-depth; use visudo)
+# - CAN reset root password (only role with this privilege)
 #
 # NOTE:
 # - Membership in SUPER replaces ADM and SEC
 # - Users must NOT be assigned to ADM and SEC simultaneously
 # ========================================================================
-%$SUPER_ALL ALL=(root) NOPASSWD: ALL, !ROOT_SHELLS
-%$SUPER     ALL=(root) NOPASSWD: ALL, !ROOT_SHELLS
+%$SUPER_ALL ALL=(root) NOPASSWD: ALL, !ROOT_SHELLS, !PRIV_ESC, !SEC_SUDOERS_WRITE
+%$SUPER     ALL=(root) NOPASSWD: ALL, !ROOT_SHELLS, !PRIV_ESC, !SEC_SUDOERS_WRITE
 EOF
 
 # -------------------------------------------------------------------------
@@ -5914,31 +6297,6 @@ printf "${C_CYAN}%-25s${C_RESET} %s\n" "Network RTT:" "${C_DIM}${TRUST_RTT:-n/a}
 printf "${C_CYAN}%-25s${C_RESET} %s\n" "SSSD Service:" "${SSSD_COLOR}${SSSD_STATUS}${C_RESET}"
 printf "${C_CYAN}%-25s${C_RESET} %s\n" "SSH Service:" "${SSH_COLOR}${SSH_STATUS}${C_RESET}"
 print_divider
-
-# -------------------------------------------------------------------------
-# Deferred D-Bus restart (post-configuration, all critical work committed)
-# -------------------------------------------------------------------------
-# This runs AFTER sudoers, SSH, SSSD, PAM, and all other configs are applied.
-# Even if the D-Bus restart briefly disrupts the session (Ansible scenario),
-# the system is already fully configured and will be operational after recovery.
-# -------------------------------------------------------------------------
-if [[ "${_DBUS_RESTART_DEFERRED:-false}" == "true" && -n "${_DBUS_RESTART_UNIT:-}" ]]; then
-    log_info "🔄 Executing deferred D-Bus restart ($_DBUS_RESTART_UNIT)"
-
-    if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" ]]; then
-        log_info "ℹ Running over SSH — session may briefly stall during D-Bus restart"
-    fi
-
-    # Use nohup+setsid to survive potential session disruption
-    nohup setsid bash -c "
-        sleep 1
-        systemctl restart '${_DBUS_RESTART_UNIT}' >/dev/null 2>&1
-        systemctl restart oddjobd >/dev/null 2>&1
-    " </dev/null >/dev/null 2>&1 &
-    disown 2>/dev/null || true
-
-    log_info "✅ D-Bus restart dispatched (detached, will complete after script exit)"
-fi
 
 # Insert short pause and newline without spawning a subshell
 sleep 0.05
