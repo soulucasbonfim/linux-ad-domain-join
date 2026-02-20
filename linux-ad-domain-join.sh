@@ -423,7 +423,7 @@ validate_ad_group_name() {
     # Character policy:
     # - We intentionally restrict to a safe subset to avoid escaping issues across sudoers/SSH/PAM tooling.
     # - Space is allowed explicitly; other whitespace is rejected above.
-    if [[ ! "$name" =~ ^[A-Za-z0-9._ -]+$ ]]; then
+    if [[ ! "$name" =~ ^[A-Za-z0-9._\ -]+$ ]]; then
         log_info "⚠️ ${context} contains invalid characters: $name"
         log_info "   Allowed: letters, digits, dot (.), underscore (_), hyphen (-), space"
         return 1
@@ -978,12 +978,24 @@ trim_ws() {
 # Safe mktemp wrapper with enhanced error handling and logging context.
 # -------------------------------------------------------------------------
 safe_mktemp() {
-    local tmpfile template="${*:-<default>}"
-    # Redirect stderr to /dev/null to prevent contaminating the path with warnings.
-    # On failure, log_error provides adequate context (template name + exit code).
-    if ! tmpfile="$(mktemp "$@" 2>/dev/null)"; then
-        log_error "mktemp failed (template: $template)" 1
+    local tmpfile template
+
+    # BusyBox mktemp (and some minimal images) require an explicit template.
+    # When no args are provided, force a portable /tmp template.
+    if (( $# == 0 )); then
+        template="/tmp/linux-ad-domain-join.XXXXXX"
+        if ! tmpfile="$(mktemp "$template" 2>/dev/null)"; then
+            log_error "mktemp failed (template: $template)" 1
+        fi
+    else
+        template="${*}"
+        # Redirect stderr to /dev/null to prevent contaminating the path with warnings.
+        # On failure, log_error provides adequate context (template name + exit code).
+        if ! tmpfile="$(mktemp "$@" 2>/dev/null)"; then
+            log_error "mktemp failed (template: $template)" 1
+        fi
     fi
+
     [[ -z "$tmpfile" ]] && log_error "mktemp returned empty path" 1
     printf '%s' "$tmpfile"
 }
@@ -2886,9 +2898,15 @@ if (( ${#missing_pkgs[@]} > 0 )); then
         log_info "   ${line_colored}"
     done
 
-    # Fail fast with documented exit code when offline and packages are needed
+    # Fail fast with documented exit code when offline and packages are needed.
+    # NOTE: In VALIDATE_ONLY mode we must not fail with "cannot install" semantics,
+    # because installation is intentionally suppressed.
     if [[ "$HAS_INTERNET" == "false" && "$NET_OK" == "false" ]]; then
-        log_error "Missing packages (${missing_pkgs[*]}) and system is offline - cannot install" 100
+        if $VALIDATE_ONLY; then
+            log_info "⚠ VALIDATE-ONLY: system appears offline; package installation is suppressed. Missing packages: ${missing_pkgs[*]}"
+        else
+            log_error "Missing packages (${missing_pkgs[*]}) and system is offline - cannot install" 100
+        fi
     fi
 
     # -------------------------------------------------------------------------
@@ -4032,7 +4050,14 @@ create_secret_passfile() {
 }
 
 cleanup_secrets() {
-    local _exit_code=$?
+    # Accept an explicit exit code when called outside the EXIT trap.
+    # If not provided, fall back to the caller's $? (works for EXIT trap usage).
+    local _exit_code="${1:-$?}"
+
+    # Defensive: ensure numeric exit code.
+    if [[ ! "$_exit_code" =~ ^[0-9]+$ ]]; then
+        _exit_code=1
+    fi
 
     # -------------------------------------------------------------------------
     # Deferred D-Bus restart (only on successful exit)
@@ -4167,18 +4192,26 @@ _DBUS_RESTART_UNIT=""
 # execution after Ctrl+C or SIGTERM, regardless of where the signal lands.
 terminate_on_signal() {
     local sig="${1:-TERM}"
+    local rc=1
+
+    case "$sig" in
+        HUP)  rc=129 ;;
+        INT)  rc=130 ;;
+        TERM) rc=143 ;;
+        *)    rc=1   ;;
+    esac
+
     # Prevent recursive trap invocation
     trap - EXIT HUP INT TERM
-    cleanup_secrets
-    case "$sig" in
-        HUP)  exit 129 ;;
-        INT)  exit 130 ;;
-        TERM) exit 143 ;;
-        *)    exit 1   ;;
-    esac
+
+    # Pass the intended exit code so cleanup logic can reliably detect abort vs success.
+    cleanup_secrets "$rc"
+
+    exit "$rc"
 }
 
-trap cleanup_secrets EXIT
+# Ensure cleanup_secrets can see the real exit status on normal script termination.
+trap 'cleanup_secrets "$?"' EXIT
 trap 'terminate_on_signal HUP'  HUP
 trap 'terminate_on_signal INT'  INT
 trap 'terminate_on_signal TERM' TERM
@@ -5761,7 +5794,7 @@ PRINCIPAL="${HOST_SHORT_U}\$@${REALM}"
 KRB_LOG=$(safe_mktemp)
 START_MS="$(now_ms)"
 
-KRB5_TRACE=$KRB_LOG kinit -kt "$KRB5_KEYTAB" "$PRINCIPAL" >/dev/null 2>&1
+KRB5_TRACE="$KRB_LOG" safe_timeout "${TRUST_TIMEOUT:-15}s" kinit -kt "$KRB5_KEYTAB" "$PRINCIPAL" >/dev/null 2>&1
 EXIT_CODE=$?
 END_MS="$(now_ms)"
 ELAPSED=$((END_MS - START_MS))
