@@ -861,12 +861,10 @@ if $_log_dir_created; then
     chmod 750 -- "$LOG_DIR" 2>/dev/null || true
 fi
 
-# If LOG_DIR already existed, enforce safety in production mode (best-effort).
-if ! $VALIDATE_ONLY && ! $DRY_RUN; then
-    _assert_secure_dir "$LOG_DIR" "LOG_DIR"
-    # BACKUP_ROOT may not exist yet; validate only if present.
-    _assert_secure_dir "$BACKUP_ROOT" "BACKUP_ROOT"
-fi
+# Always enforce directory safety if the directory already exists.
+# Even in DRY_RUN / VALIDATE_ONLY, logs are written as root and must not be attacker-controlled.
+_assert_secure_dir "$LOG_DIR" "LOG_DIR"
+_assert_secure_dir "$BACKUP_ROOT" "BACKUP_ROOT"
 
 # Create the log file under a restrictive umask so it is safe even if chmod fails.
 __prev_umask="$(umask)"
@@ -5254,7 +5252,8 @@ _DBUS_RESTART_UNIT=""
 _LOGIND_RESTART_DEFERRED=false
 _LOGIND_RESTART_UNIT=""
 
-# Deterministic signal handler: cleanup core + exit with signal-appropriate code.
+# Deterministic signal handler: cleanup core only, then exit with a signal-appropriate code.
+# Keep this minimal and side-effect free (no deferred remediations on abort).
 terminate_on_signal() {
     local sig="${1:-TERM}"
     local rc=1
@@ -5266,59 +5265,28 @@ terminate_on_signal() {
         *)    rc=1   ;;
     esac
 
-    # Prevent recursive trap invocation
+    # Prevent recursive trap invocation.
     trap - EXIT HUP INT TERM
 
-    # On signal abort: run cleanup only (no deferred remediations)
-    cleanup_secrets_core "$rc"
-
+    cleanup_secrets_core "$rc" || true
     exit "$rc"
 }
 
-# Deterministic EXIT handler: capture RC once, then dispatch remediations + cleanup.
+# Deterministic EXIT handler: capture RC once, dispatch deferred remediations (success-only inside),
+# then run cleanup core (secrets, temp files, lock fallback, immutable restore).
 _on_exit() {
     local rc=$?
     dispatch_deferred_remediations "$rc" || true
     cleanup_secrets_core "$rc" || true
 }
 
-# EXIT: dispatch deferred remediations first (success-only inside), then cleanup core.
+# Install traps exactly once (do not overwrite later).
 trap '_on_exit' EXIT
-
 trap 'terminate_on_signal HUP'  HUP
 trap 'terminate_on_signal INT'  INT
 trap 'terminate_on_signal TERM' TERM
 
-# Deterministic signal handler: cleanup + exit with signal-appropriate code.
-# Separating signal traps from EXIT ensures the script cannot continue
-# execution after Ctrl+C or SIGTERM, regardless of where the signal lands.
-terminate_on_signal() {
-    local sig="${1:-TERM}"
-    local rc=1
-
-    case "$sig" in
-        HUP)  rc=129 ;;
-        INT)  rc=130 ;;
-        TERM) rc=143 ;;
-        *)    rc=1   ;;
-    esac
-
-    # Prevent recursive trap invocation
-    trap - EXIT HUP INT TERM
-
-    # Pass the intended exit code so cleanup logic can reliably detect abort vs success.
-    cleanup_secrets "$rc"
-
-    exit "$rc"
-}
-
-# Ensure cleanup_secrets can see the real exit status on normal script termination.
-trap 'cleanup_secrets "$?"' EXIT
-trap 'terminate_on_signal HUP'  HUP
-trap 'terminate_on_signal INT'  INT
-trap 'terminate_on_signal TERM' TERM
-
-# Create secret file now (DOMAIN_PASS must exist at this moment)
+# Create secret file now (DOMAIN_PASS must exist at this moment).
 create_secret_passfile
 
 # -------------------------------------------------------------------------
@@ -6295,7 +6263,7 @@ chrony_payload="$(cat <<EOF
 # Managed by linux-ad-domain-join.sh
 # Purpose: enforce domain NTP source for Kerberos stability
 # DO NOT EDIT: changes may be overwritten
-# Generated: $(date '+%F %T')
+# Generated-by: linux-ad-domain-join.sh v${scriptVersion}
 # ======================================================================
 
 # Preferred domain NTP source
@@ -7080,7 +7048,7 @@ write_file 0600 "$SSSD_CONF" <<EOF
 # Author:      Lucas Bonfim de Oliveira Lima (soulucasbonfim)
 # Domain:      $REALM
 # Hostname:    $HOST_FQDN
-# Generated:   $(date '+%Y-%m-%d %H:%M:%S')
+# Generated-by: linux-ad-domain-join.sh v${scriptVersion}
 # ---------------------------------------------------------------------------
 # Notes:
 #   • DO NOT EDIT MANUALLY - changes may be overwritten by automation.
