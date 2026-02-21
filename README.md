@@ -6,7 +6,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Shell](https://img.shields.io/badge/Shell-Bash_4%2B-green.svg)]()
-[![Version](https://img.shields.io/badge/Version-3.1.0-orange.svg)]()
+[![Version](https://img.shields.io/badge/Version-3.4.1-orange.svg)]()
 
 A single-script solution that handles the entire AD join lifecycle - from package installation to sudoers hardening - across every major enterprise Linux distribution.
 
