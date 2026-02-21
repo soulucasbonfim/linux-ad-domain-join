@@ -976,14 +976,23 @@ _prune_old_logs() {
 # -------------------------------------------------------------------------
 # Single-instance lock (prevents concurrent executions)
 # - Must run before log truncation to avoid clobbering an active run log.
+# - Use a private root-only directory to prevent symlink/clobber attacks.
 # -------------------------------------------------------------------------
-LOCK_BASE="/run/lock"
-[[ -d "$LOCK_BASE" ]] || LOCK_BASE="/var/lock"
-mkdir -p "$LOCK_BASE" 2>/dev/null || true
+LOCK_BASE="/run/lock/linux-ad-domain-join"
+[[ -d "/run/lock" ]] || LOCK_BASE="/var/lock/linux-ad-domain-join"
+
+mkdir -p -- "$LOCK_BASE" 2>/dev/null || log_error "Failed to create lock base directory: $LOCK_BASE" 1
+chmod 700 -- "$LOCK_BASE" 2>/dev/null || true
+
+# Ensure the lock directory is not attacker-controlled (root-owned, not group/other-writable, not symlink).
+_assert_secure_dir "$LOCK_BASE" "LOCK_BASE"
 
 LOCK_FILE="${LOCK_BASE}/linux-ad-domain-join.lock"
 LOCK_DIR_FALLBACK="${LOCK_FILE}.d"
 LOCK_MODE=""
+
+# Refuse symlinked lock files (prevents clobber/truncation via malicious link).
+[[ -L "$LOCK_FILE" ]] && log_error "LOCK_FILE is a symlink (refusing): $LOCK_FILE" 1
 
 # Fixed FD number for flock. FD 9 is the conventional choice for script locks.
 # We use a fixed FD (exec N>) instead of dynamic allocation (exec {var}>) to
@@ -995,30 +1004,24 @@ if command -v flock >/dev/null 2>&1; then
     # NOTE: exec FD>> does NOT set O_CLOEXEC. Child processes inherit this FD
     # unless explicitly closed. The detached D-Bus remediation in cleanup_secrets
     # closes FD 9 via redirection (9>&-) to avoid keeping the lock alive.
-    # Open without truncating before the lock is acquired (avoids clobbering
-    # the lock file contents when another run is active).
     exec 9>>"$LOCK_FILE"
     if ! flock -n "$_LOCK_FD_FIXED"; then
         echo "[$(date '+%F %T')] [ERROR] Another instance is already running (lock: $LOCK_FILE)" >&2
         exit 16
     fi
-    # Store PID for troubleshooting (best-effort). We hold the lock now, so overwrite is safe.
     printf '%s\n' "$$" >"$LOCK_FILE" 2>/dev/null || true
     LOCK_MODE="flock"
 else
     # Portable fallback: atomic mkdir lock with stale detection
     if ! mkdir "$LOCK_DIR_FALLBACK" 2>/dev/null; then
-        # Check if the holder PID is still alive
         _lock_pid=""
         _lock_pid="$(cat "${LOCK_DIR_FALLBACK}/pid" 2>/dev/null || true)"
         if [[ -n "$_lock_pid" ]] && kill -0 "$_lock_pid" 2>/dev/null; then
             echo "[$(date '+%F %T')] [ERROR] Another instance is already running (PID $_lock_pid, lock: $LOCK_DIR_FALLBACK)" >&2
             exit 16
         fi
-        # Stale lock: previous run crashed without cleanup
         echo "[$(date '+%F %T')] [WARN] Removing stale lock from PID ${_lock_pid:-unknown} (lock: $LOCK_DIR_FALLBACK)" >&2
         rm -rf -- "${LOCK_DIR_FALLBACK:?}" 2>/dev/null || true
-        # Atomic re-acquisition; sleep+retry reduces TOCTOU window
         if ! mkdir "$LOCK_DIR_FALLBACK" 2>/dev/null; then
             sleep 0.2
             if ! mkdir "$LOCK_DIR_FALLBACK" 2>/dev/null; then
@@ -2105,7 +2108,8 @@ cmd_must() {
 
     local rc="$CMD_LAST_RC"
     if (( rc != 0 )); then
-        log_error "Command failed (rc=$rc): $(print_cmd_quoted "$@")" 1
+        # Preserve the failing command RC for deterministic automation.
+        log_error "Command failed (rc=$rc): $(print_cmd_quoted "$@")" "$rc"
     fi
     return 0
 }
@@ -2958,6 +2962,15 @@ install_missing_deps() {
         local u
         for u in "${units[@]}"; do
             if echo "$_active_units" | grep -qw "$u"; then
+                if $VALIDATE_ONLY; then
+                    $VERBOSE && log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would stop conflicting unit: $u"
+                    continue
+                fi
+                if $DRY_RUN; then
+                    $VERBOSE && log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would stop conflicting unit: $u"
+                    continue
+                fi
+
                 $VERBOSE && log_info "🛑 Stopping conflicting unit: $u"
                 safe_timeout 8 systemctl stop "$u" >/dev/null 2>&1 || true
             fi
@@ -3916,40 +3929,42 @@ if $NONINTERACTIVE; then
     : "${NTP_SERVER:=ntp.${DOMAIN,,}}"
     : "${DOMAIN_USER:?DOMAIN_USER required}"
 
-    # Credential resolution: DOMAIN_PASS_FILE takes precedence over DOMAIN_PASS
-    # when both are set (file-based is safer; env-based persists in /proc/<pid>/environ).
-    if [[ -n "${DOMAIN_PASS_FILE:-}" ]]; then
-        [[ -f "$DOMAIN_PASS_FILE" ]] || log_error "DOMAIN_PASS_FILE not found: $DOMAIN_PASS_FILE" 1
-        [[ -r "$DOMAIN_PASS_FILE" ]] || log_error "DOMAIN_PASS_FILE not readable: $DOMAIN_PASS_FILE" 1
+    # Credential resolution: DOMAIN_PASS_FILE takes precedence over DOMAIN_PASS.
+    # Skip entirely in VALIDATE_ONLY (credential validation is suppressed later).
+    if $VALIDATE_ONLY; then
+        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Skipping credential resolution (DOMAIN_PASS/DOMAIN_PASS_FILE not required)"
+        DOMAIN_PASS_BUF=""
+    else
+        if [[ -n "${DOMAIN_PASS_FILE:-}" ]]; then
+            [[ -f "$DOMAIN_PASS_FILE" ]] || log_error "DOMAIN_PASS_FILE not found: $DOMAIN_PASS_FILE" 1
+            [[ -r "$DOMAIN_PASS_FILE" ]] || log_error "DOMAIN_PASS_FILE not readable: $DOMAIN_PASS_FILE" 1
 
-        # Reject group/other-readable files (defense-in-depth)
-        if command -v stat >/dev/null 2>&1; then
-            _pass_perms="$(stat -c '%a' "$DOMAIN_PASS_FILE" 2>/dev/null || true)"
-            if [[ "$_pass_perms" =~ ^[0-9]{3,4}$ ]]; then
-                if (( (8#${_pass_perms} & 8#077) != 0 )); then
-                    log_error "DOMAIN_PASS_FILE permissions too open (${_pass_perms}, expected 0400/0600): $DOMAIN_PASS_FILE" 1
+            # Reject group/other-readable files (defense-in-depth)
+            if command -v stat >/dev/null 2>&1; then
+                _pass_perms="$(stat -c '%a' "$DOMAIN_PASS_FILE" 2>/dev/null || true)"
+                if [[ "$_pass_perms" =~ ^[0-9]{3,4}$ ]]; then
+                    if (( (8#${_pass_perms} & 8#077) != 0 )); then
+                        log_error "DOMAIN_PASS_FILE permissions too open (${_pass_perms}, expected 0400/0600): $DOMAIN_PASS_FILE" 1
+                    fi
                 fi
             fi
+
+            IFS= read -r DOMAIN_PASS < "$DOMAIN_PASS_FILE" \
+                || log_error "DOMAIN_PASS_FILE is empty or unreadable: $DOMAIN_PASS_FILE" 1
+
+            DOMAIN_PASS="${DOMAIN_PASS%$'\r'}"
+            [[ -n "$DOMAIN_PASS" ]] || log_error "DOMAIN_PASS_FILE resolved to empty string: $DOMAIN_PASS_FILE" 1
+
+            log_info "🔐 Password loaded from file: $DOMAIN_PASS_FILE"
         fi
 
-        # Read only the first line; secrets managers (Vault, K8s) almost always append a trailing newline.
-        # Using 'read -r' strips it naturally without a subshell.
-        IFS= read -r DOMAIN_PASS < "$DOMAIN_PASS_FILE" \
-            || log_error "DOMAIN_PASS_FILE is empty or unreadable: $DOMAIN_PASS_FILE" 1
+        : "${DOMAIN_PASS:?DOMAIN_PASS or DOMAIN_PASS_FILE required}"
 
-        # Strip trailing CR (Windows line endings).
-        DOMAIN_PASS="${DOMAIN_PASS%$'\r'}"
-
-        [[ -n "$DOMAIN_PASS" ]] || log_error "DOMAIN_PASS_FILE resolved to empty string: $DOMAIN_PASS_FILE" 1
-
-        log_info "🔐 Password loaded from file: $DOMAIN_PASS_FILE"
+        # Reduce /proc/<pid>/environ exposure: move secret to a non-exported variable ASAP.
+        # This also reduces accidental leakage via exported environment snapshots.
+        DOMAIN_PASS_BUF="$DOMAIN_PASS"
+        unset DOMAIN_PASS
     fi
-    : "${DOMAIN_PASS:?DOMAIN_PASS or DOMAIN_PASS_FILE required}"
-
-    # Reduce /proc/<pid>/environ exposure: move secret to a non-exported variable ASAP.
-    # This also reduces accidental leakage via exported environment snapshots.
-    DOMAIN_PASS_BUF="$DOMAIN_PASS"
-    unset DOMAIN_PASS
 
     : "${SESSION_TIMEOUT_SECONDS:?SESSION_TIMEOUT_SECONDS required (seconds)}"
     : "${PERMIT_ROOT_LOGIN:?PERMIT_ROOT_LOGIN required (yes|no)}"
@@ -4107,19 +4122,24 @@ else
         break
     done
 
-    # Require Password
-    while true; do
-        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Password for ${C_BOLD}${DOMAIN_USER}${C_RESET}: " "$(date '+%F %T')"
-        read -rs DOMAIN_PASS
-        echo
-        [[ -n "$DOMAIN_PASS" ]] && break
-        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Password cannot be empty.\n" "$(date '+%F %T')"
-    done
+    # Require Password (skip in VALIDATE_ONLY to avoid unnecessary secret exposure)
+    if $VALIDATE_ONLY; then
+        log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Skipping password prompt (credential validation suppressed)"
+        DOMAIN_PASS_BUF=""
+    else
+        while true; do
+            printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} Password for ${C_BOLD}${DOMAIN_USER}${C_RESET}: " "$(date '+%F %T')"
+            read -rs DOMAIN_PASS
+            echo
+            [[ -n "$DOMAIN_PASS" ]] && break
+            printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Password cannot be empty.\n" "$(date '+%F %T')"
+        done
 
-    # Reduce /proc/<pid>/environ exposure: move secret to a non-exported variable ASAP.
-    # Comments in en-US per project convention.
-    DOMAIN_PASS_BUF="$DOMAIN_PASS"
-    unset DOMAIN_PASS
+        # Reduce /proc/<pid>/environ exposure: move secret to a non-exported variable ASAP.
+        # Comments in en-US per project convention.
+        DOMAIN_PASS_BUF="$DOMAIN_PASS"
+        unset DOMAIN_PASS
+    fi
 
     # Session timeout (SSH + Shell) in seconds
     default_SESSION_TIMEOUT_SECONDS=900
