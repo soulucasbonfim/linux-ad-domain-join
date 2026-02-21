@@ -2991,23 +2991,56 @@ install_missing_deps() {
 
             # --- apt-get update (skip if probe refreshed cache OR packages already have candidates) ---
             local _need_update=true
+            local _did_apt_update="${_PKG_CACHE_REFRESHED:-false}"
 
             if [[ "${_PKG_CACHE_REFRESHED:-false}" == "true" ]]; then
                 _need_update=false
                 $VERBOSE && log_info "ℹ️ apt-get update skipped (cache already refreshed by connectivity probe)"
             else
-                # Fast-path: check if all packages have install candidates in current cache.
-                # apt-cache policy is instantaneous and avoids costly apt-get update.
+                # Fast-path: check if ALL packages have install candidates in the current cache.
+                # Optimization: single 'apt-cache policy' call for the whole set (reduces forks).
                 local _all_have_candidates=true
-                local _p _policy_out
+                local _policy_all=""
+                local -A _uniq_seen=()
+                local -a _uniq_pkgs=()
+                local _p
+
                 for _p in "${to_install[@]}"; do
-                    _policy_out="$(apt-cache policy "$_p" 2>/dev/null || true)"
-                    if ! echo "$_policy_out" | grep -q 'Candidate:' || \
-                       echo "$_policy_out" | grep -q 'Candidate: (none)'; then
-                        _all_have_candidates=false
-                        break
-                    fi
+                    [[ -n "${_uniq_seen[$_p]:-}" ]] && continue
+                    _uniq_seen["$_p"]=1
+                    _uniq_pkgs+=( "$_p" )
                 done
+
+                if (( ${#_uniq_pkgs[@]} > 0 )); then
+                    _policy_all="$(apt-cache policy "${_uniq_pkgs[@]}" 2>/dev/null || true)"
+                fi
+
+                if [[ -n "$_policy_all" ]]; then
+                    # Parse once and ensure every requested package has a non-(none) Candidate.
+                    if ! awk -v list="${_uniq_pkgs[*]}" '
+                        BEGIN {
+                            n = split(list, a, /[[:space:]]+/)
+                            for (i=1; i<=n; i++) if (a[i]!="") need[a[i]]=1
+                            pkg=""
+                        }
+                        /^[^[:space:]].*:$/ {
+                            pkg=$1
+                            sub(/:$/, "", pkg)
+                            next
+                        }
+                        $1=="Candidate:" && pkg!="" {
+                            if ($2!="(none)" && (pkg in need)) ok[pkg]=1
+                        }
+                        END {
+                            for (p in need) if (!(p in ok)) exit 1
+                            exit 0
+                        }
+                    ' <<< "$_policy_all"; then
+                        _all_have_candidates=false
+                    fi
+                else
+                    _all_have_candidates=false
+                fi
 
                 if $_all_have_candidates; then
                     _need_update=false
@@ -3050,6 +3083,8 @@ install_missing_deps() {
                     esac
                     log_error "apt-get update failed (rc=$_pkg_rc)" 1
                 fi
+
+                _did_apt_update=true
                 [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
             fi
 
@@ -3076,6 +3111,35 @@ install_missing_deps() {
                     apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
                     install -y -qq --no-install-recommends "${to_install[@]}" \
                     || _pkg_rc=$?
+            fi
+
+            # On-demand cache refresh retry (only when update was skipped previously)
+            if (( _pkg_rc != 0 )) && [[ "$_did_apt_update" != true ]] && [[ -n "${_pkg_log:-}" && -s "$_pkg_log" ]]; then
+                if grep -qiE 'Hash Sum mismatch|File has unexpected size|404[[:space:]]+Not Found|Failed to fetch|Some index files failed to download' "$_pkg_log"; then
+                    log_info "⚠️ apt-get install indicates stale metadata; running apt-get update and retrying once..."
+                    _did_apt_update=true
+
+                    local _upd_rc=0
+                    : >"${_pkg_log:-/dev/null}" 2>/dev/null || true
+
+                    _run_with_timeout "apt-get update" "${_update_budget}" "${_pkg_log:-/dev/null}" \
+                        env "${_apt_env[@]}" \
+                        apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq \
+                        || _upd_rc=$?
+
+                    if (( _upd_rc == 0 )); then
+                        _pkg_rc=0
+                        : >"${_pkg_log:-/dev/null}" 2>/dev/null || true
+
+                        _run_with_timeout "apt-get install" "${_install_budget}" "${_pkg_log:-/dev/null}" \
+                            env "${_apt_env[@]}" \
+                            apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
+                            install -y -qq --no-install-recommends "${to_install[@]}" \
+                            || _pkg_rc=$?
+                    else
+                        _pkg_rc=$_upd_rc
+                    fi
+                fi
             fi
 
             if (( _pkg_rc != 0 )); then
@@ -3109,12 +3173,14 @@ install_missing_deps() {
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
-            safe_timeout --kill-after=10 "${_install_budget}" \
+
+            # Use the same timeout+heartbeat runner as APT for consistent behavior under high latency.
+            _run_with_timeout "$PKG install" "${_install_budget}" "${_pkg_log:-/dev/null}" \
                 "$PKG" install \
                 ${extra_flags[@]+"${extra_flags[@]}"} \
                 "${_rpm_net_opts[@]}" \
                 -y "${to_install[@]}" \
-                >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
+                || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
                 if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
@@ -3150,9 +3216,9 @@ install_missing_deps() {
             }
 
             # Attempt 1 (fast-path): no refresh
-            safe_timeout --kill-after=10 "${_install_budget}" \
+            _run_with_timeout "$PKG install (no-refresh)" "${_install_budget}" "${_pkg_log:-/dev/null}" \
                 "$PKG" "${_zypper_opts[@]}" install "${to_install[@]}" \
-                >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
+                || _pkg_rc=$?
 
             # Retry once with refresh if failure strongly indicates stale metadata
             if (( _pkg_rc != 0 )) && _zypper_log_needs_refresh "$_pkg_log"; then
@@ -3160,9 +3226,9 @@ install_missing_deps() {
                 _pkg_rc=0
                 : >"${_pkg_log:-/dev/null}" 2>/dev/null || true
 
-                safe_timeout --kill-after=10 "${_install_budget}" \
+                _run_with_timeout "$PKG install (refresh)" "${_install_budget}" "${_pkg_log:-/dev/null}" \
                     "$PKG" -n install "${to_install[@]}" \
-                    >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
+                    || _pkg_rc=$?
             fi
 
             if (( _pkg_rc != 0 )); then
@@ -3503,21 +3569,67 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     # =====================================================================
     # Layer 3: TCP probe to public endpoints (informational only)
     # =====================================================================
-    NET_TEST_HOSTS=( "1.1.1.1" "8.8.8.8" "9.9.9.9" )
+    # Proxy detection (best-effort, fast path):
+    # - Used only to avoid misleading Layer 3 signals in proxy-only networks.
+    # - Also refines the Layer 4 fast-path skip condition (avoid false positives).
+    # - Never blocks installation attempts.
+    _proxy_detected=false
+
+    # Environment proxy variables (most common in automation)
+    if [[ -n "${http_proxy:-${HTTP_PROXY:-}}" || -n "${https_proxy:-${HTTPS_PROXY:-}}" || -n "${no_proxy:-${NO_PROXY:-}}" ]]; then
+        _proxy_detected=true
+        CONNECT_DETAILS+=( "ℹ️ Proxy environment variables detected (http_proxy/https_proxy/no_proxy)" )
+    fi
+
+    # Package-manager specific proxy config (covers non-env deployments)
+    if [[ "$_proxy_detected" != true ]]; then
+        case "$PKG" in
+            apt)
+                # Detect APT proxy settings in apt.conf / apt.conf.d (cheap, bounded)
+                if grep -rsqE 'Acquire::(http|https)::Proxy' /etc/apt/apt.conf /etc/apt/apt.conf.d 2>/dev/null; then
+                    _proxy_detected=true
+                    CONNECT_DETAILS+=( "ℹ️ APT proxy configuration detected (Acquire::http(s)::Proxy)" )
+                fi
+                ;;
+            yum|dnf)
+                # DNF/YUM proxy is typically configured in yum.conf or dnf.conf
+                if grep -hsqE '^[[:space:]]*proxy=' /etc/yum.conf /etc/dnf/dnf.conf 2>/dev/null; then
+                    _proxy_detected=true
+                    CONNECT_DETAILS+=( "ℹ️ DNF/YUM proxy configuration detected (proxy=)" )
+                fi
+                ;;
+            zypper)
+                # Zypper proxy is typically configured in zypp.conf
+                if grep -hsqE '^[[:space:]]*proxy=' /etc/zypp/zypp.conf 2>/dev/null; then
+                    _proxy_detected=true
+                    CONNECT_DETAILS+=( "ℹ️ Zypper proxy configuration detected (proxy=)" )
+                fi
+                ;;
+        esac
+    fi
+
     NET_OK=false
-    for H in "${NET_TEST_HOSTS[@]}"; do
-        if tcp_port_open "$H" 443 2; then
-            CONNECT_DETAILS+=( "✅ TCP/443 reachable (host $H)" )
-            NET_OK=true
-            break
-        elif tcp_port_open "$H" 80 2; then
-            CONNECT_DETAILS+=( "✅ TCP/80 reachable (host $H)" )
-            NET_OK=true
-            break
+
+    # If a proxy is configured, direct TCP probes to public IPs are often blocked by policy
+    # and are not representative of repository reachability. Skip for speed and clarity.
+    if [[ "$_proxy_detected" == true ]]; then
+        CONNECT_DETAILS+=( "ℹ️ Proxy detected; skipping direct TCP probes to public IPs (Layer 3 not representative)" )
+    else
+        NET_TEST_HOSTS=( "1.1.1.1" "8.8.8.8" "9.9.9.9" )
+        for H in "${NET_TEST_HOSTS[@]}"; do
+            if tcp_port_open "$H" 443 2; then
+                CONNECT_DETAILS+=( "✅ TCP/443 reachable (host $H)" )
+                NET_OK=true
+                break
+            elif tcp_port_open "$H" 80 2; then
+                CONNECT_DETAILS+=( "✅ TCP/80 reachable (host $H)" )
+                NET_OK=true
+                break
+            fi
+        done
+        if [[ "$NET_OK" != true ]]; then
+            CONNECT_DETAILS+=( "⚠️ No outbound TCP on ports 80/443 (may be normal behind proxy)" )
         fi
-    done
-    if [[ "$NET_OK" != true ]]; then
-        CONNECT_DETAILS+=( "⚠️ No outbound TCP on ports 80/443 (may be normal behind proxy)" )
     fi
 
     # =====================================================================
@@ -3527,6 +3639,7 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     #   - PKG_PROBE_MODE=auto   : skip Layer 4 when heuristics strongly indicate connectivity (faster)
     #   - PKG_PROBE_MODE=always : always run Layer 4 (previous behavior)
     PKG_PROBE_OK=false
+    PKG_PROBE_SKIPPED=false
     PKG_PROBE_NETFAIL=false
     _PKG_PROBE_TIMEOUT="${PKG_PROBE_TIMEOUT:-15}"
     _PKG_PROBE_KILL_AFTER="${PKG_PROBE_KILL_AFTER:-3}"
@@ -3539,19 +3652,22 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     if $VALIDATE_ONLY; then
         CONNECT_DETAILS+=( "ℹ️ Package manager probe skipped (VALIDATE_ONLY mode)" )
         if [[ "$NET_OK" == true ]] || [[ "$_has_default_route" == true ]]; then
-            PKG_PROBE_OK=true
+            PKG_PROBE_SKIPPED=true
             CONNECT_DETAILS+=( "ℹ️ Heuristics suggest connectivity may be available" )
         fi
     elif $DRY_RUN; then
         CONNECT_DETAILS+=( "ℹ️ Package manager probe skipped (DRY_RUN mode)" )
         if [[ "$NET_OK" == true ]] || [[ "$_has_default_route" == true ]]; then
-            PKG_PROBE_OK=true
+            PKG_PROBE_SKIPPED=true
         fi
     else
-        # Fast-path: if route+TCP are OK, skip Layer 4 to reduce startup latency.
-        # If repos/proxy are broken, the subsequent package manager step will still fail with parsed errors.
-        if [[ "$_PKG_PROBE_MODE" != "always" ]] && [[ "$NET_OK" == true ]] && [[ "$_has_default_route" == true ]]; then
-            PKG_PROBE_OK=true
+        # Fast-path: if route+TCP are OK AND no proxy is configured, skip Layer 4 to reduce startup latency.
+        # IMPORTANT:
+        # - Layer 4 remains the authoritative signal when executed.
+        # - When skipped, we must not claim "package manager confirmed repos" in logs.
+        if [[ "$_PKG_PROBE_MODE" != "always" ]] && [[ "$NET_OK" == true ]] && [[ "$_has_default_route" == true ]] && [[ "$_proxy_detected" != true ]]; then
+            PKG_PROBE_SKIPPED=true
+            CONNECT_DETAILS+=( "✅ Package manager probe skipped (fast-path: route+TCP OK, no proxy detected)" )
         else
             $VERBOSE && log_info "🔍 Testing package manager connectivity (timeout: ${_PKG_PROBE_TIMEOUT}s)..."
             _probe_log="$(safe_mktemp)" || _probe_log=""
@@ -3619,10 +3735,13 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     # =====================================================================
     if [[ "$PKG_PROBE_OK" == true ]]; then
         HAS_INTERNET=true
-        CONNECT_DETAILS+=( "🌐 Connectivity confirmed (package manager can reach repositories)" )
+        CONNECT_DETAILS+=( "🌐 Connectivity confirmed (package manager reached repositories)" )
+    elif [[ "$PKG_PROBE_SKIPPED" == true ]]; then
+        HAS_INTERNET=true
+        CONNECT_DETAILS+=( "🌐 Connectivity assumed (fast-path: route+TCP OK; probe skipped)" )
     elif [[ "$NET_OK" == true ]]; then
         HAS_INTERNET=true
-        CONNECT_DETAILS+=( "⚠️ TCP probes passed but package manager probe failed — proceeding with caution" )
+        CONNECT_DETAILS+=( "⚠️ TCP probes passed but package manager probe did not confirm repos — proceeding with caution" )
     elif [[ "$_has_default_route" == true ]]; then
         HAS_INTERNET=true
         CONNECT_DETAILS+=( "⚠️ Default route present but probes inconclusive — proceeding with caution" )
