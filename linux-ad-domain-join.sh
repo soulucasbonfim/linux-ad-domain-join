@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.4.2
+# Version:     3.4.3
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -1382,6 +1382,10 @@ backup_prune_old_runs() {
     if (( total > keep )); then
         local _skip=0 _ts d
         while IFS=$'\t' read -r _ts d; do
+            # When the list comes from the ls fallback, it has no timestamp column.
+            # Treat the first field as the directory path in that case.
+            [[ -n "$d" ]] || d="$_ts"
+
             (( ++_skip <= keep )) && continue
             [[ -n "$d" ]] && rm -rf -- "$d" 2>/dev/null || true
         done < "$tmp_list"
@@ -2826,7 +2830,7 @@ install_missing_deps() {
 # - If running as root, falls back to machine keytab (COMPUTER$@REALM).
 # Outputs: OU DN on stdout; returns 0 on success, 1 on failure.
 detect_current_computer_ou() {
-    local dc host_u host_u_esc realm filter out ou ccache princ
+    local dc host_u host_u_esc realm filter out ou ccache princ dc_uri
 
     # Need ldapsearch + a DC + base DN
     command -v ldapsearch >/dev/null 2>&1 || return 1
@@ -2840,6 +2844,12 @@ detect_current_computer_ou() {
         [[ -n "$dc" ]] || return 1
     fi
 
+    # IPv6 requires brackets in ldap:// URIs (RFC 3986).
+    dc_uri="$dc"
+    if [[ "$dc_uri" == *:* && "$dc_uri" != \[*\] ]]; then
+        dc_uri="[$dc_uri]"
+    fi
+
     host_u="$(hostname -s 2>/dev/null | tr '[:lower:]' '[:upper:]')"
     [[ -n "$host_u" ]] || return 1
     filter="(sAMAccountName=${host_u}\$)"
@@ -2848,7 +2858,7 @@ detect_current_computer_ou() {
     out="$(
         set +e +o pipefail
         safe_timeout "$LDAP_TIMEOUT" ldapsearch -LLL -Y GSSAPI -o ldif-wrap=no \
-            -H "ldap://${dc}" -b "$DOMAIN_DN" "$filter" distinguishedName 2>/dev/null
+            -H "ldap://${dc_uri}" -b "$DOMAIN_DN" "$filter" distinguishedName 2>/dev/null
     )" || true
 
     ou="$(printf '%s\n' "$out" | sed -n 's/^distinguishedName: CN=[^,]*,//p' | head -n1)"
@@ -2876,7 +2886,7 @@ detect_current_computer_ou() {
     out="$(
         set +e +o pipefail
         KRB5CCNAME="$ccache" safe_timeout "$LDAP_TIMEOUT" ldapsearch -LLL -Y GSSAPI -o ldif-wrap=no \
-            -H "ldap://${dc}" -b "$DOMAIN_DN" "$filter" distinguishedName 2>/dev/null
+            -H "ldap://${dc_uri}" -b "$DOMAIN_DN" "$filter" distinguishedName 2>/dev/null
     )" || true
 
     KRB5CCNAME="$ccache" kdestroy -q >/dev/null 2>&1 || true
@@ -3581,7 +3591,15 @@ MACHINE_PRINCIPAL="${HOST_SHORT_U}\$@${REALM}"
 #   1. Always use ldap:// (TCP/389) for GSSAPI operations
 #   2. GSSAPI Sign&Seal provides encryption + integrity (equivalent to TLS)
 #   3. Optionally layer STARTTLS for defense-in-depth (if available)
-LDAP_URI="ldap://${LDAP_SERVER}"
+#
+# IPv6 requires brackets in ldap:// URIs (RFC 3986). Keep LDAP_SERVER unmodified
+# for non-URI consumers, and build a URI-safe variant only for ldapsearch -H.
+LDAP_SERVER_URI="$LDAP_SERVER"
+if [[ "$LDAP_SERVER_URI" == *:* && "$LDAP_SERVER_URI" != \[*\] ]]; then
+    LDAP_SERVER_URI="[$LDAP_SERVER_URI]"
+fi
+
+LDAP_URI="ldap://${LDAP_SERVER_URI}"
 LDAP_TLS_FLAG=""
 
 # Check LDAPS availability (informational - not used with GSSAPI)
@@ -4026,9 +4044,18 @@ EOF
             log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would create $_netplan_dropin with DNS $DC_DNS_IP"
             _dns_configured=true
         else
-            # Netplan requires proper YAML indentation
-            _np_iface="${PRIMARY_IFACE:-eth0}"
-            write_file 0600 "$_netplan_dropin" <<EOF
+            # Netplan override safety: do not guess interface names (avoids breaking networking on reboot).
+            _np_iface="${PRIMARY_IFACE:-}"
+            if [[ -z "$_np_iface" ]]; then
+                log_info "⚠ Netplan detected but PRIMARY_IFACE is unknown; skipping Netplan DNS override to avoid targeting the wrong interface"
+            elif ! ip link show "$_np_iface" >/dev/null 2>&1; then
+                log_info "⚠ Netplan detected but interface '$_np_iface' not found; skipping Netplan DNS override"
+            else
+                # Backup existing drop-in if present (consistency with other managed config files).
+                [[ -f "$_netplan_dropin" ]] && backup_file "$_netplan_dropin"
+
+                # Netplan requires proper YAML indentation.
+                write_file 0600 "$_netplan_dropin" <<EOF
 # Managed by linux-ad-domain-join.sh - AD DNS override
 network:
   version: 2
@@ -4038,12 +4065,24 @@ network:
         addresses: [$DC_DNS_IP]
         search: [$DOMAIN]
 EOF
-            if netplan apply 2>/dev/null; then
-                log_info "✅ DNS configured via Netplan ($_netplan_dropin)"
-                _dns_configured=true
-            else
-                log_info "⚠ netplan apply failed - manual review recommended"
-                log_info "⚠ Netplan DNS configuration not applied; will try next method"
+                if netplan apply 2>/dev/null; then
+                    log_info "✅ DNS configured via Netplan ($_netplan_dropin)"
+                    _dns_configured=true
+                else
+                    log_info "⚠ netplan apply failed - manual review recommended"
+                    log_info "⚠ Netplan DNS configuration not applied; rolling back drop-in and trying next method"
+
+                    # Roll back: restore backup if it existed; otherwise remove the drop-in.
+                    _np_rel="${_netplan_dropin#/}"
+                    _np_bak="${BACKUP_DIR}/${_np_rel}"
+                    if [[ -f "$_np_bak" ]]; then
+                        cp -pf -- "$_np_bak" "$_netplan_dropin" 2>/dev/null || true
+                    else
+                        rm -f -- "$_netplan_dropin" 2>/dev/null || true
+                    fi
+                    selinux_restore "$_netplan_dropin"
+                    log_info "↩ Netplan override rolled back after failed apply"
+                fi
             fi
         fi
     fi
@@ -4226,8 +4265,14 @@ fi
 
 # Strategy 2: HTTP Date header from DC (fallback when ntpdate unavailable)
 if ! $_time_skew_ok && command -v curl >/dev/null 2>&1; then
-    # Protect pipeline with || true to handle empty/missing Date header
-    _http_date="$(safe_timeout 5 curl -sI "http://${DC_SERVER}/" 2>/dev/null | awk -F': ' '/^[Dd]ate:/{print $2}' | tr -d '\r' || true)"
+    # Protect pipeline with || true to handle empty/missing Date header.
+    # IPv6 requires brackets in http:// URLs (RFC 3986).
+    _dc_http_host="$DC_SERVER"
+    if [[ "$_dc_http_host" == *:* && "$_dc_http_host" != \[*\] ]]; then
+        _dc_http_host="[$_dc_http_host]"
+    fi
+
+    _http_date="$(safe_timeout 5 curl -sI "http://${_dc_http_host}/" 2>/dev/null | awk -F': ' '/^[Dd]ate:/{print $2}' | tr -d '\r' || true)"
     if [[ -n "$_http_date" ]]; then
         _remote_epoch="$(date -d "$_http_date" +%s 2>/dev/null || true)"
         _local_epoch="$(date +%s)"
