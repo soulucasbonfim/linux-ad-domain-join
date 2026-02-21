@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.5.1
+# Version:     3.5.2
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2982,8 +2982,8 @@ install_missing_deps() {
                     fi
                     [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                     case "$_pkg_rc" in
-                        124) log_info "⚠️ apt-get update timed out after ${_update_budget}s (SIGTERM)" ;
-                        137) log_info "⚠️ apt-get update killed after $((_update_budget + 10))s (SIGKILL)" ;
+                        124) log_info "⚠️ apt-get update timed out after ${_update_budget}s (SIGTERM)" ;;
+                        137) log_info "⚠️ apt-get update killed after $((_update_budget + 10))s (SIGKILL)" ;;
                     esac
                     log_error "apt-get update failed (rc=$_pkg_rc)" 1
                 fi
@@ -3010,13 +3010,13 @@ install_missing_deps() {
                 fi
                 [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                 case "$_pkg_rc" in
-                    124) log_info "⚠️ apt-get install timed out after ${_install_budget}s (SIGTERM)" ;
-                    137) log_info "⚠️ apt-get install killed after $((_install_budget + 10))s (SIGKILL)" ;
+                    124) log_info "⚠️ apt-get install timed out after ${_install_budget}s (SIGTERM)" ;;
+                    137) log_info "⚠️ apt-get install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
                 log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
             [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
-            ;
+            ;;
         yum|dnf)
             local -a extra_flags=()
             if [[ "${DISABLE_PKG_PLUGINS:-false}" == "true" ]]; then
@@ -3048,13 +3048,13 @@ install_missing_deps() {
                 fi
                 [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                 case "$_pkg_rc" in
-                    124) log_info "⚠️ $PKG install timed out after ${_install_budget}s (SIGTERM)" ;
-                    137) log_info "⚠️ $PKG install killed after $((_install_budget + 10))s (SIGKILL)" ;
+                    124) log_info "⚠️ $PKG install timed out after ${_install_budget}s (SIGTERM)" ;;
+                    137) log_info "⚠️ $PKG install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
                 log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
             [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
-            ;
+            ;;
         zypper)
             log_info "📦 Installing ${#to_install[@]} package(s). (budget: ${_install_budget}s)"
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
@@ -3070,16 +3070,16 @@ install_missing_deps() {
                 fi
                 [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                 case "$_pkg_rc" in
-                    124) log_info "⚠️ zypper install timed out after ${_install_budget}s (SIGTERM)" ;
-                    137) log_info "⚠️ zypper install killed after $((_install_budget + 10))s (SIGKILL)" ;
+                    124) log_info "⚠️ zypper install timed out after ${_install_budget}s (SIGTERM)" ;;
+                    137) log_info "⚠️ zypper install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
                 log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
             [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
-            ;
+            ;;
         *)
             log_error "Unsupported package manager: $PKG" 101
-            ;
+            ;;
     esac
 
     log_info "✅ All packages installed successfully"
