@@ -628,6 +628,42 @@ validate_ldap_dn() {
 }
 
 # -------------------------------------------------------------------------
+# Strip the first RDN component from an LDAP DN (handles escaped commas).
+# Outputs the remainder on stdout. Returns 0 on success, 1 if no delimiter found.
+# -------------------------------------------------------------------------
+ldap_dn_strip_first_rdn() {
+    # Comments in en-US per project convention.
+    local dn="${1:-}" ch esc=false
+    local i
+
+    [[ -n "$dn" ]] || return 1
+
+    for (( i=0; i<${#dn}; i++ )); do
+        ch="${dn:$i:1}"
+
+        if $esc; then
+            esc=false
+            continue
+        fi
+
+        if [[ "$ch" == "\\" ]]; then
+            esc=true
+            continue
+        fi
+
+        if [[ "$ch" == "," ]]; then
+            local rest="${dn:$((i+1))}"
+            # Trim leading whitespace after the delimiter.
+            rest="${rest#"${rest%%[![:space:]]*}"}"
+            printf '%s' "$rest"
+            return 0
+        fi
+    done
+
+    return 1
+}
+
+# -------------------------------------------------------------------------
 # Global error trap - catches any unexpected command failure.
 # Uses BASH_LINENO[0] and FUNCNAME[1] for accurate callsite reporting
 # inside nested functions (more reliable than $LINENO in string traps).
@@ -818,6 +854,39 @@ _assert_secure_dir() {
             (( (8#$mode & 8#022) == 0 )) || log_error "$label is writable by group/others (mode $mode) - refusing: $d" 1
         fi
     fi
+}
+
+# -------------------------------------------------------------------------
+# Resolve symlink chains safely (preserves relative targets).
+# Returns the final non-symlink path on stdout.
+# Requires: readlink(1)
+# -------------------------------------------------------------------------
+_resolve_symlink_final() {
+    # Comments in en-US per project convention.
+    local p="$1"
+    local depth=0
+    local target dir
+
+    [[ -n "$p" ]] || return 1
+    command -v readlink >/dev/null 2>&1 || return 1
+
+    while [[ -L "$p" ]]; do
+        depth=$(( depth + 1 ))
+        (( depth <= 16 )) || return 1
+
+        target="$(readlink "$p" 2>/dev/null || true)"
+        [[ -n "$target" ]] || return 1
+
+        if [[ "$target" == /* ]]; then
+            p="$target"
+        else
+            dir="$(dirname "$p")"
+            p="$dir/$target"
+        fi
+    done
+
+    printf '%s' "$p"
+    return 0
 }
 
 if ! $VALIDATE_ONLY && ! $DRY_RUN; then
@@ -1558,7 +1627,7 @@ sshd_set_directive_dedup() {
     # Ensures the directive is set once in the global section (before any Match blocks),
     # while preserving any Match-specific overrides. Preserves perms/owner.
     local key="$1" value="$2" file="$3"
-    local tmp
+    local tmp dest symlink_mode
 
     if $VALIDATE_ONLY; then
         log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would set global '$key $value' in $file (deduplicated, preserving Match blocks)"
@@ -1570,7 +1639,27 @@ sshd_set_directive_dedup() {
         return 0
     fi
 
-    tmp="$(safe_mktemp "${file}.XXXXXX")"
+    symlink_mode="${SYMLINK_WRITE_MODE:-follow}"
+    dest="$file"
+
+    if [[ -L "$file" ]]; then
+        case "$symlink_mode" in
+            follow)
+                dest="$(_resolve_symlink_final "$file")" || log_error "sshd_set_directive_dedup: failed to resolve symlink target for $file (requires readlink)" 1
+                ;;
+            replace)
+                dest="$file"
+                ;;
+            refuse)
+                log_error "sshd_set_directive_dedup: refusing to write to symlink path: $file (SYMLINK_WRITE_MODE=refuse)" 1
+                ;;
+            *)
+                log_error "sshd_set_directive_dedup: invalid SYMLINK_WRITE_MODE='$symlink_mode' (expected follow|replace|refuse)" 1
+                ;;
+        esac
+    fi
+
+    tmp="$(safe_mktemp "${dest}.XXXXXX")"
 
     awk -v k="$key" -v v="$value" '
         BEGIN { in_match=0; inserted=0 }
@@ -1592,11 +1681,11 @@ sshd_set_directive_dedup() {
         END { if (inserted==0) print k " " v }
     ' "$file" >"$tmp" || { rm -f "$tmp"; log_error "Failed to render new sshd_config content for $file" 1; }
 
-    chown --reference="$file" "$tmp" 2>/dev/null || true
-    chmod --reference="$file" "$tmp" 2>/dev/null || true
+    chown --reference="$dest" "$tmp" 2>/dev/null || true
+    chmod --reference="$dest" "$tmp" 2>/dev/null || true
 
-    mv -f "$tmp" "$file" || { rm -f "$tmp"; log_error "Failed to install updated $file" 1; }
-    selinux_restore "$file"
+    mv -f "$tmp" "$dest" || { rm -f "$tmp"; log_error "Failed to install updated $dest" 1; }
+    selinux_restore "$dest"
 }
 
 # -------------------------------------------------------------------------
@@ -2370,30 +2459,50 @@ write_file() {
         return 0
     fi
 
+    # Symlink handling:
+    # - SYMLINK_WRITE_MODE=follow (default): write atomically to the final target, preserving the symlink.
+    # - SYMLINK_WRITE_MODE=replace: replace the symlink itself (legacy behavior).
+    # - SYMLINK_WRITE_MODE=refuse: abort if path is a symlink.
+    local symlink_mode="${SYMLINK_WRITE_MODE:-follow}"
+    local dest="$path"
+
+    if [[ -L "$path" ]]; then
+        case "$symlink_mode" in
+            follow)
+                dest="$(_resolve_symlink_final "$path")" || log_error "write_file: failed to resolve symlink target for $path (requires readlink)" 1
+                ;;
+            replace)
+                dest="$path"
+                ;;
+            refuse)
+                log_error "write_file: refusing to write to symlink path: $path (SYMLINK_WRITE_MODE=refuse)" 1
+                ;;
+            *)
+                log_error "write_file: invalid SYMLINK_WRITE_MODE='$symlink_mode' (expected follow|replace|refuse)" 1
+                ;;
+        esac
+    fi
+
     local parent_dir
-    parent_dir="$(dirname "$path")"
+    parent_dir="$(dirname "$dest")"
     [[ -d "$parent_dir" ]] || mkdir -p "$parent_dir" || log_error "Failed to create parent directory: $parent_dir" 31
 
-    _file_ensure_mutable "$path"
+    _file_ensure_mutable "$dest"
 
-    # Atomic write: stage to temp file, then rename into place
-    # (rename(2) is atomic on POSIX filesystems, preventing truncated configs)
+    # Atomic write: stage to temp file in the SAME directory as dest, then rename into place.
     local _wf_tmp
-    _wf_tmp="$(safe_mktemp "${path}.XXXXXX")"
+    _wf_tmp="$(safe_mktemp "${dest}.XXXXXX")"
     install -m "$mode" -o root -g root /dev/stdin "$_wf_tmp" || {
         rm -f "$_wf_tmp"
-        log_error "write_file: install failed for $path" 1
+        log_error "write_file: install failed for $dest" 1
     }
-    mv -f "$_wf_tmp" "$path" || {
+    mv -f "$_wf_tmp" "$dest" || {
         rm -f "$_wf_tmp"
-        log_error "write_file: mv failed for $path" 1
+        log_error "write_file: mv failed for $dest" 1
     }
 
-    _file_restore_attr "$path"
-
-    # Restore SELinux context if applicable (install via /dev/stdin
-    # inherits caller's context instead of the policy-defined context)
-    selinux_restore "$path"
+    _file_restore_attr "$dest"
+    selinux_restore "$dest"
 }
 
 # -------------------------------------------------------------------------
@@ -3341,7 +3450,7 @@ install_missing_deps() {
 # - If running as root, falls back to machine keytab (COMPUTER$@REALM).
 # Outputs: OU DN on stdout; returns 0 on success, 1 on failure.
 detect_current_computer_ou() {
-    local dc host_u host_u_esc realm filter out ou ccache princ dc_uri
+    local dc host_u realm filter out ou ccache princ dc_uri dn_line _line
 
     # Need ldapsearch + a DC + base DN
     command -v ldapsearch >/dev/null 2>&1 || return 1
@@ -3372,7 +3481,20 @@ detect_current_computer_ou() {
             -H "ldap://${dc_uri}" -b "$DOMAIN_DN" "$filter" distinguishedName 2>/dev/null
     )" || true
 
-    ou="$(printf '%s\n' "$out" | sed -n 's/^distinguishedName: CN=[^,]*,//p' | head -n1)"
+    dn_line=""
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        case "$_line" in
+            distinguishedName:*)
+                dn_line="${_line#distinguishedName:}"
+                dn_line="${dn_line#"${dn_line%%[![:space:]]*}"}"
+                break
+                ;;
+        esac
+    done <<<"$out"
+
+    ou=""
+    [[ -n "$dn_line" ]] && ou="$(ldap_dn_strip_first_rdn "$dn_line" 2>/dev/null || true)"
+
     if [[ -n "$ou" ]] && validate_ldap_dn "$ou"; then
         printf '%s\n' "$ou"
         return 0
@@ -3403,7 +3525,20 @@ detect_current_computer_ou() {
     KRB5CCNAME="$ccache" kdestroy -q >/dev/null 2>&1 || true
     secure_delete "$ccache" 2>/dev/null || true
 
-    ou="$(printf '%s\n' "$out" | sed -n 's/^distinguishedName: CN=[^,]*,//p' | head -n1)"
+    dn_line=""
+    while IFS= read -r _line || [[ -n "$_line" ]]; do
+        case "$_line" in
+            distinguishedName:*)
+                dn_line="${_line#distinguishedName:}"
+                dn_line="${dn_line#"${dn_line%%[![:space:]]*}"}"
+                break
+                ;;
+        esac
+    done <<<"$out"
+
+    ou=""
+    [[ -n "$dn_line" ]] && ou="$(ldap_dn_strip_first_rdn "$dn_line" 2>/dev/null || true)"
+
     if [[ -n "$ou" ]] && validate_ldap_dn "$ou"; then
         printf '%s\n' "$ou"
         return 0
@@ -4386,7 +4521,7 @@ fi
 if [[ -z "$PRIMARY_IP" ]]; then
     PRIMARY_IFACE="$(ip -4 route show default 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i=="dev"){print $(i+1); exit}}')"
     if [[ -n "$PRIMARY_IFACE" ]]; then
-        PRIMARY_IP="$(ip -4 addr show dev "$PRIMARY_IFACE" scope global 2>/dev/null | awk '/inet / {print $2}' | cut -d/ -f1 | head -n1)"
+        PRIMARY_IP="$(ip -4 addr show dev "$PRIMARY_IFACE" scope global 2>/dev/null | awk '/inet / {split($2, a, "/"); print a[1]; exit}')"
     fi
 fi
 
@@ -4394,7 +4529,7 @@ fi
 if [[ -z "$PRIMARY_IP" ]]; then
     if ip -o -4 addr show scope global >/dev/null 2>&1; then
         PRIMARY_IFACE="$(ip -o -4 addr show scope global 2>/dev/null | awk -v skip="$SKIP_IFACES" '$2 !~ skip {print $2; exit}')"
-        PRIMARY_IP="$(ip -o -4 addr show scope global 2>/dev/null | awk -v skip="$SKIP_IFACES" '$2 !~ skip {print $4; exit}' | cut -d/ -f1)"
+        PRIMARY_IP="$(ip -o -4 addr show scope global 2>/dev/null | awk -v skip="$SKIP_IFACES" '$2 !~ skip {split($4, a, "/"); print a[1]; exit}')"
     fi
 fi
 
@@ -4904,14 +5039,40 @@ EOF
                         done < <(grep -E '^nameserver[[:space:]]+' "$RESOLV_CONF" 2>/dev/null | awk '{print $2}' | awk '!seen[$0]++ {print}')
                     } >"$_tmp_resolv"
 
-                    # Atomic rename preferred; fall back to copy for cross-filesystem targets
-                    if ! mv -f "$_tmp_resolv" "$RESOLV_CONF" 2>/dev/null; then
-                        cp -f "$_tmp_resolv" "$RESOLV_CONF" || log_error "Failed to update $RESOLV_CONF" 1
-                        rm -f "$_tmp_resolv"
+                    # Install resolv.conf without breaking symlinks (default follow).
+                    _resolv_dest="$RESOLV_CONF"
+                    _symlink_mode="${SYMLINK_WRITE_MODE:-follow}"
+
+                    if [[ -L "$RESOLV_CONF" ]]; then
+                        case "$_symlink_mode" in
+                            follow)
+                                _resolv_dest="$(_resolve_symlink_final "$RESOLV_CONF")" || log_error "Failed to resolve symlink target for $RESOLV_CONF (requires readlink)" 1
+                                ;;
+                            replace)
+                                _resolv_dest="$RESOLV_CONF"
+                                ;;
+                            refuse)
+                                log_error "Refusing to write to symlink path: $RESOLV_CONF (SYMLINK_WRITE_MODE=refuse)" 1
+                                ;;
+                            *)
+                                log_error "Invalid SYMLINK_WRITE_MODE='$_symlink_mode' (expected follow|replace|refuse)" 1
+                                ;;
+                        esac
                     fi
 
-                    selinux_restore "$RESOLV_CONF"
-                    log_info "✅ DNS configured in $RESOLV_CONF (preserved options/search/nameservers)"
+                    # Re-stage tmp in the same directory as the destination to keep rename atomic.
+                    _tmp_resolv2="$(safe_mktemp "${_resolv_dest}.XXXXXX")"
+                    cp -f -- "$_tmp_resolv" "$_tmp_resolv2" || { rm -f "$_tmp_resolv" "$_tmp_resolv2"; log_error "Failed to stage resolv.conf tmp for $_resolv_dest" 1; }
+                    rm -f "$_tmp_resolv"
+
+                    if ! mv -f -- "$_tmp_resolv2" "$_resolv_dest" 2>/dev/null; then
+                        # Cross-filesystem fallback (non-atomic).
+                        cp -f -- "$_tmp_resolv2" "$_resolv_dest" || { rm -f "$_tmp_resolv2"; log_error "Failed to update $_resolv_dest" 1; }
+                        rm -f "$_tmp_resolv2"
+                    fi
+
+                    selinux_restore "$_resolv_dest"
+                    log_info "✅ DNS configured in $RESOLV_CONF (installed to ${_resolv_dest})"
                 fi
 
                 _file_restore_attr "$RESOLV_CONF"
