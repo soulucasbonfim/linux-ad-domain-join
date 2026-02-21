@@ -1190,14 +1190,17 @@ service_control() {
     # Modern systemd-based systems (RHEL 7+, Ubuntu 16.04+, Debian 8+)
     if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
         case "$action" in
-            start)   systemctl start "$svc_name" || rc=$? ;;
-            stop)    systemctl stop "$svc_name" || rc=$? ;;
-            restart) systemctl restart "$svc_name" || rc=$? ;;
-            enable)  systemctl enable "$svc_name" || rc=$? ;;
-            disable) systemctl disable "$svc_name" || rc=$? ;;
-            status)  systemctl status "$svc_name" || rc=$? ;;
+            start)      systemctl start "$svc_name" || rc=$? ;;
+            stop)       systemctl stop "$svc_name" || rc=$? ;;
+            restart)    systemctl restart "$svc_name" || rc=$? ;;
+            reload)     systemctl reload "$svc_name" || rc=$? ;;
+            enable)     systemctl enable "$svc_name" || rc=$? ;;
+            disable)    systemctl disable "$svc_name" || rc=$? ;;
+            mask)       systemctl mask "$svc_name" || rc=$? ;;
+            unmask)     systemctl unmask "$svc_name" || rc=$? ;;
+            status)     systemctl status "$svc_name" || rc=$? ;;
             enable-now) systemctl enable --now "$svc_name" || rc=$? ;;
-            *)       log_error "Unknown service action: $action" 1 ;;
+            *)          log_error "Unknown service action: $action" 1 ;;
         esac
         return $rc
     fi
