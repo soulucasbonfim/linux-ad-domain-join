@@ -2658,6 +2658,76 @@ install_missing_deps() {
     esac
 }
 
+# Best-effort: detect current computer OU/container in AD.
+# - First tries existing user Kerberos cache (GSSAPI).
+# - If running as root, falls back to machine keytab (COMPUTER$@REALM).
+# Outputs: OU DN on stdout; returns 0 on success, 1 on failure.
+detect_current_computer_ou() {
+    local dc host_u realm filter out ou ccache princ
+
+    # Need ldapsearch + a DC + base DN
+    command -v ldapsearch >/dev/null 2>&1 || return 1
+    [[ -n "${DC_SERVER:-}" && -n "${DOMAIN_DN:-}" && -n "${DOMAIN:-}" ]] || return 1
+
+    dc="$DC_SERVER"
+
+    # GSSAPI with LDAP over IP is unreliable (SPN). If DC is an IP, resolve to a hostname.
+    if [[ "$dc" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+        dc="$(getent hosts "$dc" 2>/dev/null | awk '{print $2; exit}')"
+        [[ -n "$dc" ]] || return 1
+    fi
+
+    host_u="$(hostname -s 2>/dev/null | tr '[:lower:]' '[:upper:]')"
+    [[ -n "$host_u" ]] || return 1
+    filter="(sAMAccountName=${host_u}\$)"
+
+    # 1) Try with existing Kerberos creds (user cache)
+    out="$(
+        set +e +o pipefail
+        safe_timeout "$LDAP_TIMEOUT" ldapsearch -LLL -Y GSSAPI -o ldif-wrap=no \
+            -H "ldap://${dc}" -b "$DOMAIN_DN" "$filter" distinguishedName 2>/dev/null
+    )" || true
+
+    ou="$(printf '%s\n' "$out" | sed -n 's/^distinguishedName: CN=[^,]*,//p' | head -n1)"
+    if [[ -n "$ou" ]] && validate_ldap_dn "$ou"; then
+        printf '%s\n' "$ou"
+        return 0
+    fi
+
+    # 2) Root fallback: use machine keytab (prefer COMPUTER$@REALM)
+    [[ $EUID -eq 0 && -r /etc/krb5.keytab ]] || return 1
+    command -v kinit >/dev/null 2>&1 || return 1
+    command -v klist >/dev/null 2>&1 || return 1
+
+    realm="$(printf '%s' "$DOMAIN" | tr '[:lower:]' '[:upper:]')"
+    princ="$(klist -k /etc/krb5.keytab 2>/dev/null | awk 'NR>3{print $2}' | sort -u | grep -F "${host_u}\$@${realm}" | head -n1)"
+    [[ -n "$princ" ]] || princ="$(klist -k /etc/krb5.keytab 2>/dev/null | awk 'NR>3{print $2}' | sort -u | grep -F "\$@${realm}" | head -n1)"
+    [[ -n "$princ" ]] || return 1
+
+    ccache="/tmp/krb5cc_ou_detect.$$"
+    if ! KRB5CCNAME="$ccache" safe_timeout "${TRUST_TIMEOUT:-15}s" kinit -k -t /etc/krb5.keytab "$princ" >/dev/null 2>&1; then
+        rm -f "$ccache" 2>/dev/null || true
+        return 1
+    fi
+
+    out="$(
+        set +e +o pipefail
+        KRB5CCNAME="$ccache" safe_timeout "$LDAP_TIMEOUT" ldapsearch -LLL -Y GSSAPI -o ldif-wrap=no \
+            -H "ldap://${dc}" -b "$DOMAIN_DN" "$filter" distinguishedName 2>/dev/null
+    )" || true
+
+    KRB5CCNAME="$ccache" kdestroy -q >/dev/null 2>&1 || true
+    rm -f "$ccache" 2>/dev/null || true
+
+    ou="$(printf '%s\n' "$out" | sed -n 's/^distinguishedName: CN=[^,]*,//p' | head -n1)"
+    if [[ -n "$ou" ]] && validate_ldap_dn "$ou"; then
+        printf '%s\n' "$ou"
+        return 0
+    fi
+
+    return 1
+}
+
 # -------------------------------------------------------------------------
 # List required tools
 # -------------------------------------------------------------------------
@@ -3070,23 +3140,6 @@ else
     done
     DOMAIN_SHORT="$(echo "$DOMAIN" | cut -d'.' -f1 | tr '[:lower:]' '[:upper:]')"
 
-    # OU (optional, default filled)
-    DOMAIN_DN=$(awk -F'.' '{
-		for (i = 1; i <= NF; i++) printf "%sDC=%s", (i>1?",":""), toupper($i)
-	}' <<< "$DOMAIN")
-
-    default_OU="CN=Computers,${DOMAIN_DN}"
-    while true; do
-        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} OU ${C_DIM}[default: ${default_OU}]${C_RESET}: " "$(date '+%F %T')"
-        read -r OU
-        OU="$(trim_ws "${OU:-}")"
-        OU="${OU:-$default_OU}"
-        if validate_ldap_dn "$OU"; then
-            break
-        fi
-        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid OU format. Expected: OU=Name,DC=domain,DC=tld\n" "$(date '+%F %T')"
-    done
-
     # DC Server - auto-discover nearest via DNS SRV + ping latency
     log_info "🔍 Discovering nearest Domain Controller..."
     default_DC_SERVER="$(discover_nearest_dc "$DOMAIN")" || true
@@ -3108,6 +3161,32 @@ else
             break
         fi
         printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid DC server. Use FQDN (e.g., dc01.domain.com) or IP.\n" "$(date '+%F %T')"
+    done
+
+    # OU (optional, default filled)
+    DOMAIN_DN=$(awk -F'.' '{
+		for (i = 1; i <= NF; i++) printf "%sDC=%s", (i>1?",":""), toupper($i)
+	}' <<< "$DOMAIN")
+
+    default_OU="CN=Computers,${DOMAIN_DN}"
+
+    # Best-effort: auto-detect existing computer OU/container (rejoin UX).
+    # Uses current user Kerberos cache first; if running as root, falls back to machine keytab.
+    if detected_ou="$(detect_current_computer_ou)"; then
+        default_OU="$detected_ou"
+        log_info "✅ Auto-detected current computer OU/container: ${default_OU}"
+    fi
+    unset detected_ou
+
+    while true; do
+        printf "${C_DIM}[%s]${C_RESET} ${C_YELLOW}[?]${C_RESET} OU ${C_DIM}[default: ${default_OU}]${C_RESET}: " "$(date '+%F %T')"
+        read -r OU
+        OU="$(trim_ws "${OU:-}")"
+        OU="${OU:-$default_OU}"
+        if validate_ldap_dn "$OU"; then
+            break
+        fi
+        printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Invalid OU format. Expected: OU=Name,DC=domain,DC=tld\n" "$(date '+%F %T')"
     done
 
 	# NTP Server (optional, default filled)
