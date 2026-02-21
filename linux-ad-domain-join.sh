@@ -749,6 +749,12 @@ if ! [[ "$KINIT_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
     KINIT_TIMEOUT=20
 fi
 
+TRUST_TIMEOUT="${TRUST_TIMEOUT:-15}"
+if ! [[ "$TRUST_TIMEOUT" =~ ^[1-9][0-9]*$ ]]; then
+    log_info "⚠ TRUST_TIMEOUT='$TRUST_TIMEOUT' is not a valid positive integer - defaulting to 15"
+    TRUST_TIMEOUT=15
+fi
+
 KRB5_KEYTAB="${KRB5_KEYTAB:-/etc/krb5.keytab}"
 
 # -------------------------------------------------------------------------
