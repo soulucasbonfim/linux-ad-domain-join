@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.4.1
+# Version:     3.4.2
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -320,14 +320,8 @@ log_info() {
         msg="$(sanitize_log_msg <<< "$msg")"
     fi
 
-    if (( ENABLE_COLORS )); then
-        msg="${msg//\[x\]/${C_RED}[x]${C_RESET}}"
-        msg="${msg//\[!\]/${C_YELLOW}[!]${C_RESET}}"
-        msg="${msg//\[+\]/${C_GREEN}[+]${C_RESET}}"
-        msg="${msg//\[i\]/${C_BLUE}[i]${C_RESET}}"
-        msg="${msg//\[>\]/${C_CYAN}[>]${C_RESET}}"
-        msg="${msg//\[\*\]/${C_MAGENTA}[*]${C_RESET}}"
-    fi
+    # Centralize tag colorization in a single helper to keep DRY.
+    msg="$(colorize_tag "$msg")"
 
     echo "${ts} ${msg}" >&2
 }
@@ -342,8 +336,13 @@ log_error() {
     local line1="${ts} ${C_RED}[x]${C_RESET} ${C_BOLD}[ERROR]${C_RESET} $msg"
     local line2="${ts} ${C_BLUE}[i]${C_RESET} Exiting with code $code"
     
-    line1="$(sanitize_log_msg <<< "$line1")"
-    line2="$(sanitize_log_msg <<< "$line2")"
+    # Fast path: only sanitize when emoji bytes are present (avoid unnecessary forks).
+    if [[ "$line1" == *$'\xe2'* || "$line1" == *$'\xf0'* ]]; then
+        line1="$(sanitize_log_msg <<< "$line1")"
+    fi
+    if [[ "$line2" == *$'\xe2'* || "$line2" == *$'\xf0'* ]]; then
+        line2="$(sanitize_log_msg <<< "$line2")"
+    fi
     
     echo "$line1" >&2
     echo "$line2" >&2
@@ -879,7 +878,7 @@ umask 027
 if ! : >>"$LOG_FILE" 2>/dev/null; then
     # Fallback if /var/log is not writable
     LOG_DIR="/tmp/linux-ad-domain-join"
-    LOG_FILE="${LOG_DIR}/${LOG_TIMESTAMP}_${LOG_HOSTNAME}.log"
+    LOG_FILE="${LOG_DIR}/${LOG_TIMESTAMP}_${LOG_HOSTNAME}_$$.log"
 
     _log_dir_created=false
     if [[ ! -d "$LOG_DIR" ]]; then
@@ -924,7 +923,7 @@ _prune_old_logs() {
     (( count > keep )) || return 0
 
     # Preferred path: GNU find supports -printf (common on enterprise distros).
-    # Fallback path exists below for minimal/BusyBox find implementations.
+    # Fallback paths exist below for minimal/BusyBox find implementations.
     if find "$log_dir" -maxdepth 1 -type f -name '*.log' -printf '%T@\t%p\n' >/dev/null 2>&1; then
         # Log filenames are script-generated (timestamp_hostname_pid.log) and never
         # contain whitespace or newlines. Use newline-delimited pipeline for
@@ -938,8 +937,8 @@ _prune_old_logs() {
         return 0
     fi
 
-    # Fallback: no -printf support. Use ls -1t (newest first) and delete beyond keep.
-    # NOTE: This is best-effort; never fail the run if pruning cannot be completed.
+    # Fallback: no -printf support. Prefer stat-based ordering when available; otherwise
+    # fall back to ls -1t (best-effort). Never fail the run if pruning cannot be completed.
     local -a files=()
     local f
 
@@ -953,7 +952,21 @@ _prune_old_logs() {
 
     (( ${#files[@]} > keep )) || return 0
 
-    # Delete from (keep+1) to end (oldest tail).
+    # Prefer stat(1) if it supports GNU-style -c '%Y' (common on enterprise distros and BusyBox).
+    if command -v stat >/dev/null 2>&1 && stat -c '%Y' "${files[0]}" >/dev/null 2>&1; then
+        for f in "${files[@]}"; do
+            printf '%s\t%s\n' "$(stat -c '%Y' "$f" 2>/dev/null || echo 0)" "$f"
+        done \
+            | sort -t$'\t' -k1,1nr \
+            | awk -F'\t' -v keep="$keep" 'NR>keep {print $2}' \
+            | while IFS= read -r old_log; do
+                  [[ -n "$old_log" ]] && rm -f -- "$old_log" 2>/dev/null || true
+              done || true
+        return 0
+    fi
+
+    # Last resort: ls -1t (newest first) and delete beyond keep.
+    # NOTE: Filenames are script-generated and do not contain whitespace/newlines.
     ls -1t -- "$log_dir"/*.log 2>/dev/null \
         | awk -v keep="$keep" 'NR>keep {print}' \
         | while IFS= read -r old_log; do
@@ -1100,6 +1113,25 @@ safe_mktemp() {
 }
 
 # -------------------------------------------------------------------------
+# Non-fatal mktemp helper: returns path on stdout; returns 1 on failure.
+# Use when a temporary file is an optimization and a safe fallback exists.
+# -------------------------------------------------------------------------
+mktemp_try() {
+    local tmpfile template
+
+    # BusyBox mktemp (and some minimal images) require an explicit template.
+    if (( $# == 0 )); then
+        template="/tmp/linux-ad-domain-join.XXXXXX"
+        tmpfile="$(mktemp "$template" 2>/dev/null)" || return 1
+    else
+        tmpfile="$(mktemp "$@" 2>/dev/null)" || return 1
+    fi
+
+    [[ -n "$tmpfile" ]] || return 1
+    printf '%s' "$tmpfile"
+}
+
+# -------------------------------------------------------------------------
 # Secure file deletion (best-effort: shred > srm > rm)
 # -------------------------------------------------------------------------
 # Overwrites file content before unlinking to reduce recovery risk on
@@ -1130,21 +1162,41 @@ selinux_restore() {
     # Skip in read-only modes (restorecon modifies xattrs)
     if $DRY_RUN || $VALIDATE_ONLY; then return 0; fi
 
-    local -a filtered=()
-    local arg
+    local -a opts=() paths=()
+    local arg end_opts=false need_double_dash=false
 
     for arg in "$@"; do
-        if [[ "$arg" == -* ]]; then
-            filtered+=("$arg")
+        # Accept explicit '--' from callers (end of options marker)
+        if ! $end_opts && [[ "$arg" == "--" ]]; then
+            end_opts=true
             continue
         fi
+
+        # Collect options until the first non-option argument
+        if ! $end_opts && [[ "$arg" == -* ]]; then
+            opts+=("$arg")
+            continue
+        fi
+
+        end_opts=true
+
+        # Skip ephemeral paths (no matching file_contexts rule and already inheriting context)
         [[ "$arg" == /tmp/* || "$arg" == /var/tmp/* || "$arg" == /dev/shm/* || "$arg" == /run/* ]] && continue
-        filtered+=("$arg")
+
+        # A leading '-' is a valid pathname edge case; only use '--' when needed.
+        [[ "$arg" == -* ]] && need_double_dash=true
+        paths+=("$arg")
     done
 
-    (( ${#filtered[@]} == 0 )) && return 0
+    (( ${#paths[@]} == 0 )) && return 0
 
-    command -v restorecon >/dev/null 2>&1 && restorecon "${filtered[@]}" 2>/dev/null || true
+    if command -v restorecon >/dev/null 2>&1; then
+        if $need_double_dash; then
+            restorecon "${opts[@]}" -- "${paths[@]}" 2>/dev/null || true
+        else
+            restorecon "${opts[@]}" "${paths[@]}" 2>/dev/null || true
+        fi
+    fi
 }
 
 # -------------------------------------------------------------------------
@@ -1311,8 +1363,17 @@ backup_prune_old_runs() {
     tmp_list="$(safe_mktemp)" || return 0
 
     # Newline-delimited list: safe with spaces; paths containing newlines are out-of-scope for backup dirs here.
-    find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\n' 2>/dev/null \
-        | sort -t$'\t' -k1,1rn >"$tmp_list" || true
+    #
+    # Prefer GNU find -printf (common on enterprise distros). Fallback to ls -dt when -printf
+    # is unavailable (e.g., BusyBox find on minimal images).
+    if find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\n' >/dev/null 2>&1; then
+        find "$BACKUP_ROOT" -mindepth 1 -maxdepth 1 -type d -printf '%T@\t%p\n' 2>/dev/null \
+            | sort -t$'\t' -k1,1rn >"$tmp_list" || true
+    else
+        # ls -1dt prints newest first; normalize trailing slashes.
+        ls -1dt -- "$BACKUP_ROOT"/*/ 2>/dev/null \
+            | sed $SED_EXT 's:/*$::' >"$tmp_list" || true
+    fi
 
     local total
     total="$(wc -l <"$tmp_list" 2>/dev/null || echo 0)"
@@ -2627,7 +2688,7 @@ discover_nearest_dc() {
 
     # ── Multiple DCs - parallel ping, pick lowest latency ──
     local ping_tmp _dc _dc_l _dc_ip _dc_avg _running=0
-    ping_tmp="$(mktemp /tmp/.dc-ping.XXXXXX 2>/dev/null)" || {
+    ping_tmp="$(mktemp_try /tmp/.dc-ping.XXXXXX)" || {
         # mktemp failed - fall back to first candidate
         echo "${dc_arr[0]}"
         return 0
@@ -2806,9 +2867,9 @@ detect_current_computer_ou() {
     [[ -n "$princ" ]] || princ="$(klist -k /etc/krb5.keytab 2>/dev/null | awk 'NR>3{print $2}' | sort -u | grep -F "\$@${realm}" | head -n1)"
     [[ -n "$princ" ]] || return 1
 
-    ccache="/tmp/krb5cc_ou_detect.$$"
+    ccache="$(safe_mktemp "/tmp/krb5cc_ou_detect.XXXXXX")"
     if ! KRB5CCNAME="$ccache" safe_timeout "${TRUST_TIMEOUT:-15}s" kinit -k -t /etc/krb5.keytab "$princ" >/dev/null 2>&1; then
-        rm -f "$ccache" 2>/dev/null || true
+        secure_delete "$ccache" 2>/dev/null || true
         return 1
     fi
 
@@ -2819,7 +2880,7 @@ detect_current_computer_ou() {
     )" || true
 
     KRB5CCNAME="$ccache" kdestroy -q >/dev/null 2>&1 || true
-    rm -f "$ccache" 2>/dev/null || true
+    secure_delete "$ccache" 2>/dev/null || true
 
     ou="$(printf '%s\n' "$out" | sed -n 's/^distinguishedName: CN=[^,]*,//p' | head -n1)"
     if [[ -n "$ou" ]] && validate_ldap_dn "$ou"; then
@@ -3170,6 +3231,11 @@ if $NONINTERACTIVE; then
     fi
     : "${DOMAIN_PASS:?DOMAIN_PASS or DOMAIN_PASS_FILE required}"
 
+    # Reduce /proc/<pid>/environ exposure: move secret to a non-exported variable ASAP.
+    # This also reduces accidental leakage via exported environment snapshots.
+    DOMAIN_PASS_BUF="$DOMAIN_PASS"
+    unset DOMAIN_PASS
+
     : "${SESSION_TIMEOUT_SECONDS:?SESSION_TIMEOUT_SECONDS required (seconds)}"
     : "${PERMIT_ROOT_LOGIN:?PERMIT_ROOT_LOGIN required (yes|no)}"
 
@@ -3334,6 +3400,11 @@ else
         [[ -n "$DOMAIN_PASS" ]] && break
         printf "${C_DIM}[%s]${C_RESET} ${C_RED}[!]${C_RESET} Password cannot be empty.\n" "$(date '+%F %T')"
     done
+
+    # Reduce /proc/<pid>/environ exposure: move secret to a non-exported variable ASAP.
+    # Comments in en-US per project convention.
+    DOMAIN_PASS_BUF="$DOMAIN_PASS"
+    unset DOMAIN_PASS
 
     # Session timeout (SSH + Shell) in seconds
     default_SESSION_TIMEOUT_SECONDS=900
@@ -3611,7 +3682,7 @@ fi
 
 # Ensure /etc/hostname contains the correct short hostname
 if [[ -f /etc/hostname ]]; then
-    CURRENT_HOSTNAME_FILE=$(< /etc/hostname)
+    CURRENT_HOSTNAME_FILE="$(trim_ws "$(< /etc/hostname)")"
     if [[ "$CURRENT_HOSTNAME_FILE" != "$HOST_SHORT" ]]; then
         write_line_file 0644 /etc/hostname "$HOST_SHORT"
         log_info "🧩 Updated /etc/hostname to '$HOST_SHORT'"
@@ -4205,26 +4276,31 @@ create_secret_passfile() {
     fi
 
     # Create temp file with secure permissions (0600) atomically via umask
-    # No separate chmod needed - umask 077 ensures correct permissions at creation
+    # No separate chmod needed - umask 077 ensures correct permissions at creation time
     # Use safe_mktemp for consistent error handling and logging
     PASS_FILE="$(safe_mktemp "${base}/.adjoin.pass.XXXXXX")" || log_error "Failed to create temporary password file" 1
 
-    if [[ -z "${DOMAIN_PASS:-}" ]]; then
-        log_error "DOMAIN_PASS is empty; cannot proceed with credential-based operations." 1
+    # Prefer the non-exported buffer (DOMAIN_PASS_BUF) to avoid /proc/<pid>/environ exposure.
+    # Fall back to DOMAIN_PASS only for backward compatibility with older call sites.
+    local _secret="${DOMAIN_PASS_BUF:-${DOMAIN_PASS:-}}"
+
+    if [[ -z "${_secret:-}" ]]; then
+        log_error "Domain password is empty; cannot proceed with credential-based operations." 1
     fi
 
     # Store password WITHOUT trailing newline (printf '%s', not echo).
     #
     # Why no newline:
     #   - Some consumers interpret the trailing newline differently; keep the secret unambiguous.
-    if [[ "${DOMAIN_PASS:-}" == *$'\n'* || "${DOMAIN_PASS:-}" == *$'\r'* ]]; then
-        log_error "DOMAIN_PASS contains newline/CR characters; refusing to avoid ambiguous stdin/file parsing." 1
+    if [[ "$_secret" == *$'\n'* || "$_secret" == *$'\r'* ]]; then
+        log_error "Domain password contains newline/CR characters; refusing to avoid ambiguous stdin/file parsing." 1
     fi
 
-    printf '%s' "$DOMAIN_PASS" > "$PASS_FILE" || log_error "Failed to write temporary password file" 1
+    printf '%s' "$_secret" > "$PASS_FILE" || log_error "Failed to write temporary password file" 1
 
     # Remove from memory ASAP
-    unset DOMAIN_PASS
+    unset _secret
+    unset DOMAIN_PASS DOMAIN_PASS_BUF
 
     if $DRY_RUN; then
         # In DRY_RUN, we still materialize PASS_FILE so read-only auth checks (e.g., kinit) can run deterministically.
@@ -4360,7 +4436,7 @@ cleanup_secrets() {
     unset PASS_FILE
 
     # Just in case someone reintroduced it
-    unset DOMAIN_PASS
+    unset DOMAIN_PASS DOMAIN_PASS_BUF
 }
 
 # Pre-declare temp file variables referenced by cleanup_secrets trap.
@@ -6202,8 +6278,7 @@ use_fully_qualified_names = False
 # -------------------------------------------------------------------------
 # Dynamic DNS update (Secure Update)
 # -------------------------------------------------------------------------
-${DYNDNS_IFACE_LINE:+${DYNDNS_IFACE_LINE}}
-dyndns_update = True
+${DYNDNS_IFACE_LINE:+${DYNDNS_IFACE_LINE}$'\n'}dyndns_update = True
 dyndns_refresh_interval = 43200
 dyndns_ttl = 3600
 dyndns_update_ptr = True
@@ -6219,15 +6294,11 @@ cmd_try chmod 600 "$SSSD_CONF" || true
 # Optional: flush old caches before restart
 # -------------------------------------------------------------------------
 if command -v sss_cache >/dev/null 2>&1; then
-    if [[ "${NONINTERACTIVE:-false}" == "true" ]]; then
-        log_info "ℹ️ NONINTERACTIVE mode detected - skipping SSSD cache flush to preserve UID mapping"
+    if $DRY_RUN; then
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would flush SSSD caches (sss_cache -E)"
     else
-        if $DRY_RUN; then
-            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would flush SSSD caches (sss_cache -E)"
-        else
-            log_info "🔁 Flushing old SSSD caches"
-            sss_cache -E >/dev/null 2>&1 || log_info "⚠️ Failed to flush SSSD cache (non-critical)"
-        fi
+        log_info "🔁 Flushing old SSSD caches"
+        sss_cache -E >/dev/null 2>&1 || log_info "⚠️ Failed to flush SSSD cache (non-critical)"
     fi
 else
     log_info "ℹ️ sss_cache not found - skipping cache flush"
@@ -7138,13 +7209,13 @@ log_info "🗂️ Enumerating sudoers configuration files"
 
 FILES=("$SUDOERS_MAIN")
 
-# Bash 4.4+ required for mapfile -d ''
+# Bash 4.4+ required for mapfile -d $'\0' (NUL delimiter)
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
-    mapfile -t -d '' _DROPIN_FILES < <(find "$SUDOERS_DIR" -maxdepth 1 -type f -print0)
+    mapfile -t -d $'\0' _DROPIN_FILES < <(find "$SUDOERS_DIR" -maxdepth 1 -type f -print0)
     FILES+=("${_DROPIN_FILES[@]}")
     unset _DROPIN_FILES
 else
-    while IFS= read -r -d '' f || [[ -n "$f" ]]; do
+    while IFS= read -r -d $'\0' f || [[ -n "$f" ]]; do
         FILES+=("$f")
     done < <(find "$SUDOERS_DIR" -maxdepth 1 -type f -print0)
 fi
@@ -7377,7 +7448,9 @@ echo
 
 # Force sync and restore terminal
 sync
-stty sane 2>/dev/null || true
+if [[ -t 0 || -t 1 ]]; then
+    stty sane 2>/dev/null || true
+fi
 
 # Flush tee pipelines: close stdout to signal EOF to tee, wait for completion.
 # Keep stderr open for cleanup trap errors (cleanup_secrets may log warnings).
