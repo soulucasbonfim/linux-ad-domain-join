@@ -4300,6 +4300,15 @@ create_secret_passfile() {
         return 0
     fi
 
+    if $DRY_RUN; then
+        # In DRY_RUN, never materialize credentials on disk.
+        # Keep simulation non-invasive and avoid secret persistence risk.
+        PASS_FILE=""
+        unset DOMAIN_PASS
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Credential file creation skipped in dry-run mode"
+        return 0
+    fi
+
     local old_umask
     old_umask="$(umask)"              # Save current umask for restoration
     trap 'umask "$old_umask"; trap - RETURN' RETURN  # Restore umask when function returns
