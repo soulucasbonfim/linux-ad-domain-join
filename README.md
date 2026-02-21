@@ -38,7 +38,6 @@ sudo DOMAIN="acme.corp" \
      NTP_SERVER="ntp.acme.corp" \
      DOMAIN_USER="svc-join" \
      DOMAIN_PASS="$VAULT_SECRET" \
-     GLOBAL_ADMIN_GROUPS="infra-admins" \
      SESSION_TIMEOUT_SECONDS="900" \
      PERMIT_ROOT_LOGIN="no" \
      ./linux-ad-domain-join.sh --yes
@@ -174,7 +173,6 @@ Each role has **two scopes** managed in Active Directory:
 | `NTP_SERVER` | `ntp.acme.corp` | NTP server for time sync |
 | `DOMAIN_USER` | `svc-join` | AD account with join privileges |
 | `DOMAIN_PASS` | *(secret)* | Password for `DOMAIN_USER` |
-| `GLOBAL_ADMIN_GROUPS` | `infra-admins devops` | Space-separated AD groups for SSH AllowGroups |
 | `SESSION_TIMEOUT_SECONDS` | `900` | SSH + shell idle timeout (30–86400 seconds) |
 | `PERMIT_ROOT_LOGIN` | `no` | SSH PermitRootLogin (`yes` / `no`) |
 
