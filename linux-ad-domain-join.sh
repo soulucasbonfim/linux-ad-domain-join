@@ -3213,7 +3213,7 @@ if $NONINTERACTIVE; then
 
     # Credential resolution: DOMAIN_PASS_FILE takes precedence over DOMAIN_PASS
     # when both are set (file-based is safer; env-based persists in /proc/<pid>/environ).
-    if [[ -z "${DOMAIN_PASS:-}" && -n "${DOMAIN_PASS_FILE:-}" ]]; then
+    if [[ -n "${DOMAIN_PASS_FILE:-}" ]]; then
         [[ -f "$DOMAIN_PASS_FILE" ]] || log_error "DOMAIN_PASS_FILE not found: $DOMAIN_PASS_FILE" 1
         [[ -r "$DOMAIN_PASS_FILE" ]] || log_error "DOMAIN_PASS_FILE not readable: $DOMAIN_PASS_FILE" 1
 
@@ -4348,10 +4348,14 @@ create_secret_passfile() {
     unset DOMAIN_PASS DOMAIN_PASS_BUF
 
     if $DRY_RUN; then
-        # In DRY_RUN, we still materialize PASS_FILE so read-only auth checks (e.g., kinit) can run deterministically.
-        # The file must be removed by the script's global cleanup/EXIT trap.
-        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Password file materialized for deterministic read-only checks (will be deleted by cleanup)"
+        # In DRY_RUN, do not materialize real credentials on disk.
+        # This keeps simulation non-invasive and avoids secret persistence risk.
+        PASS_FILE=""
+        unset DOMAIN_PASS DOMAIN_PASS_BUF
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Credential file creation skipped in dry-run mode"
+        return 0
     fi
+
 }
 
 cleanup_secrets() {
@@ -4531,10 +4535,12 @@ log_info "🔐 Verifying credentials for $DOMAIN_USER@$REALM"
 KRB_TRACE=$(safe_mktemp)
 
 if $VALIDATE_ONLY; then
-    log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Kerberos credential validation suppressed (non-invasive mode)"
-    log_info "✅ VALIDATE-ONLY: pre-checks completed successfully. Skipping domain join and all configuration writes."
+    log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Kerberos credential validation suppressed"
+    log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Non-invasive scope: no domain join, no config writes, no secret file creation"
+    log_info "✅ VALIDATE-ONLY: pre-checks completed successfully."
     exit 0
 fi
+
 
 # Temporarily relax -e and disable ERR trap to classify kinit failures
 trap - ERR
