@@ -2937,13 +2937,12 @@ install_missing_deps() {
         local pid=$!
 
         # Lightweight wait with optional heartbeat (only after threshold)
+        local _next_hb=$(( start + _progress_threshold ))
         while kill -0 "$pid" 2>/dev/null; do
             local elapsed=$(( (${SECONDS:-0}) - start ))
-            if (( _progress_interval > 0 && elapsed >= _progress_threshold )); then
-                # Emit heartbeat at most every _progress_interval seconds
-                if (( elapsed % _progress_interval == 0 )); then
-                    log_info "⏳ ${label} still running (${elapsed}s)..."
-                fi
+            if (( _progress_interval > 0 && elapsed >= _next_hb )); then
+                log_info "⏳ ${label} still running (${elapsed}s)..."
+                _next_hb=$(( elapsed + _progress_interval ))
             fi
             sleep 2
         done
@@ -2995,10 +2994,11 @@ install_missing_deps() {
                 # Fast-path: check if all packages have install candidates in current cache.
                 # apt-cache policy is instantaneous and avoids costly apt-get update.
                 local _all_have_candidates=true
-                local _p
+                local _p _policy_out
                 for _p in "${to_install[@]}"; do
-                    if ! apt-cache policy "$_p" 2>/dev/null | grep -q 'Candidate:' || \
-                       apt-cache policy "$_p" 2>/dev/null | grep -q 'Candidate: (none)'; then
+                    _policy_out="$(apt-cache policy "$_p" 2>/dev/null || true)"
+                    if ! echo "$_policy_out" | grep -q 'Candidate:' || \
+                       echo "$_policy_out" | grep -q 'Candidate: (none)'; then
                         _all_have_candidates=false
                         break
                     fi
@@ -3102,11 +3102,12 @@ install_missing_deps() {
             )
 
             # Fast-path: skip costly metadata refresh if all packages are available locally
+            # NOTE: -C (cache-only) works on both yum (RHEL 7) and dnf (RHEL 8+).
             local _rpm_need_refresh=false
             local _p
             for _p in "${to_install[@]}"; do
                 if ! rpm -q "$_p" >/dev/null 2>&1 && \
-                   ! "$PKG" list available "$_p" --cacheonly -q 2>/dev/null | grep -qi "$_p"; then
+                   ! "$PKG" -C list available "$_p" -q 2>/dev/null | grep -qi "$_p"; then
                     _rpm_need_refresh=true
                     break
                 fi
