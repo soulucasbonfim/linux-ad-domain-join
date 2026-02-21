@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.5.5
+# Version:     3.5.6
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -4931,6 +4931,12 @@ fi
 # Create secure password file (tmpfs, 0600, no TOCTOU race, no ps exposure)
 create_secret_passfile() {
     if $VALIDATE_ONLY; then
+        # Security hardening:
+        # Ensure PASS_FILE cannot be influenced by inherited environment variables
+        # in VALIDATE_ONLY mode (non-invasive contract).
+        PASS_FILE=""
+        unset DOMAIN_PASS DOMAIN_PASS_BUF
+
         log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Password file creation suppressed (credential validation skipped)"
         return 0
     fi
@@ -7897,16 +7903,23 @@ log_info "🗂️ Enumerating sudoers configuration files"
 
 FILES=("$SUDOERS_MAIN")
 
+# Mirror sudoers "#includedir" behavior:
+# - ignore files containing '.' (dot) anywhere in the name
+# - ignore files ending with '~'
+# This prevents patching files that sudo itself will not include.
+_FIND_SUDOERS_D=( find "$SUDOERS_DIR" -maxdepth 1 -type f ! -name '*.*' ! -name '*~' -print0 )
+
 # Bash 4.4+ required for mapfile -d $'\0' (NUL delimiter)
 if (( BASH_VERSINFO[0] > 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] >= 4) )); then
-    mapfile -t -d $'\0' _DROPIN_FILES < <(find "$SUDOERS_DIR" -maxdepth 1 -type f -print0)
+    mapfile -t -d $'\0' _DROPIN_FILES < <("${_FIND_SUDOERS_D[@]}")
     FILES+=("${_DROPIN_FILES[@]}")
     unset _DROPIN_FILES
 else
     while IFS= read -r -d $'\0' f || [[ -n "$f" ]]; do
         FILES+=("$f")
-    done < <(find "$SUDOERS_DIR" -maxdepth 1 -type f -print0)
+    done < <("${_FIND_SUDOERS_D[@]}")
 fi
+unset _FIND_SUDOERS_D
 
 # -------------------------------------------------------------------------
 # Extract administrative groups from all sudoers files
@@ -8059,7 +8072,14 @@ log_info "🚀 Completed domain join for $DOMAIN"
 # -------------------------------------------------------------------------
 log_info "💡 Performing post-validation summary checks"
 
-REALM_JOINED=$(safe_realm_list | awk '/^[^ ]/ {print $1}' | head -n1)
+# Report join state for the requested domain deterministically (exact match).
+_realm_lc="${DOMAIN,,}"
+if safe_realm_list | awk '/^[^ ]/ {print tolower($1)}' | grep -Fx -- "$_realm_lc" >/dev/null 2>&1; then
+    REALM_JOINED="$_realm_lc"
+else
+    REALM_JOINED="⚠️ Not detected"
+fi
+unset _realm_lc
 
 if command -v systemctl >/dev/null 2>&1; then
     # -------------------------------------------------------------------------
