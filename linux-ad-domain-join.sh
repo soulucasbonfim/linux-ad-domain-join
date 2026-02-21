@@ -570,8 +570,10 @@ validate_host_or_ip() {
 # -------------------------------------------------------------------------
 # Checks: non-empty, no newlines/CR (LDIF injection), max 1024 chars,
 # at least 2 RDN components, each matching KEY=VALUE format.
-# NOTE: Does not handle escaped commas in RDN values (e.g., CN=User\, Name).
-# This is acceptable because the OU parameter never contains escaped commas.
+# NOTE:
+# - Supports escaped commas (e.g., CN=User\, Name) for safe splitting.
+# - Does not attempt full RFC 4514 semantics validation (e.g., hex escapes);
+#   this is sufficient for the OU DN usage in this script.
 # -------------------------------------------------------------------------
 validate_ldap_dn() {
     local dn="${1:-}"
@@ -768,13 +770,12 @@ fi
 # Build timestamped log filename (PID suffix prevents collision on same-second double-run)
 LOG_FILE="${LOG_DIR}/${LOG_TIMESTAMP}_${LOG_HOSTNAME}_$$.log"
 
-# Ensure log directory exists with restrictive permissions.
-# Never chmod arbitrary pre-existing directories from environment overrides.
+# Ensure roots are absolute (defense-in-depth).
 [[ "$LOG_DIR" == /* ]] || log_error "LOG_DIR must be an absolute path: $LOG_DIR" 1
+[[ "$BACKUP_ROOT" == /* ]] || log_error "BACKUP_ROOT must be an absolute path: $BACKUP_ROOT" 1
 
 # Ensure BACKUP_ROOT is safe (defense-in-depth for pruning logic).
 # Reject empty, root, and overly generic system directories.
-[[ "$BACKUP_ROOT" == /* ]] || log_error "BACKUP_ROOT must be an absolute path: $BACKUP_ROOT" 1
 [[ "$BACKUP_ROOT" =~ ^/[^/]+/[^/]+ ]] || log_error "BACKUP_ROOT is too generic/short: $BACKUP_ROOT" 1
 
 case "$BACKUP_ROOT" in
@@ -783,11 +784,58 @@ case "$BACKUP_ROOT" in
         ;;
 esac
 
-# Refuse symlinked backup roots under world-writable trees.
+# -------------------------------------------------------------------------
+# Hardening: refuse unsafe LOG_DIR/BACKUP_ROOT when not in read-only modes
+# -------------------------------------------------------------------------
+_assert_secure_dir() {
+    # Usage: _assert_secure_dir <dir> <label>
+    # Enforces: not symlink, owned by root (best-effort), not group/other-writable.
+    # Comments in en-US per project convention.
+    local d="$1"
+    local label="${2:-DIR}"
+
+    [[ -n "$d" ]] || return 0
+    [[ -d "$d" ]] || return 0
+
+    [[ -L "$d" ]] && log_error "$label is a symlink (refusing): $d" 1
+
+    if command -v stat >/dev/null 2>&1; then
+        local mode uid
+        mode="$(stat -c '%a' "$d" 2>/dev/null || true)"
+        uid="$(stat -c '%u' "$d" 2>/dev/null || true)"
+
+        if [[ "$uid" =~ ^[0-9]+$ ]] && (( uid != 0 )); then
+            log_error "$label must be owned by root (uid 0). Found uid=$uid for $d" 1
+        fi
+
+        if [[ "$mode" =~ ^[0-9]{3,4}$ ]]; then
+            # Refuse group/other-writable directories (prevents symlink/file clobber attacks).
+            (( (8#$mode & 8#022) == 0 )) || log_error "$label is writable by group/others (mode $mode) - refusing: $d" 1
+        fi
+    fi
+}
+
+if ! $VALIDATE_ONLY && ! $DRY_RUN; then
+    # Refuse world-writable trees in production mode (untrusted path risk).
+    case "$LOG_DIR" in
+        /tmp/*|/var/tmp/*|/dev/shm/*)
+            log_error "LOG_DIR must not be under a world-writable tree in production mode: $LOG_DIR" 1
+            ;;
+    esac
+
+    case "$BACKUP_ROOT" in
+        /tmp/*|/var/tmp/*|/dev/shm/*)
+            log_error "BACKUP_ROOT must not be under a world-writable tree in production mode: $BACKUP_ROOT" 1
+            ;;
+    esac
+fi
+
+# Refuse symlinked backup roots under world-writable trees (legacy guard).
 if [[ "$BACKUP_ROOT" == /tmp/* || "$BACKUP_ROOT" == /var/tmp/* || "$BACKUP_ROOT" == /dev/shm/* ]]; then
     [[ -L "$BACKUP_ROOT" ]] && log_error "BACKUP_ROOT is a symlink (refusing): $BACKUP_ROOT" 1
 fi
 
+# Extra protection for LOG_DIR under /tmp and /var/tmp (legacy guard + TOCTOU recheck).
 if [[ "$LOG_DIR" == /tmp/* || "$LOG_DIR" == /var/tmp/* ]]; then
     if [[ -L "$LOG_DIR" ]]; then
         log_info "⚠ LOG_DIR is a symlink ($LOG_DIR) - refusing to use it"
@@ -808,9 +856,19 @@ if $_log_dir_created; then
     chmod 750 -- "$LOG_DIR" 2>/dev/null || true
 fi
 
+# If LOG_DIR already existed, enforce safety in production mode (best-effort).
+if ! $VALIDATE_ONLY && ! $DRY_RUN; then
+    _assert_secure_dir "$LOG_DIR" "LOG_DIR"
+    # BACKUP_ROOT may not exist yet; validate only if present.
+    _assert_secure_dir "$BACKUP_ROOT" "BACKUP_ROOT"
+fi
+
 # Create the log file under a restrictive umask so it is safe even if chmod fails.
 __prev_umask="$(umask)"
 umask 027
+
+# Refuse symlinked log files before opening (prevents clobber via attacker-controlled paths).
+[[ -L "$LOG_FILE" ]] && log_error "LOG_FILE is a symlink (refusing): $LOG_FILE" 1
 
 if ! : >>"$LOG_FILE" 2>/dev/null; then
     # Fallback if /var/log is not writable
@@ -825,6 +883,13 @@ if ! : >>"$LOG_FILE" 2>/dev/null; then
     if $_log_dir_created; then
         chmod 750 -- "$LOG_DIR" 2>/dev/null || true
     fi
+
+    # Always enforce safety on the fallback directory (it lives under /tmp).
+    if ! $VALIDATE_ONLY && ! $DRY_RUN; then
+        _assert_secure_dir "$LOG_DIR" "LOG_DIR (fallback)"
+    fi
+
+    [[ -L "$LOG_FILE" ]] && { echo "[$(date '+%F %T')] [ERROR] LOG_FILE is a symlink: $LOG_FILE" >&2; exit 1; }
 
     : >>"$LOG_FILE" 2>/dev/null || { echo "[$(date '+%F %T')] [ERROR] Cannot write LOG_FILE=$LOG_FILE" >&2; exit 1; }
 fi
@@ -845,20 +910,48 @@ fi
 _prune_old_logs() {
     local log_dir="$1" keep="$2"
     [[ -d "$log_dir" ]] || return 0
+
     local count
     # Best-effort: never abort the whole run if log pruning hits filesystem edge-cases.
     count="$(find "$log_dir" -maxdepth 1 -type f -name '*.log' 2>/dev/null | wc -l || true)"
     [[ "$count" =~ ^[0-9]+$ ]] || count=0
     (( count > keep )) || return 0
 
-    # Log filenames are script-generated (timestamp_hostname_pid.log) and never
-    # contain whitespace or newlines. Use newline-delimited pipeline for
-    # compatibility with coreutils < 8.25 (no head -z; e.g. RHEL 7).
-    find "$log_dir" -maxdepth 1 -type f -name '*.log' -printf '%T@\t%p\n' 2>/dev/null \
-        | sort -t$'\t' -k1,1n \
-        | head -n "$(( count - keep ))" \
-        | while IFS=$'\t' read -r _ts old_log; do
-              rm -f -- "$old_log" 2>/dev/null || true
+    # Preferred path: GNU find supports -printf (common on enterprise distros).
+    # Fallback path exists below for minimal/BusyBox find implementations.
+    if find "$log_dir" -maxdepth 1 -type f -name '*.log' -printf '%T@\t%p\n' >/dev/null 2>&1; then
+        # Log filenames are script-generated (timestamp_hostname_pid.log) and never
+        # contain whitespace or newlines. Use newline-delimited pipeline for
+        # compatibility with coreutils < 8.25 (no head -z; e.g. RHEL 7).
+        find "$log_dir" -maxdepth 1 -type f -name '*.log' -printf '%T@\t%p\n' 2>/dev/null \
+            | sort -t$'\t' -k1,1n \
+            | head -n "$(( count - keep ))" \
+            | while IFS=$'\t' read -r _ts old_log; do
+                  rm -f -- "$old_log" 2>/dev/null || true
+              done || true
+        return 0
+    fi
+
+    # Fallback: no -printf support. Use ls -1t (newest first) and delete beyond keep.
+    # NOTE: This is best-effort; never fail the run if pruning cannot be completed.
+    local -a files=()
+    local f
+
+    local _prev_nullglob=false
+    shopt -q nullglob && _prev_nullglob=true
+    shopt -s nullglob
+    for f in "$log_dir"/*.log; do
+        files+=( "$f" )
+    done
+    $_prev_nullglob || shopt -u nullglob
+
+    (( ${#files[@]} > keep )) || return 0
+
+    # Delete from (keep+1) to end (oldest tail).
+    ls -1t -- "$log_dir"/*.log 2>/dev/null \
+        | awk -v keep="$keep" 'NR>keep {print}' \
+        | while IFS= read -r old_log; do
+              [[ -n "$old_log" ]] && rm -f -- "$old_log" 2>/dev/null || true
           done || true
 }
 # NOTE: Log pruning moved to after lock acquisition (see below)
@@ -3145,7 +3238,7 @@ else
     default_DC_SERVER="$(discover_nearest_dc "$DOMAIN")" || true
 
     if [[ -n "$default_DC_SERVER" ]]; then
-        log_info "✅ Nearest DC: ${default_DC_SERVER}"
+        log_info "✅ Auto-detected Nearest DC"
     else
         # Fallback: static pattern if discovery failed
         default_DC_SERVER="${DOMAIN_SHORT,,}-ad01.${DOMAIN,,}"
@@ -3174,7 +3267,7 @@ else
     # Uses current user Kerberos cache first; if running as root, falls back to machine keytab.
     if detected_ou="$(detect_current_computer_ou)"; then
         default_OU="$detected_ou"
-        log_info "✅ Auto-detected current computer OU/container: ${default_OU}"
+        log_info "✅ Auto-detected current computer OU/container"
     fi
     unset detected_ou
 
@@ -7070,16 +7163,21 @@ else
 			handled=false
 
 			for grp in "${TARGET_GROUPS[@]}"; do
-				good_all="%${grp} ALL=(ALL:ALL) ALL, !ROOT_SHELLS"
-				good_npw="%${grp} ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS"
+				# Render group token exactly as sudoers expects (spaces must be backslash-escaped).
+				# Example: "Domain Admins" -> "Domain\ Admins"
+				grp_sudo="${grp// /\\ }"
 
-				# Escape regex metacharacters in group name for safe pattern matching
-				grp_escaped="$(regex_escape_ere "$grp")"
+				good_all="%${grp_sudo} ALL=(ALL:ALL) ALL, !ROOT_SHELLS"
+				good_npw="%${grp_sudo} ALL=(ALL) NOPASSWD: ALL, !ROOT_SHELLS"
+
+				# Escape regex metacharacters in the sudoers token for safe pattern matching.
+				# NOTE: grp_sudo may contain backslashes (escaped spaces); regex_escape_ere handles this.
+				grp_token_escaped="$(regex_escape_ere "$grp_sudo")"
 
 				# Allow optional spaces around '=' as sudoers syntax permits (e.g., ALL = (ALL))
 				# Trailing whitespace tolerance: editors may leave invisible spaces at end of line
-				pat_all="^%${grp_escaped}[[:space:]]+ALL[[:space:]]*=[[:space:]]*\(ALL(:ALL)?\)[[:space:]]+ALL[[:space:]]*$"
-				pat_npw="^%${grp_escaped}[[:space:]]+ALL[[:space:]]*=[[:space:]]*\(ALL(:ALL)?\)[[:space:]]+NOPASSWD:[[:space:]]+ALL[[:space:]]*$"
+				pat_all="^%${grp_token_escaped}[[:space:]]+ALL[[:space:]]*=[[:space:]]*\\(ALL(:ALL)?\\)[[:space:]]+ALL[[:space:]]*$"
+				pat_npw="^%${grp_token_escaped}[[:space:]]+ALL[[:space:]]*=[[:space:]]*\\(ALL(:ALL)?\\)[[:space:]]+NOPASSWD:[[:space:]]+ALL[[:space:]]*$"
 
 				# Already compliant
 				if [[ "$line" == "$good_all" || "$line" == "$good_npw" ]]; then
