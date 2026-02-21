@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.4.7
+# Version:     3.4.8
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2815,20 +2815,13 @@ install_missing_deps() {
     # the entire process group (apt -> dpkg -> postinst), ensuring hung children
     # are killed too. With --foreground, only the direct child gets the signal.
     #
-    # IMPORTANT: We do NOT use cmd_must here. cmd_must routes through
-    # _cmd_run_capture which redirects ALL output to a temp file, making
-    # multi-minute installs appear completely silent (the operator sees zero
-    # progress and thinks the script is stuck).
-    #
-    # We also do NOT use > >(tee ...) process substitution. The script already
-    # has a global exec > >(tee -a "$LOG_FILE") (line ~1047). Adding another
-    # tee inside a process substitution creates a nested async subshell that
-    # hangs after the command finishes (the inner tee waits for EOF on the
-    # pipe, which never comes because the outer tee holds it open).
-    #
-    # Instead, commands run with bare stdout/stderr — output flows naturally
-    # through the global tee pipeline to both console and log file.
-    # This follows the same pattern used for adcli join (line ~6218).
+    # OUTPUT STRATEGY: All package manager output is redirected to LOG_FILE
+    # directly (>>"$LOG_FILE" 2>&1), BYPASSING the global exec > >(tee)
+    # pipeline entirely. This prevents three confirmed hang scenarios:
+    #   1. cmd_must -> _cmd_run_capture: redirects to tmpfile, silent hang
+    #   2. > >(tee -a file): nested process substitution, async subshell hang
+    #   3. bare stdout through exec >(tee): apt \r chars corrupt pipe state, hang
+    # The operator sees clean log_info messages; full output is in the log file.
     # -------------------------------------------------------------------------
     local _update_budget="${PKG_UPDATE_TIMEOUT:-300}"
     local _install_budget="${PKG_INSTALL_TIMEOUT:-900}"
@@ -2858,36 +2851,36 @@ install_missing_deps() {
                 safe_timeout --kill-after=10 "${_update_budget}" \
                     env DEBIAN_FRONTEND=noninteractive \
                     apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq \
-                    || _pkg_rc=$?
+                    >>"$LOG_FILE" 2>&1 || _pkg_rc=$?
 
                 if (( _pkg_rc != 0 )); then
                     case "$_pkg_rc" in
                         124) log_info "⚠️ apt-get update timed out after ${_update_budget}s (SIGTERM)" ;;
                         137) log_info "⚠️ apt-get update killed after $((_update_budget + 10))s (SIGKILL)" ;;
                     esac
-                    log_error "apt-get update failed (rc=$_pkg_rc)" 1
+                    log_error "apt-get update failed (rc=$_pkg_rc). Check $LOG_FILE for details." 1
                 fi
             else
                 $VERBOSE && log_info "ℹ️ apt-get update skipped (cache already refreshed by connectivity probe)"
             fi
 
-            # --- apt-get install (live output via global tee pipeline) ---
-            # Use -q (not -qq) so package names appear as they install.
-            # Output goes directly to stdout -> global tee -> console + log.
+            # --- apt-get install ---
+            # Output goes directly to LOG_FILE, bypassing the global tee pipeline.
+            # Console feedback via log_info only.
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
             _pkg_rc=0
             safe_timeout --kill-after=10 "${_install_budget}" \
                 env DEBIAN_FRONTEND=noninteractive \
                 apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
-                install -y -q --no-install-recommends "${to_install[@]}" \
-                || _pkg_rc=$?
+                install -y -qq --no-install-recommends "${to_install[@]}" \
+                >>"$LOG_FILE" 2>&1 || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
                 case "$_pkg_rc" in
                     124) log_info "⚠️ apt-get install timed out after ${_install_budget}s (SIGTERM)" ;;
                     137) log_info "⚠️ apt-get install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
-                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
+                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}. Check $LOG_FILE for details." 1
             fi
             ;;
         yum|dnf)
@@ -2912,14 +2905,14 @@ install_missing_deps() {
                 ${extra_flags[@]+"${extra_flags[@]}"} \
                 "${_rpm_net_opts[@]}" \
                 -y "${to_install[@]}" \
-                || _pkg_rc=$?
+                >>"$LOG_FILE" 2>&1 || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
                 case "$_pkg_rc" in
                     124) log_info "⚠️ $PKG install timed out after ${_install_budget}s (SIGTERM)" ;;
                     137) log_info "⚠️ $PKG install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
-                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
+                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}. Check $LOG_FILE for details." 1
             fi
             ;;
         zypper)
@@ -2928,14 +2921,14 @@ install_missing_deps() {
             _pkg_rc=0
             safe_timeout --kill-after=10 "${_install_budget}" \
                 "$PKG" install -n "${to_install[@]}" \
-                || _pkg_rc=$?
+                >>"$LOG_FILE" 2>&1 || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
                 case "$_pkg_rc" in
                     124) log_info "⚠️ zypper install timed out after ${_install_budget}s (SIGTERM)" ;;
                     137) log_info "⚠️ zypper install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
-                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
+                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}. Check $LOG_FILE for details." 1
             fi
             ;;
         *)
