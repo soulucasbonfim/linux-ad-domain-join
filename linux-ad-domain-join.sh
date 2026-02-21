@@ -4300,15 +4300,6 @@ create_secret_passfile() {
         return 0
     fi
 
-    if $DRY_RUN; then
-        # In DRY_RUN, never materialize credentials on disk.
-        # Keep simulation non-invasive and avoid secret persistence risk.
-        PASS_FILE=""
-        unset DOMAIN_PASS
-        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Credential file creation skipped in dry-run mode"
-        return 0
-    fi
-
     local old_umask
     old_umask="$(umask)"              # Save current umask for restoration
     trap 'umask "$old_umask"; trap - RETURN' RETURN  # Restore umask when function returns
@@ -4318,13 +4309,21 @@ create_secret_passfile() {
     umask 077
 
     # Prefer tmpfs-backed directories (memory-only, no disk writes)
-    # Fallback to /tmp for legacy systems or containers without tmpfs
+    # Fallback to /tmp for non-dry-run only (may be disk-backed)
     local base=""
     if [[ -d /run && -w /run ]]; then
         base="/run"                   # systemd standard tmpfs location
     elif [[ -d /dev/shm && -w /dev/shm ]]; then
         base="/dev/shm"               # POSIX shared memory tmpfs
     else
+        if $DRY_RUN; then
+            # In DRY_RUN, never write credentials to disk-backed storage.
+            PASS_FILE=""
+            unset DOMAIN_PASS DOMAIN_PASS_BUF
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} No tmpfs available; skipping credential file to avoid disk writes"
+            return 0
+        fi
+
         base="/tmp"                   # Legacy fallback (may be disk-backed)
         log_info "⚠️ WARNING: Password file will be created in /tmp (potentially disk-backed). Consider mounting tmpfs."
     fi
@@ -4357,14 +4356,8 @@ create_secret_passfile() {
     unset DOMAIN_PASS DOMAIN_PASS_BUF
 
     if $DRY_RUN; then
-        # In DRY_RUN, do not materialize real credentials on disk.
-        # This keeps simulation non-invasive and avoids secret persistence risk.
-        PASS_FILE=""
-        unset DOMAIN_PASS DOMAIN_PASS_BUF
-        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Credential file creation skipped in dry-run mode"
-        return 0
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Credential file created in tmpfs and will be securely deleted on exit"
     fi
-
 }
 
 cleanup_secrets() {
