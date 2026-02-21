@@ -5073,9 +5073,10 @@ create_secret_passfile() {
     fi
 }
 
-cleanup_secrets() {
-    # Accept an explicit exit code when called outside the EXIT trap.
-    # If not provided, fall back to the caller's $? (works for EXIT trap usage).
+# -------------------------------------------------------------------------
+# Deferred remediations dispatcher (runs only on successful EXIT)
+# -------------------------------------------------------------------------
+dispatch_deferred_remediations() {
     local _exit_code="${1:-$?}"
 
     # Defensive: ensure numeric exit code.
@@ -5086,16 +5087,6 @@ cleanup_secrets() {
     # -------------------------------------------------------------------------
     # Deferred D-Bus restart (only on successful exit)
     # -------------------------------------------------------------------------
-    # Dispatched FIRST in the EXIT trap, before file cleanup, because:
-    #   1. All configs (sudoers, SSH, SSSD, PAM) are already committed at this point
-    #   2. The detached process (nohup+setsid) survives the script exit
-    #   3. Prevents session sluggishness observed on some distros when D-Bus
-    #      is not restarted after oddjob registration changes
-    #   4. Running in EXIT trap guarantees execution regardless of script flow
-    #
-    # Variables are passed via environment export (not interpolated in bash -c)
-    # to prevent shell injection. This is an intentional security pattern.
-    # -------------------------------------------------------------------------
     if (( _exit_code == 0 )) && \
        [[ "${_DBUS_RESTART_DEFERRED:-false}" == "true" && -n "${_DBUS_RESTART_UNIT:-}" ]]; then
         log_info "🔄 Executing deferred D-Bus remediation ($_DBUS_RESTART_UNIT)" 2>/dev/null || true
@@ -5105,11 +5096,6 @@ cleanup_secrets() {
         local _is_ssh=false
         [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" ]] && _is_ssh=true
 
-        # Export vars for the detached subshell. Single-quoted bash -c prevents
-        # shell expansion (security: no interpolation of user-controlled data).
-        #
-        # Close the inherited lock FD (9) via redirection so the detached process
-        # cannot keep the flock alive after the main script exits.
         _DBUS_UNIT_EXPORT="$_DBUS_RESTART_UNIT" \
         _IS_SSH="$_is_ssh" \
         nohup setsid bash -c '
@@ -5120,7 +5106,7 @@ cleanup_secrets() {
                 local unit="$1"
                 local svc="${unit%.service}"
 
-                if command -v systemctl >/dev/null 2>&1; then
+                if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
                     systemctl restart "$unit" >/dev/null 2>&1 || true
                     return 0
                 fi
@@ -5151,21 +5137,17 @@ cleanup_secrets() {
             # Step 3: Test if oddjobd is now responsive via D-Bus
             if dbus-send --system --dest=com.redhat.oddjob_mkhomedir --print-reply \
                 / com.redhat.oddjob_mkhomedir.Hello >/dev/null 2>&1; then
-                # Success - oddjobd operational, no full D-Bus restart needed
                 exit 0
             fi
 
             # Step 4: Full D-Bus restart as last resort (only if NOT over SSH)
             if [[ "$_IS_SSH" == "true" ]]; then
-                # Over SSH: full D-Bus restart would kill this session and all others.
-                # Log recommendation and exit; admin should reboot at a planned window.
                 logger -t linux-ad-domain-join \
                     "WARNING: oddjobd not responding after D-Bus reload. Running over SSH - skipping full D-Bus restart to preserve sessions. A planned reboot is recommended." \
                     2>/dev/null || true
                 exit 0
             fi
 
-            # Not SSH: safe to perform full restart (console/BMC/local session)
             _restart_unit "$_DBUS_UNIT_EXPORT"
             _restart_unit "oddjobd"
         ' 9>&- </dev/null >/dev/null 2>&1 &
@@ -5177,6 +5159,66 @@ cleanup_secrets() {
         else
             log_info "✅ D-Bus remediation dispatched (full restart if needed, will complete after script exit)" 2>/dev/null || true
         fi
+    fi
+
+    # -------------------------------------------------------------------------
+    # Deferred systemd-logind restart (only on successful exit)
+    # -------------------------------------------------------------------------
+    if (( _exit_code == 0 )) && \
+       [[ "${_LOGIND_RESTART_DEFERRED:-false}" == "true" && -n "${_LOGIND_RESTART_UNIT:-}" ]]; then
+
+        local _is_ssh=false
+        [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" ]] && _is_ssh=true
+
+        local _force_ssh="${LOGIND_RESTART_FORCE_SSH:-false}"
+
+        if $_is_ssh && [[ "$_force_ssh" != "true" ]]; then
+            logger -t linux-ad-domain-join \
+                "WARNING: systemd-logind restart deferred but skipped (running over SSH). If session issues persist, schedule a planned reboot or set LOGIND_RESTART_FORCE_SSH=true." \
+                2>/dev/null || true
+            log_info "⚠️  systemd-logind restart deferred but skipped over SSH (planned reboot recommended)" 2>/dev/null || true
+        else
+            log_info "🔄 Dispatching deferred systemd-logind restart ($_LOGIND_RESTART_UNIT)" 2>/dev/null || true
+
+            _LOGIND_UNIT_EXPORT="$_LOGIND_RESTART_UNIT" \
+            nohup setsid bash -c '
+                sleep 1
+
+                _restart_unit() {
+                    local unit="$1"
+                    local svc="${unit%.service}"
+
+                    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+                        systemctl restart "$unit" >/dev/null 2>&1 || true
+                        return 0
+                    fi
+
+                    if command -v service >/dev/null 2>&1; then
+                        service "$svc" restart >/dev/null 2>&1 || true
+                        return 0
+                    fi
+
+                    if [[ -x "/etc/init.d/$svc" ]]; then
+                        "/etc/init.d/$svc" restart >/dev/null 2>&1 || true
+                    fi
+                }
+
+                _restart_unit "$_LOGIND_UNIT_EXPORT"
+            ' 9>&- </dev/null >/dev/null 2>&1 &
+            disown 2>/dev/null || true
+        fi
+    fi
+}
+
+# -------------------------------------------------------------------------
+# Cleanup core (no remediations, no side effects)
+# -------------------------------------------------------------------------
+cleanup_secrets_core() {
+    local _exit_code="${1:-$?}"
+
+    # Defensive: ensure numeric exit code (kept for consistency / future use).
+    if [[ ! "$_exit_code" =~ ^[0-9]+$ ]]; then
+        _exit_code=1
     fi
 
     # Restore immutable bits on any files we unlocked
@@ -5191,8 +5233,6 @@ cleanup_secrets() {
     done
 
     # Release mkdir-based lock (if flock is unavailable).
-    # :? expansion is defense-in-depth - prevents rm -rf on empty string even if
-    # the -n guard above is accidentally removed in future maintenance.
     if [[ "${LOCK_MODE:-}" == "mkdir" && -n "${LOCK_DIR_FALLBACK:-}" ]]; then
         rm -rf "${LOCK_DIR_FALLBACK:?}" 2>/dev/null || true
     fi
@@ -5203,13 +5243,51 @@ cleanup_secrets() {
     unset DOMAIN_PASS DOMAIN_PASS_BUF
 }
 
-# Pre-declare temp file variables referenced by cleanup_secrets trap.
-# Actual values are assigned later when the files are created.
+# Pre-declare temp file variables referenced by cleanup traps.
 KRB_TRACE="" KRB_LOG="" JOIN_LOG="" TMP_LDIF=""
 
-# Deferred D-Bus restart flag (set during oddjob remediation, executed in cleanup_secrets EXIT trap)
+# Deferred D-Bus restart flag (set during oddjob remediation, executed on EXIT success)
 _DBUS_RESTART_DEFERRED=false
 _DBUS_RESTART_UNIT=""
+
+# Deferred systemd-logind restart flag (set when inline reload fails, executed on EXIT success)
+_LOGIND_RESTART_DEFERRED=false
+_LOGIND_RESTART_UNIT=""
+
+# Deterministic signal handler: cleanup core + exit with signal-appropriate code.
+terminate_on_signal() {
+    local sig="${1:-TERM}"
+    local rc=1
+
+    case "$sig" in
+        HUP)  rc=129 ;;
+        INT)  rc=130 ;;
+        TERM) rc=143 ;;
+        *)    rc=1   ;;
+    esac
+
+    # Prevent recursive trap invocation
+    trap - EXIT HUP INT TERM
+
+    # On signal abort: run cleanup only (no deferred remediations)
+    cleanup_secrets_core "$rc"
+
+    exit "$rc"
+}
+
+# Deterministic EXIT handler: capture RC once, then dispatch remediations + cleanup.
+_on_exit() {
+    local rc=$?
+    dispatch_deferred_remediations "$rc" || true
+    cleanup_secrets_core "$rc" || true
+}
+
+# EXIT: dispatch deferred remediations first (success-only inside), then cleanup core.
+trap '_on_exit' EXIT
+
+trap 'terminate_on_signal HUP'  HUP
+trap 'terminate_on_signal INT'  INT
+trap 'terminate_on_signal TERM' TERM
 
 # Deterministic signal handler: cleanup + exit with signal-appropriate code.
 # Separating signal traps from EXIT ensures the script cannot continue
@@ -7196,47 +7274,52 @@ else
 fi
 
 # -------------------------------------------------------------------------
-# Restarts systemd-logind to refresh PAM and D-Bus session handling
+# Refresh systemd-logind to pick up PAM/session changes (safe strategy)
+# - Prefer reload (non-disruptive).
+# - If reload is unsupported/fails, defer restart to EXIT (success only).
+# - Over SSH, deferred restart is skipped by default to preserve automation sessions.
+#   Set LOGIND_RESTART_FORCE_SSH=true to override.
 # -------------------------------------------------------------------------
-log_info "🔄 Starting direct execution block for systemd-logind restart"
+log_info "🔄 Refreshing systemd-logind (safe strategy)"
 
 LOGIND_UNIT="systemd-logind.service"
+_LOGIND_RESTART_FORCE_SSH="${LOGIND_RESTART_FORCE_SSH:-false}"
 
-# 1. Check for systemctl presence (Systemd environments)
-if $DRY_RUN; then
-    log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would restart ${LOGIND_UNIT} to refresh PAM/D-Bus"
-elif command -v systemctl &>/dev/null; then
-    
+if $VALIDATE_ONLY; then
+    log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would refresh ${LOGIND_UNIT} (suppressed)"
+elif $DRY_RUN; then
+    log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would reload ${LOGIND_UNIT}; if unsupported, defer restart to script exit"
+elif command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]]; then
+
     # Check if the logind unit file exists
     if systemctl list-unit-files --type=service 2>/dev/null | grep -q "^${LOGIND_UNIT}"; then
-        
-        log_info "✅ Systemd detected. Attempting restart of ${LOGIND_UNIT} to refresh PAM/D-Bus"
 
-        cmd_try systemctl restart "$LOGIND_UNIT"
+        log_info "✅ Systemd detected. Attempting reload of ${LOGIND_UNIT} to refresh PAM/session handling"
+
+        # Prefer reload (best-effort, avoids dropping sessions)
+        cmd_try systemctl reload "$LOGIND_UNIT" >/dev/null 2>&1
         if (( CMD_LAST_RC == 0 )); then
-            log_info "🚀 ${LOGIND_UNIT} restarted successfully."
+            log_info "🚀 ${LOGIND_UNIT} reloaded successfully."
         else
-            log_info "⚠️ Failed to restart ${LOGIND_UNIT}. Attempting safe reload instead."
-            cmd_try systemctl reload "$LOGIND_UNIT" >/dev/null 2>&1
-            if (( CMD_LAST_RC == 0 )); then
-                log_info "🚀 ${LOGIND_UNIT} reloaded successfully."
-            else
-                log_info "🛑 Failed to restart or reload ${LOGIND_UNIT}. Continuing script execution."
+            log_info "⚠️ ${LOGIND_UNIT} reload failed/unsupported. Deferring restart to EXIT (success only)."
+            _LOGIND_RESTART_DEFERRED=true
+            _LOGIND_RESTART_UNIT="$LOGIND_UNIT"
+
+            if [[ -n "${SSH_CONNECTION:-}" || -n "${SSH_TTY:-}" ]] && [[ "$_LOGIND_RESTART_FORCE_SSH" != "true" ]]; then
+                log_info "⚠️ Running over SSH: deferred logind restart will be skipped to preserve sessions."
+                log_info "ℹ️ If session issues persist, schedule a planned reboot (or set LOGIND_RESTART_FORCE_SSH=true)."
             fi
         fi
-        
+
     else
-        log_info "ℹ️ Systemd found, but ${LOGIND_UNIT} unit file is missing. Skipping restart."
+        log_info "ℹ️ Systemd found, but ${LOGIND_UNIT} unit file is missing. Skipping refresh."
     fi
-    
-elif command -v service &>/dev/null; then
-    # 2. SysVinit/Upstart environments (Using 'service' command)
-    
+
+elif command -v service >/dev/null 2>&1; then
+    # SysVinit/Upstart environments (Using 'service' command)
     # systemd-logind is not a SysV service; skip action gracefully.
-    log_info "ℹ️ SysVinit/Upstart detected. systemd-logind is not applicable; skipping restart."
-    
+    log_info "ℹ️ SysVinit/Upstart detected. systemd-logind is not applicable; skipping refresh."
 else
-    # 3. No known service manager
     log_info "ℹ️ Neither systemctl nor service command found. Skipping systemd-logind action."
 fi
 
