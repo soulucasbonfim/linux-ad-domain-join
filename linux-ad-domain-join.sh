@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.4.6
+# Version:     3.4.7
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2812,27 +2812,31 @@ install_missing_deps() {
     # NOTE on --kill-after=10: after SIGTERM, wait 10s then SIGKILL.
     # This gives postinst scripts a grace window to clean up.
     # NOTE: do NOT use --foreground here. Without it, timeout sends signals to
-    # the entire process group (apt → dpkg → postinst), ensuring hung children
+    # the entire process group (apt -> dpkg -> postinst), ensuring hung children
     # are killed too. With --foreground, only the direct child gets the signal.
+    #
+    # IMPORTANT: We do NOT use cmd_must here. cmd_must routes through
+    # _cmd_run_capture which redirects ALL output to a temp file, making
+    # multi-minute installs appear completely silent (the operator sees zero
+    # progress and thinks the script is stuck).
+    #
+    # We also do NOT use > >(tee ...) process substitution. The script already
+    # has a global exec > >(tee -a "$LOG_FILE") (line ~1047). Adding another
+    # tee inside a process substitution creates a nested async subshell that
+    # hangs after the command finishes (the inner tee waits for EOF on the
+    # pipe, which never comes because the outer tee holds it open).
+    #
+    # Instead, commands run with bare stdout/stderr — output flows naturally
+    # through the global tee pipeline to both console and log file.
+    # This follows the same pattern used for adcli join (line ~6218).
     # -------------------------------------------------------------------------
     local _update_budget="${PKG_UPDATE_TIMEOUT:-300}"
     local _install_budget="${PKG_INSTALL_TIMEOUT:-900}"
     local _lock_wait="${PKG_LOCK_TIMEOUT:-90}"
+    local _pkg_rc=0
 
     log_info "🔌 Installing missing packages: ${to_install[*]}"
     $VERBOSE && log_info "🧬 install_missing_deps() entered with args: $*"
-
-    # -------------------------------------------------------------------------
-    # IMPORTANT: We do NOT use cmd_must here.
-    # cmd_must → cmd_run → _cmd_run_capture redirects ALL output to a temp file,
-    # which makes multi-minute installs appear completely silent ("stuck").
-    # Instead, we run directly so output flows through the global tee pipeline
-    # (line ~1047) to both console and log file, providing live progress.
-    # On failure, we analyze the LOG_FILE for diagnostics (same parse_pkg_error).
-    # This follows the same pattern as adcli join (line ~6218).
-    # -------------------------------------------------------------------------
-    local _pkg_rc=0
-    local _pkg_log=""
 
     case "$PKG" in
         apt)
@@ -2851,58 +2855,40 @@ install_missing_deps() {
             if [[ "${_PKG_CACHE_REFRESHED:-false}" != "true" ]]; then
                 log_info "📦 Refreshing package cache..."
                 _pkg_rc=0
-                _pkg_log="$(safe_mktemp)" || _pkg_log=""
-
                 safe_timeout --kill-after=10 "${_update_budget}" \
                     env DEBIAN_FRONTEND=noninteractive \
                     apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq \
-                    >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
+                    || _pkg_rc=$?
 
                 if (( _pkg_rc != 0 )); then
-                    # Show captured output for diagnosis
-                    if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
-                        log_info "📋 apt-get update output:"
-                        parse_pkg_error "$_pkg_log" "apt-get" || true
-                    fi
-                    [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
+                    case "$_pkg_rc" in
+                        124) log_info "⚠️ apt-get update timed out after ${_update_budget}s (SIGTERM)" ;;
+                        137) log_info "⚠️ apt-get update killed after $((_update_budget + 10))s (SIGKILL)" ;;
+                    esac
                     log_error "apt-get update failed (rc=$_pkg_rc)" 1
                 fi
-                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
             else
                 $VERBOSE && log_info "ℹ️ apt-get update skipped (cache already refreshed by connectivity probe)"
             fi
 
-            # --- apt-get install (with live progress output) ---
+            # --- apt-get install (live output via global tee pipeline) ---
+            # Use -q (not -qq) so package names appear as they install.
+            # Output goes directly to stdout -> global tee -> console + log.
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
             _pkg_rc=0
-            _pkg_log="$(safe_mktemp)" || _pkg_log=""
-
-            # Output goes to both console (via tee) and capture file (for error analysis).
-            # -q (single q, not -qq) shows package names as they install but no progress bars,
-            # providing visible feedback that the script is working.
             safe_timeout --kill-after=10 "${_install_budget}" \
                 env DEBIAN_FRONTEND=noninteractive \
                 apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
                 install -y -q --no-install-recommends "${to_install[@]}" \
-                > >(tee -a "${_pkg_log:-/dev/null}") 2>&1 || _pkg_rc=$?
+                || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
-                if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
-                    log_info "📋 apt-get install output analysis:"
-                    parse_pkg_error "$_pkg_log" "apt-get" || true
-                fi
-
                 case "$_pkg_rc" in
                     124) log_info "⚠️ apt-get install timed out after ${_install_budget}s (SIGTERM)" ;;
                     137) log_info "⚠️ apt-get install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
-
-                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
                 log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
-
-            [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
-            log_info "✅ All packages installed successfully"
             ;;
         yum|dnf)
             local -a extra_flags=()
@@ -2921,64 +2907,43 @@ install_missing_deps() {
 
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
             _pkg_rc=0
-            _pkg_log="$(safe_mktemp)" || _pkg_log=""
-
             safe_timeout --kill-after=10 "${_install_budget}" \
                 "$PKG" install \
                 ${extra_flags[@]+"${extra_flags[@]}"} \
                 "${_rpm_net_opts[@]}" \
                 -y "${to_install[@]}" \
-                > >(tee -a "${_pkg_log:-/dev/null}") 2>&1 || _pkg_rc=$?
+                || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
-                if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
-                    log_info "📋 $PKG install output analysis:"
-                    parse_pkg_error "$_pkg_log" "$PKG" || true
-                fi
-
                 case "$_pkg_rc" in
                     124) log_info "⚠️ $PKG install timed out after ${_install_budget}s (SIGTERM)" ;;
                     137) log_info "⚠️ $PKG install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
-
-                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
                 log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
-
-            [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
-            log_info "✅ All packages installed successfully"
             ;;
         zypper)
+            # Zypper has no granular timeout flag; safe_timeout is the only guard.
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
             _pkg_rc=0
-            _pkg_log="$(safe_mktemp)" || _pkg_log=""
-
             safe_timeout --kill-after=10 "${_install_budget}" \
                 "$PKG" install -n "${to_install[@]}" \
-                > >(tee -a "${_pkg_log:-/dev/null}") 2>&1 || _pkg_rc=$?
+                || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
-                if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
-                    log_info "📋 zypper install output analysis:"
-                    parse_pkg_error "$_pkg_log" "zypper" || true
-                fi
-
                 case "$_pkg_rc" in
                     124) log_info "⚠️ zypper install timed out after ${_install_budget}s (SIGTERM)" ;;
                     137) log_info "⚠️ zypper install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
-
-                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
                 log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
-
-            [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
-            log_info "✅ All packages installed successfully"
             ;;
         *)
             log_error "Unsupported package manager: $PKG" 101
             ;;
     esac
+
+    log_info "✅ All packages installed successfully"
 }
 
 # Best-effort: detect current computer OU/container in AD.
