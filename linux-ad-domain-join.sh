@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.5.0
+# Version:     3.5.1
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2807,19 +2807,134 @@ install_missing_deps() {
     # OUTPUT STRATEGY: All package manager output is redirected to a TEMPORARY
     # FILE to avoid WSL2 hangs with global exec > >(tee -a "$LOG_FILE").
     #
-    # HANG ROOT CAUSE (most common on Ubuntu/WSL2 fleets):
-    # - Post-install hooks can become interactive even after payload install
-    #   (e.g., needrestart / apt-listchanges). That looks like a "hang" while
-    #   packages are already installed. We hard-disable interactive hooks via env.
+    # This function adds two operational safeguards:
+    #   1) Visible progress heartbeats while apt-get runs (tail last log line).
+    #   2) Pre-flight mitigation for dpkg/apt lock contention (packagekit/unattended/apt-daily).
     # -------------------------------------------------------------------------
     local _update_budget="${PKG_UPDATE_TIMEOUT:-300}"
     local _install_budget="${PKG_INSTALL_TIMEOUT:-900}"
     local _lock_wait="${PKG_LOCK_TIMEOUT:-90}"
+
+    # Heartbeat interval while package manager runs (seconds)
+    local _progress_interval="${PKG_PROGRESS_INTERVAL:-15}"
+
+    # How long to wait before attempting to stop conflicting systemd units (seconds)
+    local _prelock_wait="${PKG_PRELOCK_WAIT_TIMEOUT:-30}"
+
     local _pkg_rc=0
     local _pkg_log=""
 
     log_info "🔌 Installing missing packages: ${to_install[*]}"
     $VERBOSE && log_info "🧬 install_missing_deps() entered with args: $*"
+
+    # -----------------------------
+    # Internal helpers (apt only)
+    # -----------------------------
+    _apt_ps_grep() {
+        # Print potentially conflicting processes (best-effort)
+        ps -eo pid,comm,args 2>/dev/null | grep -E '(^|[[:space:]])(apt|apt-get|dpkg|unattended-upgrades|packagekitd)([[:space:]]|$)' | grep -v grep || true
+    }
+
+    _apt_conflicts_running() {
+        # Return 0 if conflicts exist, 1 otherwise
+        if command -v pgrep >/dev/null 2>&1; then
+            pgrep -x apt >/dev/null 2>&1 && return 0
+            pgrep -x apt-get >/dev/null 2>&1 && return 0
+            pgrep -x dpkg >/dev/null 2>&1 && return 0
+            pgrep -x packagekitd >/dev/null 2>&1 && return 0
+            pgrep -f unattended-upgrades >/dev/null 2>&1 && return 0
+            return 1
+        fi
+
+        _apt_ps_grep | grep -qE '.' && return 0
+        return 1
+    }
+
+    _apt_stop_conflicting_units_best_effort() {
+        # Best-effort: stop units commonly holding dpkg/apt locks.
+        # Use short timeouts to avoid systemctl hangs in constrained environments.
+        command -v systemctl >/dev/null 2>&1 || return 0
+
+        local -a units=(
+            "packagekit.service"
+            "unattended-upgrades.service"
+            "apt-daily.service"
+            "apt-daily-upgrade.service"
+            "apt-daily.timer"
+            "apt-daily-upgrade.timer"
+        )
+
+        local u
+        for u in "${units[@]}"; do
+            if systemctl list-unit-files --no-legend --no-pager "$u" 2>/dev/null | awk '{print $1}' | grep -qx "$u"; then
+                # Stop only if active; avoid changing enablement state.
+                if systemctl is-active --quiet "$u" 2>/dev/null; then
+                    $VERBOSE && log_info "🛑 Stopping conflicting unit: $u"
+                    safe_timeout 8 systemctl stop "$u" >/dev/null 2>&1 || true
+                fi
+            fi
+        done
+    }
+
+    _apt_wait_and_mitigate_lock_contention() {
+        # Wait briefly for existing apt/dpkg activity to finish.
+        # If still busy, try to stop common background updaters (best-effort).
+        local start="${SECONDS:-0}"
+        local deadline=$(( start + _prelock_wait ))
+
+        while _apt_conflicts_running; do
+            if (( (${SECONDS:-0}) >= deadline )); then
+                log_info "⚠️ Detected concurrent apt/dpkg activity (possible lock contention)."
+                $VERBOSE && { log_info "📋 Conflicting processes:"; _apt_ps_grep | while IFS= read -r l; do [[ -n "$l" ]] && log_info "   $l"; done; }
+                _apt_stop_conflicting_units_best_effort
+                break
+            fi
+            $VERBOSE && log_info "⏳ Waiting for other apt/dpkg processes to finish... (elapsed: $(( (${SECONDS:-0}) - start ))s)"
+            sleep 2
+        done
+    }
+
+    _run_with_progress() {
+        # Usage: _run_with_progress "<label>" <budget_seconds> <logfile> <command...>
+        local label="$1"; shift
+        local budget="$1"; shift
+        local logfile="$1"; shift
+
+        local start="${SECONDS:-0}"
+        local next=$(( start + _progress_interval ))
+        local last_line=""
+        local pid rc
+
+        ( safe_timeout --kill-after=10 "${budget}" "$@" >"${logfile:-/dev/null}" 2>&1 ) &
+        pid=$!
+
+        while kill -0 "$pid" 2>/dev/null; do
+            if (( (${SECONDS:-0}) >= next )); then
+                local elapsed=$(( (${SECONDS:-0}) - start ))
+                local line=""
+
+                if [[ -n "${logfile:-}" && -s "${logfile:-}" ]]; then
+                    line="$(
+                        ( tail -n 1 "$logfile" 2>/dev/null || true ) | trim_line
+                    )"
+                fi
+
+                if [[ -n "$line" && "$line" != "$last_line" ]]; then
+                    log_info "⏳ ${label} still running (${elapsed}s): $line"
+                    last_line="$line"
+                else
+                    log_info "⏳ ${label} still running (${elapsed}s)..."
+                fi
+
+                next=$(( (${SECONDS:-0}) + _progress_interval ))
+            fi
+            sleep 1
+        done
+
+        wait "$pid"
+        rc=$?
+        return "$rc"
+    }
 
     case "$PKG" in
         apt)
@@ -2846,15 +2961,19 @@ install_missing_deps() {
                 "NEEDRESTART_MODE=a"
             )
 
+            # Pre-flight: mitigate dpkg/apt lock contention (best-effort)
+            _apt_wait_and_mitigate_lock_contention
+
             # --- apt-get update (skip if probe already refreshed cache) ---
             if [[ "${_PKG_CACHE_REFRESHED:-false}" != "true" ]]; then
                 log_info "📦 Refreshing package cache..."
                 _pkg_log="$(safe_mktemp)" || _pkg_log=""
                 _pkg_rc=0
-                safe_timeout --kill-after=10 "${_update_budget}" \
+
+                _run_with_progress "apt-get update" "${_update_budget}" "${_pkg_log:-/dev/null}" \
                     env "${_apt_env[@]}" \
                     apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq \
-                    >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
+                    || _pkg_rc=$?
 
                 if (( _pkg_rc != 0 )); then
                     if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
@@ -2863,8 +2982,8 @@ install_missing_deps() {
                     fi
                     [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                     case "$_pkg_rc" in
-                        124) log_info "⚠️ apt-get update timed out after ${_update_budget}s (SIGTERM)" ;;
-                        137) log_info "⚠️ apt-get update killed after $((_update_budget + 10))s (SIGKILL)" ;;
+                        124) log_info "⚠️ apt-get update timed out after ${_update_budget}s (SIGTERM)" ;
+                        137) log_info "⚠️ apt-get update killed after $((_update_budget + 10))s (SIGKILL)" ;
                     esac
                     log_error "apt-get update failed (rc=$_pkg_rc)" 1
                 fi
@@ -2877,11 +2996,12 @@ install_missing_deps() {
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
-            safe_timeout --kill-after=10 "${_install_budget}" \
+
+            _run_with_progress "apt-get install" "${_install_budget}" "${_pkg_log:-/dev/null}" \
                 env "${_apt_env[@]}" \
                 apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
                 install -y -qq --no-install-recommends "${to_install[@]}" \
-                >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
+                || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
                 if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
@@ -2890,13 +3010,13 @@ install_missing_deps() {
                 fi
                 [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                 case "$_pkg_rc" in
-                    124) log_info "⚠️ apt-get install timed out after ${_install_budget}s (SIGTERM)" ;;
-                    137) log_info "⚠️ apt-get install killed after $((_install_budget + 10))s (SIGKILL)" ;;
+                    124) log_info "⚠️ apt-get install timed out after ${_install_budget}s (SIGTERM)" ;
+                    137) log_info "⚠️ apt-get install killed after $((_install_budget + 10))s (SIGKILL)" ;
                 esac
                 log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
             [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
-            ;;
+            ;
         yum|dnf)
             local -a extra_flags=()
             if [[ "${DISABLE_PKG_PLUGINS:-false}" == "true" ]]; then
@@ -2928,15 +3048,15 @@ install_missing_deps() {
                 fi
                 [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                 case "$_pkg_rc" in
-                    124) log_info "⚠️ $PKG install timed out after ${_install_budget}s (SIGTERM)" ;;
-                    137) log_info "⚠️ $PKG install killed after $((_install_budget + 10))s (SIGKILL)" ;;
+                    124) log_info "⚠️ $PKG install timed out after ${_install_budget}s (SIGTERM)" ;
+                    137) log_info "⚠️ $PKG install killed after $((_install_budget + 10))s (SIGKILL)" ;
                 esac
                 log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
             [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
-            ;;
+            ;
         zypper)
-            log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
+            log_info "📦 Installing ${#to_install[@]} package(s). (budget: ${_install_budget}s)"
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
             safe_timeout --kill-after=10 "${_install_budget}" \
@@ -2950,16 +3070,16 @@ install_missing_deps() {
                 fi
                 [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                 case "$_pkg_rc" in
-                    124) log_info "⚠️ zypper install timed out after ${_install_budget}s (SIGTERM)" ;;
-                    137) log_info "⚠️ zypper install killed after $((_install_budget + 10))s (SIGKILL)" ;;
+                    124) log_info "⚠️ zypper install timed out after ${_install_budget}s (SIGTERM)" ;
+                    137) log_info "⚠️ zypper install killed after $((_install_budget + 10))s (SIGKILL)" ;
                 esac
                 log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
             [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
-            ;;
+            ;
         *)
             log_error "Unsupported package manager: $PKG" 101
-            ;;
+            ;
     esac
 
     log_info "✅ All packages installed successfully"
