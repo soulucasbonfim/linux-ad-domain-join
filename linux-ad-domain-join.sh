@@ -2805,18 +2805,12 @@ install_missing_deps() {
     # Timeout budgets (seconds). Tunable via environment variables.
     #
     # OUTPUT STRATEGY: All package manager output is redirected to a TEMPORARY
-    # FILE, using the exact same pattern as the Layer 4 connectivity probe
-    # (which works on all tested environments including WSL2 containers).
+    # FILE to avoid WSL2 hangs with global exec > >(tee -a "$LOG_FILE").
     #
-    # Why not other approaches (all confirmed to hang on WSL2):
-    #   - cmd_must: _cmd_run_capture tmpfile + exec>(tee) interaction = hang
-    #   - bare stdout: apt \r chars corrupt exec>(tee) pipe state = hang
-    #   - > >(tee file): nested process substitution = hang
-    #   - >>"$LOG_FILE": dual writers on same file via different paths = hang
-    #
-    # The tmpfile approach works because it redirects to a SEPARATE file that
-    # no other process is writing to, completely decoupled from the global
-    # exec > >(tee -a "$LOG_FILE") pipeline.
+    # HANG ROOT CAUSE (most common on Ubuntu/WSL2 fleets):
+    # - Post-install hooks can become interactive even after payload install
+    #   (e.g., needrestart / apt-listchanges). That looks like a "hang" while
+    #   packages are already installed. We hard-disable interactive hooks via env.
     # -------------------------------------------------------------------------
     local _update_budget="${PKG_UPDATE_TIMEOUT:-300}"
     local _install_budget="${PKG_INSTALL_TIMEOUT:-900}"
@@ -2830,14 +2824,26 @@ install_missing_deps() {
     case "$PKG" in
         apt)
             # APT guardrails (defense-in-depth):
-            #   Dpkg::Lock::Timeout      : bounded wait for dpkg lock (vs infinite hang)
-            #   Acquire::http(s)::Timeout : per-connection I/O timeout (vs stalled download)
-            #   Acquire::Retries          : retry on transient failures
-            #   safe_timeout              : absolute wall-clock budget (kills entire process group)
+            # - Dpkg::Lock::Timeout bounds lock waits.
+            # - Acquire::*::Timeout bounds network stalls.
+            # - Dpkg::Use-Pty=0 avoids pseudo-tty progress quirks in automation.
+            # - Dpkg::Options force non-interactive conffile decisions.
+            # - Env disables interactive post-install hooks (needrestart, apt-listchanges).
             local -a _apt_opts=(
                 -o "Dpkg::Lock::Timeout=${_lock_wait}"
                 -o "Acquire::http::Timeout=30"
                 -o "Acquire::https::Timeout=30"
+                -o "Dpkg::Use-Pty=0"
+                -o "Dpkg::Options::=--force-confdef"
+                -o "Dpkg::Options::=--force-confold"
+            )
+
+            local -a _apt_env=(
+                "DEBIAN_FRONTEND=noninteractive"
+                "DEBIAN_PRIORITY=critical"
+                "DEBCONF_NONINTERACTIVE_SEEN=true"
+                "APT_LISTCHANGES_FRONTEND=none"
+                "NEEDRESTART_MODE=a"
             )
 
             # --- apt-get update (skip if probe already refreshed cache) ---
@@ -2846,7 +2852,7 @@ install_missing_deps() {
                 _pkg_log="$(safe_mktemp)" || _pkg_log=""
                 _pkg_rc=0
                 safe_timeout --kill-after=10 "${_update_budget}" \
-                    env DEBIAN_FRONTEND=noninteractive \
+                    env "${_apt_env[@]}" \
                     apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq \
                     >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
 
@@ -2872,7 +2878,7 @@ install_missing_deps() {
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
             safe_timeout --kill-after=10 "${_install_budget}" \
-                env DEBIAN_FRONTEND=noninteractive \
+                env "${_apt_env[@]}" \
                 apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
                 install -y -qq --no-install-recommends "${to_install[@]}" \
                 >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
@@ -2900,7 +2906,6 @@ install_missing_deps() {
                 extra_flags+=( -4 )
             fi
 
-            # DNF/YUM internal timeouts (defense-in-depth alongside safe_timeout)
             local -a _rpm_net_opts=(
                 --setopt=timeout=30
                 --setopt=retries=3
@@ -2931,7 +2936,6 @@ install_missing_deps() {
             [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
             ;;
         zypper)
-            # Zypper has no granular timeout flag; safe_timeout is the only guard.
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
@@ -3221,12 +3225,9 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     # This eliminates false negatives in containers/proxy/NAT environments
     # while guaranteeing bounded execution time when truly offline.
     #
-    # Budget summary (worst-case wall-clock when offline):
-    #   Layer 1 (route):    ~0s   (local, no network I/O)
-    #   Layer 2 (DNS):      ~5s   (safe_timeout 5 + kill-after 2)
-    #   Layer 3 (TCP):      ~8s   (3 hosts × safe_timeout 2 + kill-after 1)
-    #   Layer 4 (pkg-mgr):  ~37s  (safe_timeout 30 + kill-after 5 + overhead)
-    #   Total max:          ~50s
+    # Output policy:
+    #   - VERBOSE: print full diagnostic summary (layers + probe details).
+    #   - NORMAL : print only the final decision line (no per-layer spam).
     # -------------------------------------------------------------------------
     log_info "🌐 Checking Internet connectivity for package installation"
     HAS_INTERNET=false
@@ -3238,15 +3239,9 @@ if (( ${#missing_pkgs[@]} > 0 )); then
 
     # =====================================================================
     # Layer 1: Default route detection (best-effort, informational only)
-    # On minimal/container images, `ip` is often missing (iproute2 not yet installed).
-    # Falls back to /proc/net/route (always available on Linux kernels).
     # =====================================================================
     _has_default_route=false
     if command -v ip >/dev/null 2>&1; then
-        # Use `ip route show default` instead of `ip route get <IP>`:
-        # - Does not require an external IP to exist
-        # - Does not generate network traffic
-        # - Works even when the routing table has no route to specific hosts
         _route_out="$(ip route show default 2>/dev/null | head -n1 || true)"
         if [[ -n "$_route_out" ]]; then
             _has_default_route=true
@@ -3255,8 +3250,6 @@ if (( ${#missing_pkgs[@]} > 0 )); then
             CONNECT_DETAILS+=( "⚠️ No default route detected via ip" )
         fi
     elif [[ -r /proc/net/route ]]; then
-        # Kernel route table: Destination=00000000 means default route.
-        # Works on every Linux kernel regardless of userspace tools.
         if awk 'NR>1 && $2=="00000000" {found=1; exit} END{exit !found}' /proc/net/route 2>/dev/null; then
             _has_default_route=true
             CONNECT_DETAILS+=( "✅ Default route detected (/proc/net/route)" )
@@ -3269,13 +3262,11 @@ if (( ${#missing_pkgs[@]} > 0 )); then
 
     # =====================================================================
     # Layer 2: DNS resolution (informational only)
-    # Timeout budget: 5s hard + 2s kill-after = 7s max.
     # =====================================================================
     DNS_SERVER="$(grep -m1 '^nameserver' /etc/resolv.conf 2>/dev/null | awk '{print $2}' || true)"
     if [[ -z "$DNS_SERVER" ]]; then
         CONNECT_DETAILS+=( "⚠️ No DNS servers configured in /etc/resolv.conf" )
     else
-        # Guard against missing getent (very minimal images)
         if command -v getent >/dev/null 2>&1; then
             if safe_timeout --kill-after=2 5 getent hosts example.com >/dev/null 2>&1; then
                 CONNECT_DETAILS+=( "✅ DNS resolution working (resolver: $DNS_SERVER)" )
@@ -3289,15 +3280,10 @@ if (( ${#missing_pkgs[@]} > 0 )); then
 
     # =====================================================================
     # Layer 3: TCP probe to public endpoints (informational only)
-    # In allowlist/proxy environments these WILL fail even when the package
-    # manager works fine. That is expected and not a blocker.
-    # Timeout budget per host: 2s + 1s kill-after = 3s max.
     # =====================================================================
     NET_TEST_HOSTS=( "1.1.1.1" "8.8.8.8" "9.9.9.9" )
     NET_OK=false
     for H in "${NET_TEST_HOSTS[@]}"; do
-        # Variables passed as positional args to prevent injection if NET_TEST_HOSTS
-        # is ever made configurable. Same pattern as tcp_port_open().
         if safe_timeout --kill-after=1 2 bash -c 'echo > "/dev/tcp/$1/443"' _ "$H" 2>/dev/null; then
             CONNECT_DETAILS+=( "✅ TCP/443 reachable (host $H)" )
             NET_OK=true
@@ -3308,60 +3294,36 @@ if (( ${#missing_pkgs[@]} > 0 )); then
             break
         fi
     done
-
     if [[ "$NET_OK" != true ]]; then
         CONNECT_DETAILS+=( "⚠️ No outbound TCP on ports 80/443 (may be normal behind proxy)" )
     fi
 
     # =====================================================================
-    # Layer 4: AUTHORITATIVE package-manager probe with bounded timeout.
-    # =====================================================================
-    # This is the definitive test: if the package manager can reach its
-    # repos, the system CAN install packages, regardless of what Layers
-    # 1-3 say.
-    #
-    # Defense-in-depth against hangs:
-    #   PRIMARY:   safe_timeout --kill-after (coreutils timeout; kills process group)
-    #   SECONDARY: APT Acquire::*::Timeout / DNF --setopt=timeout (pkg-manager internal;
-    #              works even if timeout(1) were somehow absent)
-    #
-    # Budget: 30s SIGTERM + 5s SIGKILL = 35s absolute max.
+    # Layer 4: AUTHORITATIVE package-manager probe with bounded timeout
     # =====================================================================
     PKG_PROBE_OK=false
-    PKG_PROBE_NETFAIL=false      # true only for confirmed timeout/kill (rc 124/137)
+    PKG_PROBE_NETFAIL=false
     _PKG_PROBE_TIMEOUT=30
     _PKG_PROBE_KILL_AFTER=5
 
     if $VALIDATE_ONLY; then
-        # VALIDATE_ONLY: zero network I/O — use heuristics only
         CONNECT_DETAILS+=( "ℹ️ Package manager probe skipped (VALIDATE_ONLY mode)" )
         if [[ "$NET_OK" == true ]] || [[ "$_has_default_route" == true ]]; then
             PKG_PROBE_OK=true
             CONNECT_DETAILS+=( "ℹ️ Heuristics suggest connectivity may be available" )
         fi
     elif $DRY_RUN; then
-        # DRY_RUN: zero network I/O, zero hard fail
         CONNECT_DETAILS+=( "ℹ️ Package manager probe skipped (DRY_RUN mode)" )
         if [[ "$NET_OK" == true ]] || [[ "$_has_default_route" == true ]]; then
             PKG_PROBE_OK=true
         fi
     else
-        # --- Normal execution: definitive probe ---
-        if ! $HAS_TIMEOUT; then
-            log_info "ℹ️ timeout(1) not available — probe relies on package manager internal timeouts only"
-        fi
-
-        log_info "🔍 Testing package manager connectivity (timeout: ${_PKG_PROBE_TIMEOUT}s)..."
+        $VERBOSE && log_info "🔍 Testing package manager connectivity (timeout: ${_PKG_PROBE_TIMEOUT}s)..."
         _probe_log="$(safe_mktemp)" || _probe_log=""
         _probe_rc=0
 
         case "$PKG" in
             apt)
-                # Dpkg::Lock::Timeout=10  : fail after 10s if dpkg lock is held (vs hang forever)
-                # Acquire::Retries=0      : no retries in probe (fast pass/fail)
-                # Acquire::http::Timeout=15, Acquire::https::Timeout=15:
-                #   Internal safety net — bounds each connection even if safe_timeout
-                #   cannot enforce kill (defense-in-depth).
                 safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
                     env DEBIAN_FRONTEND=noninteractive \
                     apt-get update -qq \
@@ -3372,8 +3334,6 @@ if (( ${#missing_pkgs[@]} > 0 )); then
                     >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
                 ;;
             dnf)
-                # --setopt=timeout=15 : connection timeout (internal safety net)
-                # --setopt=retries=0  : no retries in probe
                 safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
                     dnf makecache --timer -q \
                         --setopt=timeout=15 \
@@ -3388,7 +3348,6 @@ if (( ${#missing_pkgs[@]} > 0 )); then
                     >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
                 ;;
             zypper)
-                # Zypper has no granular timeout flag; rely on safe_timeout as primary.
                 safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
                     zypper refresh -q \
                     >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
@@ -3404,45 +3363,28 @@ if (( ${#missing_pkgs[@]} > 0 )); then
             _PKG_CACHE_REFRESHED=true
             CONNECT_DETAILS+=( "✅ Package manager probe succeeded ($PKG metadata refresh)" )
         else
-            # Classify failure: timeout (network) vs package-manager error (GPG/repo/lock)
             case "$_probe_rc" in
-                124)
-                    PKG_PROBE_NETFAIL=true
-                    CONNECT_DETAILS+=( "🛑 Package manager probe timed out after ${_PKG_PROBE_TIMEOUT}s (SIGTERM, rc=124)" )
-                    ;;
-                137)
-                    PKG_PROBE_NETFAIL=true
-                    CONNECT_DETAILS+=( "🛑 Package manager probe killed after $((_PKG_PROBE_TIMEOUT + _PKG_PROBE_KILL_AFTER))s (SIGKILL, rc=137)" )
-                    ;;
-                *)
-                    # NOT a timeout — could be GPG, repo, lock, CA, etc.
-                    # Do NOT flag as network failure.
-                    CONNECT_DETAILS+=( "🛑 Package manager probe failed ($PKG, rc=$_probe_rc)" )
-                    ;;
+                124) PKG_PROBE_NETFAIL=true; CONNECT_DETAILS+=( "🛑 Package manager probe timed out after ${_PKG_PROBE_TIMEOUT}s (rc=124)" ) ;;
+                137) PKG_PROBE_NETFAIL=true; CONNECT_DETAILS+=( "🛑 Package manager probe killed after $((_PKG_PROBE_TIMEOUT + _PKG_PROBE_KILL_AFTER))s (rc=137)" ) ;;
+                *)   CONNECT_DETAILS+=( "🛑 Package manager probe failed ($PKG, rc=$_probe_rc)" ) ;;
             esac
 
-            # Run parse_pkg_error for actionable diagnostics
             if [[ -n "$_probe_log" && -s "$_probe_log" ]]; then
-                log_info "📋 Package manager probe output analysis:"
-                parse_pkg_error "$_probe_log" "$PKG" || true
+                $VERBOSE && log_info "📋 Package manager probe output analysis:"
+                $VERBOSE && parse_pkg_error "$_probe_log" "$PKG" || true
             fi
         fi
 
-        # Cleanup probe log
         [[ -n "${_probe_log:-}" ]] && rm -f "$_probe_log" 2>/dev/null || true
     fi
 
     # =====================================================================
     # Final decision
-    # PKG_PROBE_OK is authoritative when executed. Heuristics are fallback
-    # for VALIDATE_ONLY / DRY_RUN / no-timeout scenarios.
     # =====================================================================
     if [[ "$PKG_PROBE_OK" == true ]]; then
         HAS_INTERNET=true
         CONNECT_DETAILS+=( "🌐 Connectivity confirmed (package manager can reach repositories)" )
     elif [[ "$NET_OK" == true ]]; then
-        # TCP probes passed but pkg manager failed — possible repo issue (GPG, CA, mirror).
-        # Let install_missing_deps attempt and produce its own error.
         HAS_INTERNET=true
         CONNECT_DETAILS+=( "⚠️ TCP probes passed but package manager probe failed — proceeding with caution" )
     else
@@ -3451,22 +3393,26 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     fi
 
     # =====================================================================
-    # Logging connectivity summary
+    # Logging connectivity summary (VERBOSE-only); NORMAL prints only final line
     # =====================================================================
-    log_info "📡 Connectivity diagnostic summary:"
-    for line in "${CONNECT_DETAILS[@]}"; do
-        line_sanitized="$(sanitize_log_msg <<< "$line")"
-        line_colored="$(colorize_tag "$line_sanitized")"
-        log_info "   ${line_colored}"
-    done
+    if $VERBOSE; then
+        log_info "📡 Connectivity diagnostic summary:"
+        for line in "${CONNECT_DETAILS[@]}"; do
+            line_sanitized="$(sanitize_log_msg <<< "$line")"
+            line_colored="$(colorize_tag "$line_sanitized")"
+            log_info "   ${line_colored}"
+        done
+    else
+        if (( ${#CONNECT_DETAILS[@]} > 0 )); then
+            _last="${CONNECT_DETAILS[$(( ${#CONNECT_DETAILS[@]} - 1 ))]}"
+            _last_s="$(sanitize_log_msg <<< "$_last")"
+            _last_c="$(colorize_tag "$_last_s")"
+            log_info "${_last_c}"
+        fi
+    fi
 
     # =====================================================================
     # Fail-fast decision
-    # CRITICAL: exit 100 is ONLY for confirmed network failures (timeouts).
-    # If the probe failed with a non-timeout rc (GPG, repo, lock), we do
-    # NOT exit 100 — instead we let install_missing_deps attempt the install
-    # so cmd_must + parse_pkg_error provide the real, actionable error.
-    # This prevents misdiagnosing "GPG key missing" as "system is offline".
     # =====================================================================
     if [[ "$HAS_INTERNET" == "false" ]]; then
         if $VALIDATE_ONLY; then
@@ -3475,11 +3421,8 @@ if (( ${#missing_pkgs[@]} > 0 )); then
             log_info "${C_YELLOW}[DRY-RUN]${C_RESET} ⚠ All connectivity probes failed. In normal mode this could abort. Missing packages: ${missing_pkgs[*]}"
         else
             if [[ "$PKG_PROBE_NETFAIL" == true ]]; then
-                # Confirmed timeout → system genuinely cannot reach repos
                 log_error "Missing packages (${missing_pkgs[*]}) and system is offline (package manager probe timed out after ${_PKG_PROBE_TIMEOUT}s) - cannot install" 100
             else
-                # Probe failed but NOT from timeout → might be GPG/repo/lock.
-                # Let install_missing_deps attempt; it will give the real error.
                 log_info "⚠ Connectivity probe failed (non-timeout); package installation will be attempted — failures will be classified by package manager output."
             fi
         fi
