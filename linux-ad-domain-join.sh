@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.4.8
+# Version:     3.4.9
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2803,30 +2803,26 @@ install_missing_deps() {
 
     # -------------------------------------------------------------------------
     # Timeout budgets (seconds). Tunable via environment variables.
-    # These protect against: lock contention, stalled downloads, hung postinst.
     #
-    # PKG_UPDATE_TIMEOUT  : apt-get update / dnf makecache (metadata only)
-    # PKG_INSTALL_TIMEOUT : apt-get install / dnf install (download + unpack + postinst)
-    # PKG_LOCK_TIMEOUT    : APT dpkg lock wait (prevents infinite wait on lock)
+    # OUTPUT STRATEGY: All package manager output is redirected to a TEMPORARY
+    # FILE, using the exact same pattern as the Layer 4 connectivity probe
+    # (which works on all tested environments including WSL2 containers).
     #
-    # NOTE on --kill-after=10: after SIGTERM, wait 10s then SIGKILL.
-    # This gives postinst scripts a grace window to clean up.
-    # NOTE: do NOT use --foreground here. Without it, timeout sends signals to
-    # the entire process group (apt -> dpkg -> postinst), ensuring hung children
-    # are killed too. With --foreground, only the direct child gets the signal.
+    # Why not other approaches (all confirmed to hang on WSL2):
+    #   - cmd_must: _cmd_run_capture tmpfile + exec>(tee) interaction = hang
+    #   - bare stdout: apt \r chars corrupt exec>(tee) pipe state = hang
+    #   - > >(tee file): nested process substitution = hang
+    #   - >>"$LOG_FILE": dual writers on same file via different paths = hang
     #
-    # OUTPUT STRATEGY: All package manager output is redirected to LOG_FILE
-    # directly (>>"$LOG_FILE" 2>&1), BYPASSING the global exec > >(tee)
-    # pipeline entirely. This prevents three confirmed hang scenarios:
-    #   1. cmd_must -> _cmd_run_capture: redirects to tmpfile, silent hang
-    #   2. > >(tee -a file): nested process substitution, async subshell hang
-    #   3. bare stdout through exec >(tee): apt \r chars corrupt pipe state, hang
-    # The operator sees clean log_info messages; full output is in the log file.
+    # The tmpfile approach works because it redirects to a SEPARATE file that
+    # no other process is writing to, completely decoupled from the global
+    # exec > >(tee -a "$LOG_FILE") pipeline.
     # -------------------------------------------------------------------------
     local _update_budget="${PKG_UPDATE_TIMEOUT:-300}"
     local _install_budget="${PKG_INSTALL_TIMEOUT:-900}"
     local _lock_wait="${PKG_LOCK_TIMEOUT:-90}"
     local _pkg_rc=0
+    local _pkg_log=""
 
     log_info "🔌 Installing missing packages: ${to_install[*]}"
     $VERBOSE && log_info "🧬 install_missing_deps() entered with args: $*"
@@ -2847,41 +2843,53 @@ install_missing_deps() {
             # --- apt-get update (skip if probe already refreshed cache) ---
             if [[ "${_PKG_CACHE_REFRESHED:-false}" != "true" ]]; then
                 log_info "📦 Refreshing package cache..."
+                _pkg_log="$(safe_mktemp)" || _pkg_log=""
                 _pkg_rc=0
                 safe_timeout --kill-after=10 "${_update_budget}" \
                     env DEBIAN_FRONTEND=noninteractive \
                     apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq \
-                    >>"$LOG_FILE" 2>&1 || _pkg_rc=$?
+                    >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
 
                 if (( _pkg_rc != 0 )); then
+                    if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
+                        log_info "📋 apt-get update output:"
+                        parse_pkg_error "$_pkg_log" "apt-get" || true
+                    fi
+                    [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                     case "$_pkg_rc" in
                         124) log_info "⚠️ apt-get update timed out after ${_update_budget}s (SIGTERM)" ;;
                         137) log_info "⚠️ apt-get update killed after $((_update_budget + 10))s (SIGKILL)" ;;
                     esac
-                    log_error "apt-get update failed (rc=$_pkg_rc). Check $LOG_FILE for details." 1
+                    log_error "apt-get update failed (rc=$_pkg_rc)" 1
                 fi
+                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
             else
                 $VERBOSE && log_info "ℹ️ apt-get update skipped (cache already refreshed by connectivity probe)"
             fi
 
             # --- apt-get install ---
-            # Output goes directly to LOG_FILE, bypassing the global tee pipeline.
-            # Console feedback via log_info only.
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
+            _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
             safe_timeout --kill-after=10 "${_install_budget}" \
                 env DEBIAN_FRONTEND=noninteractive \
                 apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
                 install -y -qq --no-install-recommends "${to_install[@]}" \
-                >>"$LOG_FILE" 2>&1 || _pkg_rc=$?
+                >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
+                if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
+                    log_info "📋 apt-get install output:"
+                    parse_pkg_error "$_pkg_log" "apt-get" || true
+                fi
+                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                 case "$_pkg_rc" in
                     124) log_info "⚠️ apt-get install timed out after ${_install_budget}s (SIGTERM)" ;;
                     137) log_info "⚠️ apt-get install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
-                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}. Check $LOG_FILE for details." 1
+                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
+            [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
             ;;
         yum|dnf)
             local -a extra_flags=()
@@ -2899,37 +2907,51 @@ install_missing_deps() {
             )
 
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
+            _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
             safe_timeout --kill-after=10 "${_install_budget}" \
                 "$PKG" install \
                 ${extra_flags[@]+"${extra_flags[@]}"} \
                 "${_rpm_net_opts[@]}" \
                 -y "${to_install[@]}" \
-                >>"$LOG_FILE" 2>&1 || _pkg_rc=$?
+                >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
+                if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
+                    log_info "📋 $PKG install output:"
+                    parse_pkg_error "$_pkg_log" "$PKG" || true
+                fi
+                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                 case "$_pkg_rc" in
                     124) log_info "⚠️ $PKG install timed out after ${_install_budget}s (SIGTERM)" ;;
                     137) log_info "⚠️ $PKG install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
-                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}. Check $LOG_FILE for details." 1
+                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
+            [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
             ;;
         zypper)
             # Zypper has no granular timeout flag; safe_timeout is the only guard.
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
+            _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
             safe_timeout --kill-after=10 "${_install_budget}" \
                 "$PKG" install -n "${to_install[@]}" \
-                >>"$LOG_FILE" 2>&1 || _pkg_rc=$?
+                >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
 
             if (( _pkg_rc != 0 )); then
+                if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
+                    log_info "📋 zypper install output:"
+                    parse_pkg_error "$_pkg_log" "zypper" || true
+                fi
+                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                 case "$_pkg_rc" in
                     124) log_info "⚠️ zypper install timed out after ${_install_budget}s (SIGTERM)" ;;
                     137) log_info "⚠️ zypper install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
-                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}. Check $LOG_FILE for details." 1
+                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
+            [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
             ;;
         *)
             log_error "Unsupported package manager: $PKG" 101
