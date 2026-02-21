@@ -2971,7 +2971,7 @@ if (( ${#missing_pkgs[@]} > 0 )); then
                     # Backup existing RPM database
                     # (backup_file does not support directories - use cp -a directly)
                     if [[ -d /var/lib/rpm ]]; then
-                        backup_path="/var/lib/rpm.bak.$(date +%F_%H-%M)"
+                        backup_path="/var/lib/rpm.bak.$(date +%F_%H-%M-%S)_$$"
                         cp -a /var/lib/rpm "$backup_path" 2>/dev/null || true
                         log_info "💾 Backup created at: $backup_path"
                     fi
@@ -3518,8 +3518,11 @@ if tcp_port_open "$LDAP_SERVER" 636 3; then
     log_info "ℹ LDAPS (TCP/636) available but not used - GSSAPI Sign&Seal provides encryption (SSF:256)"
 fi
 
-# Attempt STARTTLS as optional defense-in-depth layer on top of GSSAPI
-if safe_timeout 5 ldapsearch -x -H "$LDAP_URI" -ZZ -b "" -s base namingContexts >/dev/null 2>&1; then
+# Attempt STARTTLS as optional defense-in-depth layer on top of GSSAPI.
+# Probe uses GSSAPI (not simple bind) to match production authentication method.
+# This avoids false positives where STARTTLS works with simple bind but fails
+# with GSSAPI due to channel binding enforcement (LdapEnforceChannelBinding=2).
+if safe_timeout 5 ldapsearch -Y GSSAPI -H "$LDAP_URI" -ZZ -b "" -s base namingContexts >/dev/null 2>&1; then
     LDAP_TLS_FLAG="-ZZ"
     log_info "✅ LDAP STARTTLS available - layered on top of GSSAPI for defense-in-depth"
 else
@@ -6427,11 +6430,35 @@ if [[ "$GRP_SSH" == *" "* || "$GRP_SSH_ALL" == *" "* ]]; then
     [[ "$GRP_SSH_ALL" == *" "* ]] && log_info "   ↪ '$GRP_SSH_ALL' contains spaces"
     log_info "ℹ SSH access control enforced exclusively by SSSD simple_allow_groups"
 
-    # Remove any pre-existing AllowGroups from global section (stale from previous run)
+    # Remove AllowGroups only from the GLOBAL section (preserve Match blocks).
     if grep -qiE '^[[:space:]]*AllowGroups[[:space:]]' "$SSH_CFG" 2>/dev/null; then
-        cmd_must sed -i '/^[[:space:]]*AllowGroups[[:space:]]/d' "$SSH_CFG"
-        if ! $DRY_RUN && ! $VALIDATE_ONLY; then
-            log_info "🧹 Removed pre-existing AllowGroups directive from $SSH_CFG"
+        if $VALIDATE_ONLY; then
+            log_info "${C_MAGENTA}[VALIDATE-ONLY]${C_RESET} Would remove global AllowGroups from $SSH_CFG (preserving Match blocks)"
+        elif $DRY_RUN; then
+            log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would remove global AllowGroups from $SSH_CFG (preserving Match blocks)"
+        else
+            tmp="$(safe_mktemp "${SSH_CFG}.XXXXXX")"
+
+            awk '
+                BEGIN { in_match=0 }
+                /^[[:space:]]*Match[[:space:]]+/ { in_match=1; print; next }
+                {
+                    if (in_match==0) {
+                        line=$0
+                        sub(/^[[:space:]]+/, "", line)
+                        n=split(line, parts, /[[:space:]]+/)
+                        if (n>=1 && parts[1]=="AllowGroups") next
+                    }
+                    print
+                }
+            ' "$SSH_CFG" >"$tmp" || { rm -f "$tmp"; log_error "Failed to render updated sshd_config without global AllowGroups" 1; }
+
+            chown --reference="$SSH_CFG" "$tmp" 2>/dev/null || true
+            chmod --reference="$SSH_CFG" "$tmp" 2>/dev/null || true
+            mv -f "$tmp" "$SSH_CFG" || { rm -f "$tmp"; log_error "Failed to install updated $SSH_CFG" 1; }
+
+            selinux_restore "$SSH_CFG"
+            log_info "🧹 Removed global AllowGroups directive from $SSH_CFG (Match blocks preserved)"
         fi
     fi
 else
@@ -6958,10 +6985,13 @@ Cmnd_Alias SEC_ALL_CMDS = \\
 # Scope:
 # - Full operational administration
 # - Explicitly excluded from security posture changes (!SEC_ALL_CMDS)
-# - Cannot obtain interactive root shell
-# - Cannot invoke interpreters (python, perl, ruby, etc.)
-# - Cannot write directly to sudoers (use visudo)
-# - Cannot reset root password (SUPER only)
+# - Direct shell commands are denied via sudo (!ROOT_SHELLS), but:
+#   IMPORTANT: With NOPASSWD: ALL this is NOT a hard security boundary.
+#   Users can still achieve root-equivalent outcomes using other allowed
+#   binaries (this is a governance guardrail, not a confinement mechanism).
+# - Interpreters are denied via sudo (!PRIV_ESC) to reduce easy escalation paths
+# - Direct writes to sudoers are denied (!SEC_SUDOERS_WRITE); use visudo
+# - Root password reset is denied for ADM (!SEC_CREDENTIALS); SUPER only
 #
 # NOTE: Spaces in group names are backslash-escaped inline (sudoers requirement).
 # ========================================================================
@@ -6973,13 +7003,14 @@ Cmnd_Alias SEC_ALL_CMDS = \\
 # FULL ADMINISTRATORS (SUPER)
 # ========================================================================
 # Scope:
-# - Full operational + security administration
-# - Union of ADM and SEC privileges
-# - File editing via sudoedit (editor runs unprivileged - no root escape)
-# - Cannot obtain interactive root shell
-# - Cannot invoke interpreters (python, perl, ruby, etc.)
-# - Cannot write directly to sudoers (defense-in-depth; use visudo)
-# - CAN reset root password (only role with this privilege)
+# - Full operational + security administration (root-equivalent)
+# - File editing via sudoedit (editor runs unprivileged)
+# - Direct shell commands are denied via sudo (!ROOT_SHELLS), but:
+#   IMPORTANT: With NOPASSWD: ALL this is NOT a hard security boundary.
+#   Treat these denies as guardrails and audit signals, not confinement.
+# - Interpreters denied via sudo (!PRIV_ESC)
+# - Direct writes to sudoers denied (!SEC_SUDOERS_WRITE); use visudo
+# - Root password reset allowed for SUPER (only role with this privilege)
 #
 # NOTE:
 # - Membership in SUPER replaces ADM and SEC
