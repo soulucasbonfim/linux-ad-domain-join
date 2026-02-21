@@ -2701,8 +2701,8 @@ discover_nearest_dc() {
         return 0
     fi
 
-    # ── Multiple DCs - parallel ping, pick lowest latency ──
-    local ping_tmp _dc _dc_l _dc_ip _dc_avg _running=0
+    # ── Multiple DCs - parallel probe, pick lowest latency ──
+    local ping_tmp _dc _dc_l _dc_ip _dc_avg _t0 _t1 _elapsed _tcp_host _running=0
     ping_tmp="$(mktemp_try /tmp/.dc-ping.XXXXXX)" || {
         # mktemp failed - fall back to first candidate
         echo "${dc_arr[0]}"
@@ -2726,8 +2726,25 @@ discover_nearest_dc() {
             fi
             [[ -z "$_dc_ip" ]] && return
 
+            # ICMP RTT (preferred when available).
             _dc_avg="$(ping -c 1 -W 1 -q "$_dc_ip" 2>/dev/null \
                 | awk -F'/' '/^(rtt|round-trip)/ {printf "%.3f", $5}')" || true
+
+            # If ICMP is blocked/dropped (common in Zero-Trust), fall back to a TCP connect RTT to LDAP (389).
+            if [[ -z "$_dc_avg" || "$_dc_avg" == "0.000" ]]; then
+                _tcp_host="$_dc_ip"
+                [[ "$_tcp_host" == *:* && "$_tcp_host" != \[*\] ]] && _tcp_host="[$_tcp_host]"
+
+                _t0="$(now_ms)"
+                if tcp_port_open "$_tcp_host" 389 1; then
+                    _t1="$(now_ms)"
+                    _elapsed=$(( _t1 - _t0 ))
+                    if [[ "$_elapsed" =~ ^[0-9]+$ ]] && (( _elapsed > 0 )); then
+                        _dc_avg="$(awk -v ms="$_elapsed" 'BEGIN { printf "%.3f", ms }')"
+                    fi
+                fi
+            fi
+
             if [[ -n "$_dc_avg" && "$_dc_avg" != "0.000" ]]; then
                 # Use flock for atomic append (prevents interleaved writes from parallel subshells).
                 # Variables are passed as positional args to bash -c (not interpolated in the
@@ -2759,7 +2776,7 @@ discover_nearest_dc() {
         return 0
     fi
 
-    # All pings failed - return first candidate
+    # All probes failed - return first candidate
     echo "${dc_arr[0]}"
     return 0
 }
@@ -2966,7 +2983,8 @@ install_missing_deps() {
     case "$PKG" in
         apt)
             # APT guardrails (defense-in-depth):
-            # - Dpkg::Lock::Timeout bounds lock waits.
+            # - Dpkg::Lock::Timeout bounds lock waits on newer apt; on older apt it may be best-effort.
+            #   We still mitigate lock contention in user-space via _apt_wait_and_mitigate_lock_contention.
             # - Acquire::*::Timeout bounds network stalls.
             # - Dpkg::Use-Pty=0 avoids pseudo-tty progress quirks in automation.
             # - Dpkg::Options force non-interactive conffile decisions.
