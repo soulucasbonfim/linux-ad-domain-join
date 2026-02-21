@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.5.3
+# Version:     3.5.4
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2815,6 +2815,11 @@ install_missing_deps() {
     local _install_budget="${PKG_INSTALL_TIMEOUT:-900}"
     local _lock_wait="${PKG_LOCK_TIMEOUT:-90}"
 
+    # Validate all numeric budget knobs (same pattern as LDAP_TIMEOUT et al.)
+    [[ "$_update_budget" =~ ^[1-9][0-9]*$ ]] || _update_budget=300
+    [[ "$_install_budget" =~ ^[1-9][0-9]*$ ]] || _install_budget=900
+    [[ "$_lock_wait" =~ ^[1-9][0-9]*$ ]] || _lock_wait=90
+
     # Heartbeat interval while package manager runs (seconds). Set to 0 to disable.
     local _progress_interval="${PKG_PROGRESS_INTERVAL:-15}"
 
@@ -2825,7 +2830,7 @@ install_missing_deps() {
     local _lock_wait_fast="${PKG_LOCK_TIMEOUT_FAST:-5}"
 
     # How long to wait before attempting to stop conflicting systemd units (seconds)
-    local _prelock_wait="${PKG_PRELOCK_WAIT_TIMEOUT:-30}"
+    local _prelock_wait="${PKG_PRELOCK_WAIT_TIMEOUT:-10}"
 
     # Normalize numeric knobs (avoid accidental busy loops / invalid values)
     [[ "$_progress_interval" =~ ^[0-9]+$ ]] || _progress_interval=15
@@ -2866,6 +2871,11 @@ install_missing_deps() {
         # Use short timeouts to avoid systemctl hangs in constrained environments.
         command -v systemctl >/dev/null 2>&1 || return 0
 
+        # Single systemctl call to get all active units (avoids N×2 forks)
+        local _active_units=""
+        _active_units="$(systemctl list-units --no-legend --no-pager --state=active \
+            --plain -t service,timer 2>/dev/null || true)"
+
         local -a units=(
             "packagekit.service"
             "unattended-upgrades.service"
@@ -2877,12 +2887,9 @@ install_missing_deps() {
 
         local u
         for u in "${units[@]}"; do
-            if systemctl list-unit-files --no-legend --no-pager "$u" 2>/dev/null | awk '{print $1}' | grep -qx "$u"; then
-                # Stop only if active; avoid changing enablement state.
-                if systemctl is-active --quiet "$u" 2>/dev/null; then
-                    $VERBOSE && log_info "🛑 Stopping conflicting unit: $u"
-                    safe_timeout 8 systemctl stop "$u" >/dev/null 2>&1 || true
-                fi
+            if echo "$_active_units" | grep -qw "$u"; then
+                $VERBOSE && log_info "🛑 Stopping conflicting unit: $u"
+                safe_timeout 8 systemctl stop "$u" >/dev/null 2>&1 || true
             fi
         done
     }
@@ -2913,55 +2920,35 @@ install_missing_deps() {
         grep -qiE 'Could not get lock|Unable to acquire the dpkg frontend lock|dpkg frontend lock is locked|is another process using it' "$log"
     }
 
-    _run_with_progress() {
-        # Usage: _run_with_progress "<label>" <budget_seconds> <logfile> <command...>
+    _run_with_timeout() {
+        # Usage: _run_with_timeout "<label>" <budget_seconds> <logfile> <command...>
+        # Runs command with timeout, redirecting output to logfile.
+        # Heartbeat is emitted only if command exceeds _progress_threshold seconds.
         local label="$1"; shift
         local budget="$1"; shift
         local logfile="$1"; shift
 
         local start="${SECONDS:-0}"
-        local next
-        local last_line=""
-        local pid rc
+        local rc=0
 
-        # If interval is disabled (0), run quietly without heartbeats.
-        if (( _progress_interval < 1 )); then
-            safe_timeout --kill-after=10 "${budget}" "$@" >"${logfile:-/dev/null}" 2>&1
-            return $?
-        fi
+        # Direct execution: no extra subshell, no per-second polling.
+        # safe_timeout already handles SIGTERM+SIGKILL escalation.
+        safe_timeout --kill-after=10 "${budget}" "$@" >"${logfile:-/dev/null}" 2>&1 &
+        local pid=$!
 
-        next=$(( start + _progress_interval ))
-
-        ( safe_timeout --kill-after=10 "${budget}" "$@" >"${logfile:-/dev/null}" 2>&1 ) &
-        pid=$!
-
+        # Lightweight wait with optional heartbeat (only after threshold)
         while kill -0 "$pid" 2>/dev/null; do
-            if (( (${SECONDS:-0}) >= next )); then
-                local elapsed=$(( (${SECONDS:-0}) - start ))
-
-                # Suppress heartbeat noise for short-running installs.
-                if (( elapsed >= _progress_threshold )); then
-                    local line=""
-                    if [[ -n "${logfile:-}" && -s "${logfile:-}" ]]; then
-                        line="$(
-                            ( tail -n 1 "$logfile" 2>/dev/null || true ) | trim_line
-                        )"
-                    fi
-
-                    if [[ -n "$line" && "$line" != "$last_line" ]]; then
-                        log_info "⏳ ${label} still running (${elapsed}s): $line"
-                        last_line="$line"
-                    else
-                        log_info "⏳ ${label} still running (${elapsed}s)..."
-                    fi
+            local elapsed=$(( (${SECONDS:-0}) - start ))
+            if (( _progress_interval > 0 && elapsed >= _progress_threshold )); then
+                # Emit heartbeat at most every _progress_interval seconds
+                if (( elapsed % _progress_interval == 0 )); then
+                    log_info "⏳ ${label} still running (${elapsed}s)..."
                 fi
-
-                next=$(( (${SECONDS:-0}) + _progress_interval ))
             fi
-            sleep 1
+            sleep 2
         done
 
-        wait "$pid"
+        wait "$pid" 2>/dev/null
         rc=$?
         return "$rc"
     }
@@ -2974,8 +2961,9 @@ install_missing_deps() {
             # - Dpkg::Use-Pty=0 avoids pseudo-tty progress quirks in automation.
             # - Dpkg::Options force non-interactive conffile decisions.
             # - Env disables interactive post-install hooks (needrestart, apt-listchanges).
-            local -a _apt_opts=(
-                -o "Dpkg::Lock::Timeout=${_lock_wait}"
+
+            # Shared APT options (common to both fast and retry paths)
+            local -a _apt_opts_base=(
                 -o "Acquire::http::Timeout=30"
                 -o "Acquire::https::Timeout=30"
                 -o "Dpkg::Use-Pty=0"
@@ -2983,15 +2971,11 @@ install_missing_deps() {
                 -o "Dpkg::Options::=--force-confold"
             )
 
-            # Fast-path: shorter lock wait on first attempt; retry uses _apt_opts after mitigation.
-            local -a _apt_opts_fast=(
-                -o "Dpkg::Lock::Timeout=${_lock_wait_fast}"
-                -o "Acquire::http::Timeout=30"
-                -o "Acquire::https::Timeout=30"
-                -o "Dpkg::Use-Pty=0"
-                -o "Dpkg::Options::=--force-confdef"
-                -o "Dpkg::Options::=--force-confold"
-            )
+            # Fast-path: short lock wait on first attempt
+            local -a _apt_opts_fast=( -o "Dpkg::Lock::Timeout=${_lock_wait_fast}" "${_apt_opts_base[@]}" )
+
+            # Retry path: full lock wait after mitigation
+            local -a _apt_opts=( -o "Dpkg::Lock::Timeout=${_lock_wait}" "${_apt_opts_base[@]}" )
 
             local -a _apt_env=(
                 "DEBIAN_FRONTEND=noninteractive"
@@ -3001,13 +2985,37 @@ install_missing_deps() {
                 "NEEDRESTART_MODE=a"
             )
 
-            # --- apt-get update (skip if probe already refreshed cache) ---
-            if [[ "${_PKG_CACHE_REFRESHED:-false}" != "true" ]]; then
+            # --- apt-get update (skip if probe refreshed cache OR packages already have candidates) ---
+            local _need_update=true
+
+            if [[ "${_PKG_CACHE_REFRESHED:-false}" == "true" ]]; then
+                _need_update=false
+                $VERBOSE && log_info "ℹ️ apt-get update skipped (cache already refreshed by connectivity probe)"
+            else
+                # Fast-path: check if all packages have install candidates in current cache.
+                # apt-cache policy is instantaneous and avoids costly apt-get update.
+                local _all_have_candidates=true
+                local _p
+                for _p in "${to_install[@]}"; do
+                    if ! apt-cache policy "$_p" 2>/dev/null | grep -q 'Candidate:' || \
+                       apt-cache policy "$_p" 2>/dev/null | grep -q 'Candidate: (none)'; then
+                        _all_have_candidates=false
+                        break
+                    fi
+                done
+
+                if $_all_have_candidates; then
+                    _need_update=false
+                    log_info "✅ All packages have install candidates in cache - skipping apt-get update"
+                fi
+            fi
+
+            if $_need_update; then
                 log_info "📦 Refreshing package cache..."
                 _pkg_log="$(safe_mktemp)" || _pkg_log=""
                 _pkg_rc=0
 
-                _run_with_progress "apt-get update" "${_update_budget}" "${_pkg_log:-/dev/null}" \
+                _run_with_timeout "apt-get update" "${_update_budget}" "${_pkg_log:-/dev/null}" \
                     env "${_apt_env[@]}" \
                     apt-get "${_apt_opts_fast[@]}" -o Acquire::Retries=2 update -qq \
                     || _pkg_rc=$?
@@ -3019,7 +3027,7 @@ install_missing_deps() {
                     _pkg_rc=0
                     : >"${_pkg_log:-/dev/null}" 2>/dev/null || true
 
-                    _run_with_progress "apt-get update" "${_update_budget}" "${_pkg_log:-/dev/null}" \
+                    _run_with_timeout "apt-get update" "${_update_budget}" "${_pkg_log:-/dev/null}" \
                         env "${_apt_env[@]}" \
                         apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq \
                         || _pkg_rc=$?
@@ -3038,8 +3046,6 @@ install_missing_deps() {
                     log_error "apt-get update failed (rc=$_pkg_rc)" 1
                 fi
                 [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
-            else
-                $VERBOSE && log_info "ℹ️ apt-get update skipped (cache already refreshed by connectivity probe)"
             fi
 
             # --- apt-get install ---
@@ -3047,7 +3053,7 @@ install_missing_deps() {
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
 
-            _run_with_progress "apt-get install" "${_install_budget}" "${_pkg_log:-/dev/null}" \
+            _run_with_timeout "apt-get install" "${_install_budget}" "${_pkg_log:-/dev/null}" \
                 env "${_apt_env[@]}" \
                 apt-get "${_apt_opts_fast[@]}" -o Acquire::Retries=3 \
                 install -y -qq --no-install-recommends "${to_install[@]}" \
@@ -3060,7 +3066,7 @@ install_missing_deps() {
                 _pkg_rc=0
                 : >"${_pkg_log:-/dev/null}" 2>/dev/null || true
 
-                _run_with_progress "apt-get install" "${_install_budget}" "${_pkg_log:-/dev/null}" \
+                _run_with_timeout "apt-get install" "${_install_budget}" "${_pkg_log:-/dev/null}" \
                     env "${_apt_env[@]}" \
                     apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
                     install -y -qq --no-install-recommends "${to_install[@]}" \
@@ -3094,6 +3100,23 @@ install_missing_deps() {
                 --setopt=timeout=30
                 --setopt=retries=3
             )
+
+            # Fast-path: skip costly metadata refresh if all packages are available locally
+            local _rpm_need_refresh=false
+            local _p
+            for _p in "${to_install[@]}"; do
+                if ! rpm -q "$_p" >/dev/null 2>&1 && \
+                   ! "$PKG" list available "$_p" --cacheonly -q 2>/dev/null | grep -qi "$_p"; then
+                    _rpm_need_refresh=true
+                    break
+                fi
+            done
+
+            if $_rpm_need_refresh; then
+                $VERBOSE && log_info "ℹ️ Some packages not in local cache — metadata may be refreshed by $PKG"
+            else
+                $VERBOSE && log_info "✅ All packages available in cache — no metadata refresh needed"
+            fi
 
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
@@ -3452,7 +3475,7 @@ if (( ${#missing_pkgs[@]} > 0 )); then
         CONNECT_DETAILS+=( "⚠️ No DNS servers configured in /etc/resolv.conf" )
     else
         if command -v getent >/dev/null 2>&1; then
-            if safe_timeout --kill-after=2 5 getent hosts example.com >/dev/null 2>&1; then
+            if safe_timeout --kill-after=1 3 getent hosts example.com >/dev/null 2>&1; then
                 CONNECT_DETAILS+=( "✅ DNS resolution working (resolver: $DNS_SERVER)" )
             else
                 CONNECT_DETAILS+=( "⚠️ DNS resolution failed or timed out (resolver: $DNS_SERVER)" )
@@ -3468,11 +3491,11 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     NET_TEST_HOSTS=( "1.1.1.1" "8.8.8.8" "9.9.9.9" )
     NET_OK=false
     for H in "${NET_TEST_HOSTS[@]}"; do
-        if safe_timeout --kill-after=1 2 bash -c 'echo > "/dev/tcp/$1/443"' _ "$H" 2>/dev/null; then
+        if safe_timeout 2 bash -c 'echo > "/dev/tcp/$1/443"' _ "$H" 2>/dev/null; then
             CONNECT_DETAILS+=( "✅ TCP/443 reachable (host $H)" )
             NET_OK=true
             break
-        elif safe_timeout --kill-after=1 2 bash -c 'echo > "/dev/tcp/$1/80"' _ "$H" 2>/dev/null; then
+        elif safe_timeout 2 bash -c 'echo > "/dev/tcp/$1/80"' _ "$H" 2>/dev/null; then
             CONNECT_DETAILS+=( "✅ TCP/80 reachable (host $H)" )
             NET_OK=true
             break
@@ -3490,9 +3513,13 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     #   - PKG_PROBE_MODE=always : always run Layer 4 (previous behavior)
     PKG_PROBE_OK=false
     PKG_PROBE_NETFAIL=false
-    _PKG_PROBE_TIMEOUT=30
-    _PKG_PROBE_KILL_AFTER=5
+    _PKG_PROBE_TIMEOUT="${PKG_PROBE_TIMEOUT:-15}"
+    _PKG_PROBE_KILL_AFTER="${PKG_PROBE_KILL_AFTER:-3}"
     _PKG_PROBE_MODE="${PKG_PROBE_MODE:-auto}"
+
+    # Validate numeric probe knobs
+    [[ "$_PKG_PROBE_TIMEOUT" =~ ^[1-9][0-9]*$ ]] || _PKG_PROBE_TIMEOUT=15
+    [[ "$_PKG_PROBE_KILL_AFTER" =~ ^[1-9][0-9]*$ ]] || _PKG_PROBE_KILL_AFTER=3
 
     if $VALIDATE_ONLY; then
         CONNECT_DETAILS+=( "ℹ️ Package manager probe skipped (VALIDATE_ONLY mode)" )
