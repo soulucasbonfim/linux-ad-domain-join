@@ -1246,7 +1246,8 @@ service_control() {
     fi
 
     # Modern systemd-based systems (RHEL 7+, Ubuntu 16.04+, Debian 8+)
-    if command -v systemctl >/dev/null 2>&1 && systemctl --version >/dev/null 2>&1; then
+    # Require /run/systemd/system to reduce false positives in chroot/containers.
+    if command -v systemctl >/dev/null 2>&1 && [[ -d /run/systemd/system ]] && systemctl --version >/dev/null 2>&1; then
         case "$action" in
             start)      systemctl start "$svc_name" || rc=$? ;;
             stop)       systemctl stop "$svc_name" || rc=$? ;;
@@ -2013,7 +2014,25 @@ cmd_run() {
         fi
     fi
 
-    tmp_out="$(safe_mktemp)" || { log_info "❗ mktemp failed (cannot capture command output)"; return 1; }
+    # Best-effort capture: if mktemp is unavailable, run without output capture
+    tmp_out="$(mktemp_try "/tmp/linux-ad-domain-join.cmd.XXXXXX")" || {
+        log_info "❗ mktemp unavailable; running without output capture: $(print_cmd_quoted "${cmd[@]}")"
+
+        if LC_ALL=C LANG=C "${cmd[@]}"; then
+            if [[ "$first_bin" == "sed" ]]; then
+                local _imf3
+                while IFS= read -r _imf3; do
+                    [[ -n "$_imf3" ]] && selinux_restore "$_imf3"
+                done < <(_extract_sed_target_files "${cmd[@]}" 2>/dev/null || true)
+            fi
+            return 0
+        fi
+
+        rc=$?
+        log_info "❗ Command failed (exit $rc): $(print_cmd_quoted "${cmd[@]}")"
+        return "$rc"
+    }
+
     if _cmd_run_capture "$tmp_out" "${cmd[@]}"; then
         # Restore SELinux contexts after in-place edits that may replace files on disk.
         if [[ "$first_bin" == "sed" ]]; then
@@ -2142,7 +2161,19 @@ cmd_run_in() {
         fi
     fi
 
-    tmp_out="$(safe_mktemp)" || { log_info "❗ mktemp failed (cannot capture command output)"; return 1; }
+    # Best-effort capture: if mktemp is unavailable, run without output capture
+    tmp_out="$(mktemp_try "/tmp/linux-ad-domain-join.cmd-in.XXXXXX")" || {
+        log_info "❗ mktemp unavailable; running without output capture: $(print_cmd_quoted "${cmd[@]}") < $stdin_file"
+
+        if LC_ALL=C LANG=C "${cmd[@]}" <"$stdin_file"; then
+            return 0
+        fi
+
+        rc=$?
+        log_info "❗ Command failed (exit $rc): $(print_cmd_quoted "${cmd[@]}")"
+        return "$rc"
+    }
+
     if LC_ALL=C LANG=C "${cmd[@]}" <"$stdin_file" >"$tmp_out" 2>&1; then
         rm -f "$tmp_out"
         return 0
@@ -2209,14 +2240,14 @@ safe_realm_list() {
     local tmp_out=""
     local code=0
 
-    # Non-fatal temp file creation (this is a "safe" helper; do not abort the script here)
-    tmp_out="$(safe_mktemp)" || {
-        log_info "ℹ mktemp failed in safe_realm_list(); returning empty realm list"
+    # Non-fatal temp file creation (safe helper: do not abort the script here).
+    tmp_out="$(mktemp_try "/tmp/linux-ad-domain-join.realm-list.XXXXXX")" || {
+        log_info "ℹ mktemp unavailable in safe_realm_list(); returning empty realm list"
         echo ""
         return 0
     }
 
-    # Ensure temp file is removed even if a command fails under errexit
+    # Ensure temp file is removed even if a command fails under errexit.
     trap 'rm -f "$tmp_out" 2>/dev/null || true; trap - RETURN' RETURN
 
     if ! command -v realm >/dev/null 2>&1; then
@@ -2232,7 +2263,7 @@ safe_realm_list() {
         fi
     fi
 
-    # Output contents (may be empty) without risking errexit
+    # Output contents (may be empty) without risking errexit.
     cat "$tmp_out" 2>/dev/null || true
 }
 
