@@ -2836,6 +2836,7 @@ install_missing_deps() {
     [[ "$_progress_interval" =~ ^[0-9]+$ ]] || _progress_interval=15
     [[ "$_progress_threshold" =~ ^[0-9]+$ ]] || _progress_threshold=60
     [[ "$_lock_wait_fast" =~ ^[0-9]+$ ]] || _lock_wait_fast=5
+    [[ "$_prelock_wait" =~ ^[0-9]+$ ]] || _prelock_wait=10
 
     local _pkg_rc=0
     local _pkg_log=""
@@ -2931,20 +2932,19 @@ install_missing_deps() {
         local start="${SECONDS:-0}"
         local rc=0
 
-        # Direct execution: no extra subshell, no per-second polling.
-        # safe_timeout already handles SIGTERM+SIGKILL escalation.
+        # Run under safe_timeout (SIGTERM+SIGKILL escalation) and track PID.
         safe_timeout --kill-after=10 "${budget}" "$@" >"${logfile:-/dev/null}" 2>&1 &
         local pid=$!
 
-        # Lightweight wait with optional heartbeat (only after threshold)
-        local _next_hb=$(( start + _progress_threshold ))
+        # Lightweight wait with optional heartbeat (relative thresholds).
+        local _next_hb=$(( _progress_threshold ))
         while kill -0 "$pid" 2>/dev/null; do
             local elapsed=$(( (${SECONDS:-0}) - start ))
             if (( _progress_interval > 0 && elapsed >= _next_hb )); then
                 log_info "⏳ ${label} still running (${elapsed}s)..."
-                _next_hb=$(( elapsed + _progress_interval ))
+                _next_hb=$(( _next_hb + _progress_interval ))
             fi
-            sleep 2
+            sleep 1
         done
 
         wait "$pid" 2>/dev/null
@@ -2962,9 +2962,14 @@ install_missing_deps() {
             # - Env disables interactive post-install hooks (needrestart, apt-listchanges).
 
             # Shared APT options (common to both fast and retry paths)
+            local _apt_http_timeout="${APT_HTTP_TIMEOUT:-30}"
+            local _apt_https_timeout="${APT_HTTPS_TIMEOUT:-30}"
+            [[ "$_apt_http_timeout" =~ ^[1-9][0-9]*$ ]] || _apt_http_timeout=30
+            [[ "$_apt_https_timeout" =~ ^[1-9][0-9]*$ ]] || _apt_https_timeout=30
+
             local -a _apt_opts_base=(
-                -o "Acquire::http::Timeout=30"
-                -o "Acquire::https::Timeout=30"
+                -o "Acquire::http::Timeout=${_apt_http_timeout}"
+                -o "Acquire::https::Timeout=${_apt_https_timeout}"
                 -o "Dpkg::Use-Pty=0"
                 -o "Dpkg::Options::=--force-confdef"
                 -o "Dpkg::Options::=--force-confold"
@@ -3147,9 +3152,36 @@ install_missing_deps() {
             log_info "📦 Installing ${#to_install[@]} package(s). (budget: ${_install_budget}s)"
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
+
+            # First try without metadata refresh for speed. If it fails due to stale metadata,
+            # retry once allowing refresh (enterprise-safe, low overhead).
+            local -a _zypper_opts=( -n --no-refresh )
+
+            _zypper_log_needs_refresh() {
+                # Detect strong indicators that repo metadata refresh is required.
+                # Keep patterns conservative to avoid unnecessary retries.
+                local log="$1"
+                [[ -n "$log" && -s "$log" ]] || return 1
+                grep -qiE \
+                    'Repository.*is out of date|Repository.*out-of-date|refresh.*repository|Please refresh|metadata.*(invalid|expired|out of date)|repomd.*(expired|invalid)|Valid metadata not found' \
+                    "$log"
+            }
+
+            # Attempt 1 (fast-path): no refresh
             safe_timeout --kill-after=10 "${_install_budget}" \
-                "$PKG" install -n "${to_install[@]}" \
+                "$PKG" "${_zypper_opts[@]}" install "${to_install[@]}" \
                 >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
+
+            # Retry once with refresh if failure strongly indicates stale metadata
+            if (( _pkg_rc != 0 )) && _zypper_log_needs_refresh "$_pkg_log"; then
+                log_info "⚠️ zypper metadata appears stale; retrying once with refresh enabled..."
+                _pkg_rc=0
+                : >"${_pkg_log:-/dev/null}" 2>/dev/null || true
+
+                safe_timeout --kill-after=10 "${_install_budget}" \
+                    "$PKG" -n install "${to_install[@]}" \
+                    >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
+            fi
 
             if (( _pkg_rc != 0 )); then
                 if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
@@ -3492,11 +3524,11 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     NET_TEST_HOSTS=( "1.1.1.1" "8.8.8.8" "9.9.9.9" )
     NET_OK=false
     for H in "${NET_TEST_HOSTS[@]}"; do
-        if safe_timeout 2 bash -c 'echo > "/dev/tcp/$1/443"' _ "$H" 2>/dev/null; then
+        if tcp_port_open "$H" 443 2; then
             CONNECT_DETAILS+=( "✅ TCP/443 reachable (host $H)" )
             NET_OK=true
             break
-        elif safe_timeout 2 bash -c 'echo > "/dev/tcp/$1/80"' _ "$H" 2>/dev/null; then
+        elif tcp_port_open "$H" 80 2; then
             CONNECT_DETAILS+=( "✅ TCP/80 reachable (host $H)" )
             NET_OK=true
             break
@@ -3609,6 +3641,9 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     elif [[ "$NET_OK" == true ]]; then
         HAS_INTERNET=true
         CONNECT_DETAILS+=( "⚠️ TCP probes passed but package manager probe failed — proceeding with caution" )
+    elif [[ "$_has_default_route" == true ]]; then
+        HAS_INTERNET=true
+        CONNECT_DETAILS+=( "⚠️ Default route present but probes inconclusive — proceeding with caution" )
     else
         HAS_INTERNET=false
         CONNECT_DETAILS+=( "🚫 Connectivity not confirmed (all probes failed)" )
@@ -3642,10 +3677,11 @@ if (( ${#missing_pkgs[@]} > 0 )); then
         elif $DRY_RUN; then
             log_info "${C_YELLOW}[DRY-RUN]${C_RESET} ⚠ All connectivity probes failed. In normal mode this could abort. Missing packages: ${missing_pkgs[*]}"
         else
-            if [[ "$PKG_PROBE_NETFAIL" == true ]]; then
+            # Only fail-fast when we are truly isolated (no default route) AND the pkg-manager probe timed out.
+            if [[ "$PKG_PROBE_NETFAIL" == true ]] && [[ "$_has_default_route" != true ]]; then
                 log_error "Missing packages (${missing_pkgs[*]}) and system is offline (package manager probe timed out after ${_PKG_PROBE_TIMEOUT}s) - cannot install" 100
             else
-                log_info "⚠ Connectivity probe failed (non-timeout); package installation will be attempted — failures will be classified by package manager output."
+                log_info "⚠ Connectivity probe inconclusive; package installation will be attempted — failures will be classified by package manager output."
             fi
         fi
     fi
