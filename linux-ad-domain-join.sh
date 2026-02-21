@@ -2807,19 +2807,30 @@ install_missing_deps() {
     # OUTPUT STRATEGY: All package manager output is redirected to a TEMPORARY
     # FILE to avoid WSL2 hangs with global exec > >(tee -a "$LOG_FILE").
     #
-    # This function adds two operational safeguards:
-    #   1) Visible progress heartbeats while apt-get runs (tail last log line).
-    #   2) Pre-flight mitigation for dpkg/apt lock contention (packagekit/unattended/apt-daily).
+    # Operational safeguards:
+    #   1) Optional progress heartbeats for LONG installs (default: start after 60s).
+    #   2) On-demand mitigation for dpkg/apt lock contention (retry only when detected).
     # -------------------------------------------------------------------------
     local _update_budget="${PKG_UPDATE_TIMEOUT:-300}"
     local _install_budget="${PKG_INSTALL_TIMEOUT:-900}"
     local _lock_wait="${PKG_LOCK_TIMEOUT:-90}"
 
-    # Heartbeat interval while package manager runs (seconds)
+    # Heartbeat interval while package manager runs (seconds). Set to 0 to disable.
     local _progress_interval="${PKG_PROGRESS_INTERVAL:-15}"
+
+    # Do not emit heartbeat lines for short installs; start only after this threshold (seconds).
+    local _progress_threshold="${PKG_PROGRESS_THRESHOLD:-60}"
+
+    # Fast-path lock wait for first APT attempt (seconds); retry uses _lock_wait after mitigation.
+    local _lock_wait_fast="${PKG_LOCK_TIMEOUT_FAST:-5}"
 
     # How long to wait before attempting to stop conflicting systemd units (seconds)
     local _prelock_wait="${PKG_PRELOCK_WAIT_TIMEOUT:-30}"
+
+    # Normalize numeric knobs (avoid accidental busy loops / invalid values)
+    [[ "$_progress_interval" =~ ^[0-9]+$ ]] || _progress_interval=15
+    [[ "$_progress_threshold" =~ ^[0-9]+$ ]] || _progress_threshold=60
+    [[ "$_lock_wait_fast" =~ ^[0-9]+$ ]] || _lock_wait_fast=5
 
     local _pkg_rc=0
     local _pkg_log=""
@@ -2894,6 +2905,14 @@ install_missing_deps() {
         done
     }
 
+    _apt_log_has_lock_contention() {
+        # Detect common dpkg/apt lock contention messages in APT output logs.
+        # Keep this conservative: only retry on strong lock indicators.
+        local log="$1"
+        [[ -n "$log" && -s "$log" ]] || return 1
+        grep -qiE 'Could not get lock|Unable to acquire the dpkg frontend lock|dpkg frontend lock is locked|is another process using it' "$log"
+    }
+
     _run_with_progress() {
         # Usage: _run_with_progress "<label>" <budget_seconds> <logfile> <command...>
         local label="$1"; shift
@@ -2901,9 +2920,17 @@ install_missing_deps() {
         local logfile="$1"; shift
 
         local start="${SECONDS:-0}"
-        local next=$(( start + _progress_interval ))
+        local next
         local last_line=""
         local pid rc
+
+        # If interval is disabled (0), run quietly without heartbeats.
+        if (( _progress_interval < 1 )); then
+            safe_timeout --kill-after=10 "${budget}" "$@" >"${logfile:-/dev/null}" 2>&1
+            return $?
+        fi
+
+        next=$(( start + _progress_interval ))
 
         ( safe_timeout --kill-after=10 "${budget}" "$@" >"${logfile:-/dev/null}" 2>&1 ) &
         pid=$!
@@ -2911,19 +2938,22 @@ install_missing_deps() {
         while kill -0 "$pid" 2>/dev/null; do
             if (( (${SECONDS:-0}) >= next )); then
                 local elapsed=$(( (${SECONDS:-0}) - start ))
-                local line=""
 
-                if [[ -n "${logfile:-}" && -s "${logfile:-}" ]]; then
-                    line="$(
-                        ( tail -n 1 "$logfile" 2>/dev/null || true ) | trim_line
-                    )"
-                fi
+                # Suppress heartbeat noise for short-running installs.
+                if (( elapsed >= _progress_threshold )); then
+                    local line=""
+                    if [[ -n "${logfile:-}" && -s "${logfile:-}" ]]; then
+                        line="$(
+                            ( tail -n 1 "$logfile" 2>/dev/null || true ) | trim_line
+                        )"
+                    fi
 
-                if [[ -n "$line" && "$line" != "$last_line" ]]; then
-                    log_info "⏳ ${label} still running (${elapsed}s): $line"
-                    last_line="$line"
-                else
-                    log_info "⏳ ${label} still running (${elapsed}s)..."
+                    if [[ -n "$line" && "$line" != "$last_line" ]]; then
+                        log_info "⏳ ${label} still running (${elapsed}s): $line"
+                        last_line="$line"
+                    else
+                        log_info "⏳ ${label} still running (${elapsed}s)..."
+                    fi
                 fi
 
                 next=$(( (${SECONDS:-0}) + _progress_interval ))
@@ -2953,6 +2983,16 @@ install_missing_deps() {
                 -o "Dpkg::Options::=--force-confold"
             )
 
+            # Fast-path: shorter lock wait on first attempt; retry uses _apt_opts after mitigation.
+            local -a _apt_opts_fast=(
+                -o "Dpkg::Lock::Timeout=${_lock_wait_fast}"
+                -o "Acquire::http::Timeout=30"
+                -o "Acquire::https::Timeout=30"
+                -o "Dpkg::Use-Pty=0"
+                -o "Dpkg::Options::=--force-confdef"
+                -o "Dpkg::Options::=--force-confold"
+            )
+
             local -a _apt_env=(
                 "DEBIAN_FRONTEND=noninteractive"
                 "DEBIAN_PRIORITY=critical"
@@ -2960,9 +3000,6 @@ install_missing_deps() {
                 "APT_LISTCHANGES_FRONTEND=none"
                 "NEEDRESTART_MODE=a"
             )
-
-            # Pre-flight: mitigate dpkg/apt lock contention (best-effort)
-            _apt_wait_and_mitigate_lock_contention
 
             # --- apt-get update (skip if probe already refreshed cache) ---
             if [[ "${_PKG_CACHE_REFRESHED:-false}" != "true" ]]; then
@@ -2972,8 +3009,21 @@ install_missing_deps() {
 
                 _run_with_progress "apt-get update" "${_update_budget}" "${_pkg_log:-/dev/null}" \
                     env "${_apt_env[@]}" \
-                    apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq \
+                    apt-get "${_apt_opts_fast[@]}" -o Acquire::Retries=2 update -qq \
                     || _pkg_rc=$?
+
+                # On-demand lock mitigation + single retry (robust path)
+                if (( _pkg_rc != 0 )) && _apt_log_has_lock_contention "$_pkg_log"; then
+                    log_info "⚠️ apt-get update lock contention detected; retrying after mitigation..."
+                    _apt_wait_and_mitigate_lock_contention
+                    _pkg_rc=0
+                    : >"${_pkg_log:-/dev/null}" 2>/dev/null || true
+
+                    _run_with_progress "apt-get update" "${_update_budget}" "${_pkg_log:-/dev/null}" \
+                        env "${_apt_env[@]}" \
+                        apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq \
+                        || _pkg_rc=$?
+                fi
 
                 if (( _pkg_rc != 0 )); then
                     if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
@@ -2999,9 +3049,23 @@ install_missing_deps() {
 
             _run_with_progress "apt-get install" "${_install_budget}" "${_pkg_log:-/dev/null}" \
                 env "${_apt_env[@]}" \
-                apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
+                apt-get "${_apt_opts_fast[@]}" -o Acquire::Retries=3 \
                 install -y -qq --no-install-recommends "${to_install[@]}" \
                 || _pkg_rc=$?
+
+            # On-demand lock mitigation + single retry (robust path)
+            if (( _pkg_rc != 0 )) && _apt_log_has_lock_contention "$_pkg_log"; then
+                log_info "⚠️ apt-get install lock contention detected; retrying after mitigation..."
+                _apt_wait_and_mitigate_lock_contention
+                _pkg_rc=0
+                : >"${_pkg_log:-/dev/null}" 2>/dev/null || true
+
+                _run_with_progress "apt-get install" "${_install_budget}" "${_pkg_log:-/dev/null}" \
+                    env "${_apt_env[@]}" \
+                    apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
+                    install -y -qq --no-install-recommends "${to_install[@]}" \
+                    || _pkg_rc=$?
+            fi
 
             if (( _pkg_rc != 0 )); then
                 if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
@@ -3419,12 +3483,16 @@ if (( ${#missing_pkgs[@]} > 0 )); then
     fi
 
     # =====================================================================
-    # Layer 4: AUTHORITATIVE package-manager probe with bounded timeout
+    # Layer 4: Package-manager probe with bounded timeout (optional fast-path)
     # =====================================================================
+    # Modes:
+    #   - PKG_PROBE_MODE=auto   : skip Layer 4 when heuristics strongly indicate connectivity (faster)
+    #   - PKG_PROBE_MODE=always : always run Layer 4 (previous behavior)
     PKG_PROBE_OK=false
     PKG_PROBE_NETFAIL=false
     _PKG_PROBE_TIMEOUT=30
     _PKG_PROBE_KILL_AFTER=5
+    _PKG_PROBE_MODE="${PKG_PROBE_MODE:-auto}"
 
     if $VALIDATE_ONLY; then
         CONNECT_DETAILS+=( "ℹ️ Package manager probe skipped (VALIDATE_ONLY mode)" )
@@ -3438,64 +3506,70 @@ if (( ${#missing_pkgs[@]} > 0 )); then
             PKG_PROBE_OK=true
         fi
     else
-        $VERBOSE && log_info "🔍 Testing package manager connectivity (timeout: ${_PKG_PROBE_TIMEOUT}s)..."
-        _probe_log="$(safe_mktemp)" || _probe_log=""
-        _probe_rc=0
-
-        case "$PKG" in
-            apt)
-                safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
-                    env DEBIAN_FRONTEND=noninteractive \
-                    apt-get update -qq \
-                        -o Dpkg::Lock::Timeout=10 \
-                        -o Acquire::Retries=0 \
-                        -o Acquire::http::Timeout=15 \
-                        -o Acquire::https::Timeout=15 \
-                    >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
-                ;;
-            dnf)
-                safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
-                    dnf makecache --timer -q \
-                        --setopt=timeout=15 \
-                        --setopt=retries=0 \
-                    >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
-                ;;
-            yum)
-                safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
-                    yum makecache fast -q \
-                        --setopt=timeout=15 \
-                        --setopt=retries=0 \
-                    >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
-                ;;
-            zypper)
-                safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
-                    zypper refresh -q \
-                    >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
-                ;;
-            *)
-                CONNECT_DETAILS+=( "⚠️ Package manager probe skipped (unknown PKG=$PKG)" )
-                _probe_rc=255
-                ;;
-        esac
-
-        if (( _probe_rc == 0 )); then
+        # Fast-path: if route+TCP are OK, skip Layer 4 to reduce startup latency.
+        # If repos/proxy are broken, the subsequent package manager step will still fail with parsed errors.
+        if [[ "$_PKG_PROBE_MODE" != "always" ]] && [[ "$NET_OK" == true ]] && [[ "$_has_default_route" == true ]]; then
             PKG_PROBE_OK=true
-            _PKG_CACHE_REFRESHED=true
-            CONNECT_DETAILS+=( "✅ Package manager probe succeeded ($PKG metadata refresh)" )
         else
-            case "$_probe_rc" in
-                124) PKG_PROBE_NETFAIL=true; CONNECT_DETAILS+=( "🛑 Package manager probe timed out after ${_PKG_PROBE_TIMEOUT}s (rc=124)" ) ;;
-                137) PKG_PROBE_NETFAIL=true; CONNECT_DETAILS+=( "🛑 Package manager probe killed after $((_PKG_PROBE_TIMEOUT + _PKG_PROBE_KILL_AFTER))s (rc=137)" ) ;;
-                *)   CONNECT_DETAILS+=( "🛑 Package manager probe failed ($PKG, rc=$_probe_rc)" ) ;;
+            $VERBOSE && log_info "🔍 Testing package manager connectivity (timeout: ${_PKG_PROBE_TIMEOUT}s)..."
+            _probe_log="$(safe_mktemp)" || _probe_log=""
+            _probe_rc=0
+
+            case "$PKG" in
+                apt)
+                    safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
+                        env DEBIAN_FRONTEND=noninteractive \
+                        apt-get update -qq \
+                            -o Dpkg::Lock::Timeout=10 \
+                            -o Acquire::Retries=0 \
+                            -o Acquire::http::Timeout=15 \
+                            -o Acquire::https::Timeout=15 \
+                        >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
+                    ;;
+                dnf)
+                    safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
+                        dnf makecache --timer -q \
+                            --setopt=timeout=15 \
+                            --setopt=retries=0 \
+                        >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
+                    ;;
+                yum)
+                    safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
+                        yum makecache fast -q \
+                            --setopt=timeout=15 \
+                            --setopt=retries=0 \
+                        >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
+                    ;;
+                zypper)
+                    safe_timeout --kill-after="$_PKG_PROBE_KILL_AFTER" "$_PKG_PROBE_TIMEOUT" \
+                        zypper refresh -q \
+                        >"${_probe_log:-/dev/null}" 2>&1 || _probe_rc=$?
+                    ;;
+                *)
+                    CONNECT_DETAILS+=( "⚠️ Package manager probe skipped (unknown PKG=$PKG)" )
+                    _probe_rc=255
+                    ;;
             esac
 
-            if [[ -n "$_probe_log" && -s "$_probe_log" ]]; then
-                $VERBOSE && log_info "📋 Package manager probe output analysis:"
-                $VERBOSE && parse_pkg_error "$_probe_log" "$PKG" || true
-            fi
-        fi
+            if (( _probe_rc == 0 )); then
+                PKG_PROBE_OK=true
+                _PKG_CACHE_REFRESHED=true
+                CONNECT_DETAILS+=( "✅ Package manager probe succeeded ($PKG metadata refresh)" )
+            else
+                case "$_probe_rc" in
+                    124) PKG_PROBE_NETFAIL=true; CONNECT_DETAILS+=( "🛑 Package manager probe timed out after ${_PKG_PROBE_TIMEOUT}s (rc=124)" ) ;;
+                    137) PKG_PROBE_NETFAIL=true; CONNECT_DETAILS+=( "🛑 Package manager probe killed after $((_PKG_PROBE_TIMEOUT + _PKG_PROBE_KILL_AFTER))s (rc=137)" ) ;;
+                    *)   CONNECT_DETAILS+=( "🛑 Package manager probe failed ($PKG, rc=$_probe_rc)" ) ;;
+                esac
 
-        [[ -n "${_probe_log:-}" ]] && rm -f "$_probe_log" 2>/dev/null || true
+                if [[ -n "$_probe_log" && -s "$_probe_log" ]]; then
+                    $VERBOSE && log_info "📋 Package manager probe output analysis:"
+                    $VERBOSE && parse_pkg_error "$_probe_log" "$PKG" || true
+                fi
+            fi
+
+            [[ -n "${_probe_log:-}" ]] && rm -f "$_probe_log" 2>/dev/null || true
+        fi
     fi
 
     # =====================================================================
