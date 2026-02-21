@@ -2947,8 +2947,8 @@ install_missing_deps() {
             sleep 1
         done
 
-        wait "$pid" 2>/dev/null
-        rc=$?
+        # Guard wait against errexit semantics when the child exits non-zero (Bash 4.0 edge cases).
+        wait "$pid" 2>/dev/null || rc=$?
         return "$rc"
     }
 
@@ -3106,24 +3106,6 @@ install_missing_deps() {
                 --setopt=retries=3
             )
 
-            # Fast-path: skip costly metadata refresh if all packages are available locally
-            # NOTE: -C (cache-only) works on both yum (RHEL 7) and dnf (RHEL 8+).
-            local _rpm_need_refresh=false
-            local _p
-            for _p in "${to_install[@]}"; do
-                if ! rpm -q "$_p" >/dev/null 2>&1 && \
-                   ! "$PKG" -C list available "$_p" -q 2>/dev/null | grep -qi "$_p"; then
-                    _rpm_need_refresh=true
-                    break
-                fi
-            done
-
-            if $_rpm_need_refresh; then
-                $VERBOSE && log_info "ℹ️ Some packages not in local cache — metadata may be refreshed by $PKG"
-            else
-                $VERBOSE && log_info "✅ All packages available in cache — no metadata refresh needed"
-            fi
-
             log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
@@ -3149,7 +3131,7 @@ install_missing_deps() {
             [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
             ;;
         zypper)
-            log_info "📦 Installing ${#to_install[@]} package(s). (budget: ${_install_budget}s)"
+            log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
             _pkg_log="$(safe_mktemp)" || _pkg_log=""
             _pkg_rc=0
 
@@ -3174,7 +3156,7 @@ install_missing_deps() {
 
             # Retry once with refresh if failure strongly indicates stale metadata
             if (( _pkg_rc != 0 )) && _zypper_log_needs_refresh "$_pkg_log"; then
-                log_info "⚠️ zypper metadata appears stale; retrying once with refresh enabled..."
+                log_info "⚠️ $PKG metadata appears stale; retrying once with refresh enabled..."
                 _pkg_rc=0
                 : >"${_pkg_log:-/dev/null}" 2>/dev/null || true
 
@@ -3185,13 +3167,13 @@ install_missing_deps() {
 
             if (( _pkg_rc != 0 )); then
                 if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
-                    log_info "📋 zypper install output:"
-                    parse_pkg_error "$_pkg_log" "zypper" || true
+                    log_info "📋 $PKG install output:"
+                    parse_pkg_error "$_pkg_log" "$PKG" || true
                 fi
                 [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null
                 case "$_pkg_rc" in
-                    124) log_info "⚠️ zypper install timed out after ${_install_budget}s (SIGTERM)" ;;
-                    137) log_info "⚠️ zypper install killed after $((_install_budget + 10))s (SIGKILL)" ;;
+                    124) log_info "⚠️ $PKG install timed out after ${_install_budget}s (SIGTERM)" ;;
+                    137) log_info "⚠️ $PKG install killed after $((_install_budget + 10))s (SIGKILL)" ;;
                 esac
                 log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
             fi
