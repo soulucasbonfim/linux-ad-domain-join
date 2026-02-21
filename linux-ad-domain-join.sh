@@ -2765,7 +2765,7 @@ install_missing_deps() {
 # - If running as root, falls back to machine keytab (COMPUTER$@REALM).
 # Outputs: OU DN on stdout; returns 0 on success, 1 on failure.
 detect_current_computer_ou() {
-    local dc host_u realm filter out ou ccache princ
+    local dc host_u host_u_esc realm filter out ou ccache princ
 
     # Need ldapsearch + a DC + base DN
     command -v ldapsearch >/dev/null 2>&1 || return 1
