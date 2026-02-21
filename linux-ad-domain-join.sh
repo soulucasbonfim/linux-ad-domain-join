@@ -6,7 +6,7 @@
 # LinkedIn:    https://www.linkedin.com/in/soulucasbonfim
 # GitHub:      https://github.com/soulucasbonfim
 # Created:     2025-04-27
-# Version:     3.4.4
+# Version:     3.4.5
 # License:     MIT
 # -------------------------------------------------------------------------------------------------
 # Description:
@@ -2790,6 +2790,11 @@ install_missing_deps() {
         return 0
     fi
 
+    if $DRY_RUN; then
+        log_info "${C_YELLOW}[DRY-RUN]${C_RESET} Would install packages: ${to_install[*]}"
+        return 0
+    fi
+
     # Connectivity heuristics can fail in proxy/local-repo environments.
     # Still attempt installation; fail only if the package manager errors out.
     if [[ "${HAS_INTERNET}" == "false" ]]; then
@@ -2817,13 +2822,25 @@ install_missing_deps() {
     log_info "🔌 Installing missing packages: ${to_install[*]}"
     $VERBOSE && log_info "🧬 install_missing_deps() entered with args: $*"
 
+    # -------------------------------------------------------------------------
+    # IMPORTANT: We do NOT use cmd_must here.
+    # cmd_must → cmd_run → _cmd_run_capture redirects ALL output to a temp file,
+    # which makes multi-minute installs appear completely silent ("stuck").
+    # Instead, we run directly so output flows through the global tee pipeline
+    # (line ~1047) to both console and log file, providing live progress.
+    # On failure, we analyze the LOG_FILE for diagnostics (same parse_pkg_error).
+    # This follows the same pattern as adcli join (line ~6218).
+    # -------------------------------------------------------------------------
+    local _pkg_rc=0
+    local _pkg_log=""
+
     case "$PKG" in
         apt)
             # APT guardrails (defense-in-depth):
-            #   Dpkg::Lock::Timeout  : bounded wait for dpkg lock (vs infinite hang)
+            #   Dpkg::Lock::Timeout      : bounded wait for dpkg lock (vs infinite hang)
             #   Acquire::http(s)::Timeout : per-connection I/O timeout (vs stalled download)
-            #   Acquire::Retries     : retry on transient failures (update/install may differ)
-            #   safe_timeout         : absolute wall-clock budget (kills entire process group)
+            #   Acquire::Retries          : retry on transient failures
+            #   safe_timeout              : absolute wall-clock budget (kills entire process group)
             local -a _apt_opts=(
                 -o "Dpkg::Lock::Timeout=${_lock_wait}"
                 -o "Acquire::http::Timeout=30"
@@ -2832,18 +2849,60 @@ install_missing_deps() {
 
             # --- apt-get update (skip if probe already refreshed cache) ---
             if [[ "${_PKG_CACHE_REFRESHED:-false}" != "true" ]]; then
-                cmd_must safe_timeout --kill-after=10 "${_update_budget}" \
+                log_info "📦 Refreshing package cache..."
+                _pkg_rc=0
+                _pkg_log="$(safe_mktemp)" || _pkg_log=""
+
+                safe_timeout --kill-after=10 "${_update_budget}" \
                     env DEBIAN_FRONTEND=noninteractive \
-                    apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq
+                    apt-get "${_apt_opts[@]}" -o Acquire::Retries=2 update -qq \
+                    >"${_pkg_log:-/dev/null}" 2>&1 || _pkg_rc=$?
+
+                if (( _pkg_rc != 0 )); then
+                    # Show captured output for diagnosis
+                    if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
+                        log_info "📋 apt-get update output:"
+                        parse_pkg_error "$_pkg_log" "apt-get" || true
+                    fi
+                    [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
+                    log_error "apt-get update failed (rc=$_pkg_rc)" 1
+                fi
+                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
             else
                 $VERBOSE && log_info "ℹ️ apt-get update skipped (cache already refreshed by connectivity probe)"
             fi
 
-            # --- apt-get install ---
-            cmd_must safe_timeout --kill-after=10 "${_install_budget}" \
+            # --- apt-get install (with live progress output) ---
+            log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
+            _pkg_rc=0
+            _pkg_log="$(safe_mktemp)" || _pkg_log=""
+
+            # Output goes to both console (via tee) and capture file (for error analysis).
+            # -q (single q, not -qq) shows package names as they install but no progress bars,
+            # providing visible feedback that the script is working.
+            safe_timeout --kill-after=10 "${_install_budget}" \
                 env DEBIAN_FRONTEND=noninteractive \
                 apt-get "${_apt_opts[@]}" -o Acquire::Retries=3 \
-                install -y -qq --no-install-recommends "${to_install[@]}"
+                install -y -q --no-install-recommends "${to_install[@]}" \
+                > >(tee -a "${_pkg_log:-/dev/null}") 2>&1 || _pkg_rc=$?
+
+            if (( _pkg_rc != 0 )); then
+                if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
+                    log_info "📋 apt-get install output analysis:"
+                    parse_pkg_error "$_pkg_log" "apt-get" || true
+                fi
+
+                case "$_pkg_rc" in
+                    124) log_info "⚠️ apt-get install timed out after ${_install_budget}s (SIGTERM)" ;;
+                    137) log_info "⚠️ apt-get install killed after $((_install_budget + 10))s (SIGKILL)" ;;
+                esac
+
+                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
+                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
+            fi
+
+            [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
+            log_info "✅ All packages installed successfully"
             ;;
         yum|dnf)
             local -a extra_flags=()
@@ -2860,16 +2919,61 @@ install_missing_deps() {
                 --setopt=retries=3
             )
 
-            cmd_must safe_timeout --kill-after=10 "${_install_budget}" \
+            log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
+            _pkg_rc=0
+            _pkg_log="$(safe_mktemp)" || _pkg_log=""
+
+            safe_timeout --kill-after=10 "${_install_budget}" \
                 "$PKG" install \
                 ${extra_flags[@]+"${extra_flags[@]}"} \
                 "${_rpm_net_opts[@]}" \
-                -y "${to_install[@]}"
+                -y "${to_install[@]}" \
+                > >(tee -a "${_pkg_log:-/dev/null}") 2>&1 || _pkg_rc=$?
+
+            if (( _pkg_rc != 0 )); then
+                if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
+                    log_info "📋 $PKG install output analysis:"
+                    parse_pkg_error "$_pkg_log" "$PKG" || true
+                fi
+
+                case "$_pkg_rc" in
+                    124) log_info "⚠️ $PKG install timed out after ${_install_budget}s (SIGTERM)" ;;
+                    137) log_info "⚠️ $PKG install killed after $((_install_budget + 10))s (SIGKILL)" ;;
+                esac
+
+                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
+                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
+            fi
+
+            [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
+            log_info "✅ All packages installed successfully"
             ;;
         zypper)
-            # Zypper has no granular timeout flag; safe_timeout is the only guard.
-            cmd_must safe_timeout --kill-after=10 "${_install_budget}" \
-                "$PKG" install -n "${to_install[@]}"
+            log_info "📦 Installing ${#to_install[@]} package(s)... (budget: ${_install_budget}s)"
+            _pkg_rc=0
+            _pkg_log="$(safe_mktemp)" || _pkg_log=""
+
+            safe_timeout --kill-after=10 "${_install_budget}" \
+                "$PKG" install -n "${to_install[@]}" \
+                > >(tee -a "${_pkg_log:-/dev/null}") 2>&1 || _pkg_rc=$?
+
+            if (( _pkg_rc != 0 )); then
+                if [[ -n "$_pkg_log" && -s "$_pkg_log" ]]; then
+                    log_info "📋 zypper install output analysis:"
+                    parse_pkg_error "$_pkg_log" "zypper" || true
+                fi
+
+                case "$_pkg_rc" in
+                    124) log_info "⚠️ zypper install timed out after ${_install_budget}s (SIGTERM)" ;;
+                    137) log_info "⚠️ zypper install killed after $((_install_budget + 10))s (SIGKILL)" ;;
+                esac
+
+                [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
+                log_error "Package installation failed (rc=$_pkg_rc): ${to_install[*]}" 1
+            fi
+
+            [[ -n "${_pkg_log:-}" ]] && rm -f "$_pkg_log" 2>/dev/null || true
+            log_info "✅ All packages installed successfully"
             ;;
         *)
             log_error "Unsupported package manager: $PKG" 101
