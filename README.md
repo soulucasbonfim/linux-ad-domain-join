@@ -23,10 +23,7 @@ A single-script solution that handles the entire AD join lifecycle - from packag
 **One-liner (interactive mode):**
 
 ```bash
-tmp=$(mktemp) && \
-  ( command -v curl >/dev/null && curl -fsSL https://raw.githubusercontent.com/soulucasbonfim/linux-ad-domain-join/main/linux-ad-domain-join.sh > "$tmp" \
-    || wget -qO "$tmp" https://raw.githubusercontent.com/soulucasbonfim/linux-ad-domain-join/main/linux-ad-domain-join.sh ) && \
-  chmod +x "$tmp" && sudo "$tmp"
+tmp=$(mktemp) && url="https://raw.githubusercontent.com/soulucasbonfim/linux-ad-domain-join/main/linux-ad-domain-join.sh" && (command -v curl >/dev/null 2>&1 && curl -fsSL "$url" -o "$tmp" || wget -qO "$tmp" "$url") && [ -s "$tmp" ] && chmod +x "$tmp" && sudo "$tmp"
 ```
 
 **Non-interactive (CI/CD, Ansible, Terraform):**
