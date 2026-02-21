@@ -2413,6 +2413,15 @@ append_line() {
     fi
 
     _file_ensure_mutable "$path"
+
+    # Ensure the target file ends with a newline before appending to avoid line concatenation.
+    if [[ -s "$path" ]]; then
+        # If the last byte is '\n', command substitution becomes empty (trailing newlines are stripped).
+        if [[ -n "$(tail -c 1 -- "$path" 2>/dev/null || true)" ]]; then
+            printf '\n' >>"$path"
+        fi
+    fi
+
     printf '%s\n' "$line" >>"$path"
     _file_restore_attr "$path"
 }
@@ -2739,6 +2748,9 @@ discover_nearest_dc() {
         echo "${dc_arr[0]}"
         return 0
     }
+
+    # Ensure tmp cleanup even on early return / unexpected abort within this function scope.
+    trap 'rm -f "$ping_tmp" 2>/dev/null || true; trap - RETURN' RETURN
 
     for _dc in "${dc_arr[@]}"; do
         (
